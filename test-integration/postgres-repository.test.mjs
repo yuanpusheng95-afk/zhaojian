@@ -7,6 +7,11 @@ import {
   ProjectBusyError,
   RevisionConflictError,
 } from '../src/domain/photo-project-service.mjs';
+import {
+  EditInterpretationFailedError,
+  EditInterpreter,
+} from '../src/application/edit-interpreter.mjs';
+import { MockLanguageModel } from '../src/application/mock-language-model.mjs';
 import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
 import {
   GenerationLeaseLostError,
@@ -949,4 +954,129 @@ test('reclaimed worker resumes a legacy provider job without model identity', as
   assert.equal(completed.status, 'completed');
   assert.equal(submitCalls, 0);
   assert.deepEqual(waitCalls, ['legacy_provider_job']);
+});
+
+test('edit interpreter creates a persisted generation from a language model patch', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  let modelInput;
+  const interpreter = new EditInterpreter({
+    repository,
+    languageModel: new MockLanguageModel({
+      planner: async (input) => {
+        modelInput = input;
+        return editPatch('white linen coat');
+      },
+    }),
+  });
+
+  const generation = await interpreter.interpretAndRequestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'language-edit-1',
+    message: '换成白色亚麻外套，保持人物和背景',
+  });
+  const persisted = await repository.getGeneration(generation.id);
+
+  assert.equal(generation.status, 'queued');
+  assert.equal(modelInput.message, '换成白色亚麻外套，保持人物和背景');
+  assert.deepEqual(modelInput.photoState, initialState());
+  assert.deepEqual(persisted.patch, editPatch('white linen coat'));
+  assert.equal(persisted.proposedState.appearance.outfit, 'white linen coat');
+  assert.deepEqual(persisted.proposedState.constraints, [
+    { path: 'subject.identity', strength: 'hard', source: 'user' },
+    { path: 'scene.background', strength: 'hard', source: 'user' },
+  ]);
+});
+
+test('edit interpreter does not persist or lock a generation for an invalid model patch', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const interpreter = new EditInterpreter({
+    repository,
+    languageModel: new MockLanguageModel({
+      planner: async () => ({
+        modify: [
+          {
+            path: 'account.balance',
+            operation: 'replace',
+            value: 0,
+          },
+        ],
+        preserve: [],
+      }),
+    }),
+  });
+
+  await assert.rejects(
+    interpreter.interpretAndRequestGeneration({
+      projectId: project.id,
+      baseRevisionId: project.activeRevisionId,
+      idempotencyKey: 'language-edit-invalid',
+      message: '执行非法修改',
+    }),
+    EditInterpretationFailedError,
+  );
+
+  const generationCount = await pool.query(
+    'SELECT count(*)::int AS count FROM generation_jobs',
+  );
+  const persistedProject = await repository.getProject(project.id);
+  assert.equal(generationCount.rows[0].count, 0);
+  assert.equal(persistedProject.runningGenerationId, null);
+});
+
+test('edit interpreter preserves revision conflict when state changes during planning', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const interpreter = new EditInterpreter({
+    repository,
+    languageModel: new MockLanguageModel({
+      planner: async () => {
+        await pool.query(
+          `INSERT INTO photo_revisions
+            (id, project_id, parent_revision_id, state_json, anchor_asset_id,
+             source_generation_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, NULL, $6)`,
+          [
+            'revision_concurrent',
+            project.id,
+            project.activeRevisionId,
+            {
+              ...initialState(),
+              appearance: { outfit: 'concurrent coat' },
+            },
+            'asset_source',
+            '2026-08-19T06:41:00.000Z',
+          ],
+        );
+        await pool.query(
+          `UPDATE projects
+           SET active_revision_id = $2, updated_at = $3
+           WHERE id = $1`,
+          [
+            project.id,
+            'revision_concurrent',
+            '2026-08-19T06:41:00.000Z',
+          ],
+        );
+        return editPatch('planned coat');
+      },
+    }),
+  });
+
+  await assert.rejects(
+    interpreter.interpretAndRequestGeneration({
+      projectId: project.id,
+      baseRevisionId: project.activeRevisionId,
+      idempotencyKey: 'language-edit-stale',
+      message: '换一件新外套',
+    }),
+    RevisionConflictError,
+  );
+
+  const generationCount = await pool.query(
+    'SELECT count(*)::int AS count FROM generation_jobs',
+  );
+  assert.equal(generationCount.rows[0].count, 0);
 });
