@@ -42,7 +42,8 @@ export class PostgresGenerationQueue {
         const now = this.#now();
         const result = await client.query(
           `SELECT id, project_id, status, attempt_count,
-                  provider_name, provider_job_id, provider_submitted_at
+                  provider_name, provider_model,
+                  provider_job_id, provider_submitted_at
            FROM generation_jobs
            WHERE status = 'queued'
               OR (
@@ -90,6 +91,7 @@ export class PostgresGenerationQueue {
           leaseExpiresAt,
           attemptCount: claimed.rows[0].attempt_count,
           providerName: job.provider_name,
+          providerModel: job.provider_model,
           providerJobId: job.provider_job_id,
           providerSubmittedAt: toIso(job.provider_submitted_at),
         };

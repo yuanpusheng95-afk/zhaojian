@@ -699,6 +699,20 @@ test('migration adds persisted provider job fields', async () => {
   );
 });
 
+test('migration adds persisted provider model identity', async () => {
+  const result = await pool.query(`
+    SELECT column_name, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'generation_jobs'
+      AND column_name = 'provider_model'
+  `);
+
+  assert.deepEqual(result.rows, [
+    { column_name: 'provider_model', is_nullable: 'YES' },
+  ]);
+});
+
 test('provider job binding is idempotent and cannot be replaced', async () => {
   const repository = createRepository();
   const project = await createProject(repository);
@@ -724,24 +738,48 @@ test('provider job binding is idempotent and cannot be replaced', async () => {
     generationId: generation.id,
     claimToken: claimed.leaseToken,
     providerName: 'mock',
+    providerModel: 'mock-image-v1',
     providerJobId: 'provider_job_fixed',
   });
   const repeated = await repository.recordProviderJob({
     generationId: generation.id,
     claimToken: claimed.leaseToken,
     providerName: 'mock',
+    providerModel: 'mock-image-v1',
     providerJobId: 'provider_job_fixed',
   });
 
+  assert.equal(first.providerModel, 'mock-image-v1');
   assert.deepEqual(repeated, first);
   await assert.rejects(
     repository.recordProviderJob({
       generationId: generation.id,
       claimToken: claimed.leaseToken,
       providerName: 'mock',
+      providerModel: 'mock-image-v1',
       providerJobId: 'provider_job_replacement',
     }),
     ProviderJobConflictError,
+  );
+  await assert.rejects(
+    repository.recordProviderJob({
+      generationId: generation.id,
+      claimToken: claimed.leaseToken,
+      providerName: 'mock',
+      providerModel: 'mock-image-v2',
+      providerJobId: 'provider_job_fixed',
+    }),
+    ProviderJobConflictError,
+  );
+  await assert.rejects(
+    repository.recordProviderJob({
+      generationId: generation.id,
+      claimToken: claimed.leaseToken,
+      providerName: 'mock',
+      providerModel: '',
+      providerJobId: 'provider_job_missing_model',
+    }),
+    /requires a non-empty provider model/,
   );
 });
 

@@ -234,8 +234,13 @@ export class PostgresPhotoProjectRepository {
     generationId,
     claimToken,
     providerName,
+    providerModel,
     providerJobId,
   }) {
+    if (typeof providerModel !== 'string' || providerModel.trim() === '') {
+      throw new TypeError('Provider job requires a non-empty provider model');
+    }
+
     return this.#transaction(async (client) => {
       const generation = await this.#requireGeneration(client, generationId, {
         forUpdate: true,
@@ -253,6 +258,7 @@ export class PostgresPhotoProjectRepository {
       if (generation.providerJobId) {
         if (
           generation.providerName === providerName &&
+          generation.providerModel === providerModel &&
           generation.providerJobId === providerJobId
         ) {
           return providerJobFromGeneration(generation);
@@ -264,12 +270,14 @@ export class PostgresPhotoProjectRepository {
       const result = await client.query(
         `UPDATE generation_jobs
          SET provider_name = $2,
-             provider_job_id = $3,
-             provider_submitted_at = $4,
-             updated_at = $4
+             provider_model = $3,
+             provider_job_id = $4,
+             provider_submitted_at = $5,
+             updated_at = $5
          WHERE id = $1
-         RETURNING provider_name, provider_job_id, provider_submitted_at`,
-        [generationId, providerName, providerJobId, now],
+         RETURNING provider_name, provider_model,
+                   provider_job_id, provider_submitted_at`,
+        [generationId, providerName, providerModel, providerJobId, now],
       );
       return mapProviderJob(result.rows[0]);
     });
@@ -566,6 +574,7 @@ function mapGeneration(
   }
   if (includeProvider) {
     generation.providerName = row.provider_name;
+    generation.providerModel = row.provider_model;
     generation.providerJobId = row.provider_job_id;
     generation.providerSubmittedAt = toIso(row.provider_submitted_at);
   }
@@ -575,6 +584,7 @@ function mapGeneration(
 function providerJobFromGeneration(generation) {
   return {
     providerName: generation.providerName,
+    providerModel: generation.providerModel,
     providerJobId: generation.providerJobId,
     providerSubmittedAt: generation.providerSubmittedAt,
   };
@@ -583,6 +593,7 @@ function providerJobFromGeneration(generation) {
 function mapProviderJob(row) {
   return {
     providerName: row.provider_name,
+    providerModel: row.provider_model,
     providerJobId: row.provider_job_id,
     providerSubmittedAt: toIso(row.provider_submitted_at),
   };
