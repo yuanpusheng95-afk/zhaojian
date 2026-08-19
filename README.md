@@ -19,8 +19,10 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 
 关键边界：
 
-- LanguageModel/客户端只能提交结构化 Patch，不能直接改 Photo State。
-- LanguageModel 负责自然语言理解与 Patch 规划，不参与 Generation Worker。
+- LanguageModel 只能输出结构化 Patch，不能直接改 Photo State；当前公开客户端仍直接提交 Patch。
+- EditInterpreter 是无状态 Application Service，不进入 Generation Worker。
+- MockLanguageModel 通过可编程 planner 返回 Patch，不实现关键词解析。
+- 解释失败返回 `EDIT_INTERPRETATION_FAILED`，不创建 Generation 或锁 Project。
 - ImageGenerationProvider 负责异步生图、Job 幂等提交和崩溃恢复。
 - 同一项目同时只允许一个运行中的 Generation Job。
 - `Generation`、`Candidate`、`Revision` 是三个独立概念。
@@ -38,6 +40,7 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 
 ```text
 用户自然语言
+→ EditInterpreter
 → LanguageModel：理解意图并输出结构化 Photo State Patch
 → Domain：校验 Patch 并创建 Generation
 → ImageGenerationProvider：提交异步生图 Job 并返回 Candidate
@@ -45,10 +48,10 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 
 两类能力是互不继承的 Port，不使用带 `modelType` 分支的万能 `ModelProvider`：
 
-- `LanguageModel` 不接触 Generation、Candidate 或 Revision。
+- `LanguageModel` 必须声明 `capability = language`，只负责输出 Patch。
 - `ImageGenerationProvider` 必须声明 `capability = image_generation`、`providerName` 和 `modelName`。
-- Generation Worker 构造时拒绝语言模型 Adapter。
-- 当前纵切只实现 ImageGenerationProvider；LanguageModel/Edit Interpreter 仍是后续独立纵切。
+- 两类 Adapter 不能互换；Generation Worker 构造时拒绝语言模型 Adapter。
+- 当前已实现内部 EditInterpreter 和可编程 MockLanguageModel，但未接真实 LanguageModel，也未开放自然语言 HTTP API。
 
 ## 运行环境
 
@@ -123,6 +126,7 @@ npm run check
 
 ```text
 migrations/                         PostgreSQL migration
+src/application/                    EditInterpreter 与 Mock LanguageModel
 src/domain/                         Photo State 与领域状态机
 src/infrastructure/postgres/        Migration、事务 Repository、SQL Queue
 src/worker/                         Generation Worker 与 Mock Provider
@@ -134,7 +138,9 @@ test-integration/                   真实 PostgreSQL 与 HTTP 纵切测试
 ## 当前限制
 
 - 只接 Mock ImageGenerationProvider，尚未接真实图像供应商。
-- 尚未实现对象存储上传、鉴权、SSE、LanguageModel/Edit Interpreter 和前端。
+- 已实现内部 EditInterpreter 和 Mock LanguageModel，尚未接真实 LanguageModel，也未开放自然语言 HTTP 入口。
+- **assumption：真实入口接入前，同一消息不会并发重复解释；公开入口需要持久化 Message/EditRequest。**
+- 尚未实现对象存储上传、鉴权、SSE 和前端。
 - 租约只能阻止 stale worker 写数据库，不能撤销已经发给真实 Provider 的外部调用。
 - Worker 已把稳定的 Generation ID 作为供应商幂等键，并持久化 Provider、模型和 Job ID。
 - **assumption：真实 Provider 必须真正兑现该幂等键。** 如果供应商忽略幂等键，崩溃发生在“提交成功、Job ID 落库前”时仍可能重复扣费。
