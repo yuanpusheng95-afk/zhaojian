@@ -6,6 +6,7 @@ import {
   EditInterpreter,
   InvalidEditRequestError,
 } from '../src/application/edit-interpreter.mjs';
+import { MockLanguageModel } from '../src/application/mock-language-model.mjs';
 import {
   IdempotencyConflictError,
   ProjectBusyError,
@@ -257,3 +258,34 @@ for (const error of [
     );
   });
 }
+
+test('mock language model delegates to its planner and clones the patch result', async () => {
+  const plannedPatch = editPatch();
+  let plannerInput;
+  const model = new MockLanguageModel({
+    planner: async (input) => {
+      plannerInput = input;
+      return plannedPatch;
+    },
+  });
+  const input = {
+    message: '换一件象牙白外套',
+    photoState: initialState(),
+  };
+
+  const result = await model.planPatch(input);
+
+  assert.equal(model.capability, 'language');
+  assert.equal(plannerInput, input);
+  assert.deepEqual(result, plannedPatch);
+  assert.notEqual(result, plannedPatch);
+  result.modify[0].value = 'mutated result';
+  assert.equal(plannedPatch.modify[0].value, 'ivory coat');
+});
+
+test('mock language model requires a planner function', () => {
+  assert.throws(
+    () => new MockLanguageModel({ planner: null }),
+    /Mock language model requires a planner function/,
+  );
+});
