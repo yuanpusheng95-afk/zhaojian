@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: photo_agent
+      POSTGRES_USER: photo_agent
+      POSTGRES_PASSWORD: photo_agent
+    ports:
+      - "54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U photo_agent -d photo_agent"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - photo_agent_postgres:/var/lib/postgresql/data
+
+volumes:
+  photo_agent_postgres:

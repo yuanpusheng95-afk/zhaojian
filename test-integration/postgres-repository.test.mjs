@@ -1,0 +1,472 @@
+import assert from 'node:assert/strict';
+import { after, beforeEach, test } from 'node:test';
+
+import pg from 'pg';
+
+import {
+  ProjectBusyError,
+  RevisionConflictError,
+} from '../src/domain/photo-project-service.mjs';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
+import { PostgresGenerationQueue } from '../src/infrastructure/postgres/generation-queue.mjs';
+import { GenerationWorker } from '../src/worker/generation-worker.mjs';
+import { MockImageProvider } from '../src/worker/mock-image-provider.mjs';
+import { createApiServer } from '../src/api/server.mjs';
+
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString:
+    process.env.DATABASE_URL ??
+    'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent_test',
+});
+
+beforeEach(async () => {
+  const database = await pool.query('SELECT current_database() AS name');
+  if (!database.rows[0].name.endsWith('_test')) {
+    throw new Error(
+      `Refusing to reset non-test database: ${database.rows[0].name}`,
+    );
+  }
+  await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+  await runMigrations(pool);
+});
+
+after(async () => {
+  await pool.end();
+});
+
+function createIdFactory() {
+  const counters = new Map();
+  return (prefix) => {
+    const next = (counters.get(prefix) ?? 0) + 1;
+    counters.set(prefix, next);
+    return `${prefix}_${next}`;
+  };
+}
+
+function createRepository() {
+  return new PostgresPhotoProjectRepository({
+    pool,
+    idFactory: createIdFactory(),
+    now: () => '2026-08-19T06:40:00.000Z',
+  });
+}
+
+function initialState() {
+  return {
+    subject: {
+      personId: 'person_1',
+      identity: { preserve: true },
+    },
+    scene: { location: 'studio' },
+    appearance: { outfit: 'black jacket' },
+    composition: { shot: 'medium' },
+    constraints: [],
+  };
+}
+
+function editPatch(value = 'ivory coat') {
+  return {
+    modify: [
+      {
+        path: 'appearance.outfit',
+        operation: 'replace',
+        value,
+      },
+    ],
+    preserve: [
+      { path: 'subject.identity', strength: 'hard' },
+      { path: 'scene.background', strength: 'hard' },
+    ],
+  };
+}
+
+async function createProject(repository) {
+  return repository.createProject({
+    projectId: 'project_1',
+    name: 'Autumn portrait',
+    initialState: initialState(),
+    anchorAssetId: 'asset_source',
+  });
+}
+
+test('migration creates the persistence tables', async () => {
+  const result = await pool.query(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+    ORDER BY table_name
+  `);
+
+  assert.deepEqual(
+    result.rows.map((row) => row.table_name),
+    [
+      'assets',
+      'generation_jobs',
+      'generation_outputs',
+      'idempotency_requests',
+      'photo_revisions',
+      'projects',
+      'schema_migrations',
+    ],
+  );
+});
+
+test('creates a project and its initial revision atomically', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const revision = await repository.getRevision(project.activeRevisionId);
+
+  assert.equal(project.id, 'project_1');
+  assert.equal(project.runningGenerationId, null);
+  assert.equal(revision.projectId, project.id);
+  assert.equal(revision.parentRevisionId, null);
+  assert.equal(revision.anchorAssetId, 'asset_source');
+  assert.deepEqual(revision.state, initialState());
+});
+
+test('persists idempotency, stale-revision checks, and the project generation lock', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const request = {
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'edit-1',
+    patch: editPatch(),
+  };
+
+  const first = await repository.requestGeneration(request);
+  const repeated = await repository.requestGeneration(request);
+
+  assert.equal(repeated.id, first.id);
+  assert.equal(first.status, 'queued');
+  assert.equal(first.proposedState.appearance.outfit, 'ivory coat');
+
+  await assert.rejects(
+    repository.requestGeneration({
+      ...request,
+      idempotencyKey: 'edit-2',
+    }),
+    ProjectBusyError,
+  );
+
+  await repository.transitionGeneration({
+    generationId: first.id,
+    to: 'failed',
+  });
+
+  await assert.rejects(
+    repository.requestGeneration({
+      ...request,
+      baseRevisionId: 'revision_stale',
+      idempotencyKey: 'edit-3',
+    }),
+    RevisionConflictError,
+  );
+});
+
+test('serializes concurrent generation requests for one project', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+
+  const results = await Promise.allSettled([
+    repository.requestGeneration({
+      projectId: project.id,
+      baseRevisionId: project.activeRevisionId,
+      idempotencyKey: 'edit-a',
+      patch: editPatch('ivory coat'),
+    }),
+    repository.requestGeneration({
+      projectId: project.id,
+      baseRevisionId: project.activeRevisionId,
+      idempotencyKey: 'edit-b',
+      patch: editPatch('red coat'),
+    }),
+  ]);
+
+  assert.equal(
+    results.filter((result) => result.status === 'fulfilled').length,
+    1,
+  );
+  const rejected = results.find((result) => result.status === 'rejected');
+  assert.ok(rejected.reason instanceof ProjectBusyError);
+});
+
+test('creates and activates a revision only when a completed candidate is selected', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'edit-1',
+    patch: editPatch(),
+  });
+
+  for (const status of [
+    'preparing',
+    'submitted',
+    'provider_processing',
+    'verifying',
+  ]) {
+    await repository.transitionGeneration({
+      generationId: generation.id,
+      to: status,
+    });
+  }
+  await repository.addCandidate({
+    generationId: generation.id,
+    candidateId: 'candidate_1',
+    assetId: 'asset_generated_1',
+    verification: { identity: { status: 'pass', score: 0.93 } },
+  });
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'completed',
+  });
+
+  assert.equal((await repository.listRevisions(project.id)).length, 1);
+
+  const revision = await repository.selectCandidate({
+    projectId: project.id,
+    generationId: generation.id,
+    candidateId: 'candidate_1',
+  });
+  const updatedProject = await repository.getProject(project.id);
+
+  assert.equal(revision.parentRevisionId, project.activeRevisionId);
+  assert.equal(revision.anchorAssetId, 'asset_generated_1');
+  assert.equal(revision.state.appearance.outfit, 'ivory coat');
+  assert.equal(updatedProject.activeRevisionId, revision.id);
+  assert.equal((await repository.listRevisions(project.id)).length, 2);
+
+  const repeated = await repository.selectCandidate({
+    projectId: project.id,
+    generationId: generation.id,
+    candidateId: 'candidate_1',
+  });
+  assert.equal(repeated.id, revision.id);
+});
+
+
+test('claims queued generations exactly once with SKIP LOCKED semantics', async () => {
+  const repository = createRepository();
+  const firstProject = await repository.createProject({
+    projectId: 'project_queue_1',
+    name: 'First queue project',
+    initialState: initialState(),
+  });
+  const secondProject = await repository.createProject({
+    projectId: 'project_queue_2',
+    name: 'Second queue project',
+    initialState: initialState(),
+  });
+  await repository.requestGeneration({
+    projectId: firstProject.id,
+    baseRevisionId: firstProject.activeRevisionId,
+    idempotencyKey: 'queue-1',
+    patch: editPatch(),
+  });
+  await repository.requestGeneration({
+    projectId: secondProject.id,
+    baseRevisionId: secondProject.activeRevisionId,
+    idempotencyKey: 'queue-2',
+    patch: editPatch(),
+  });
+
+  const queue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:41:00.000Z',
+  });
+  const [first, second] = await Promise.all([
+    queue.claimNext(),
+    queue.claimNext(),
+  ]);
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(first.status, 'preparing');
+  assert.equal(second.status, 'preparing');
+  assert.equal(await queue.claimNext(), null);
+});
+
+test('mock worker completes a generation but leaves revision creation to the user', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'worker-1',
+    patch: editPatch(),
+  });
+  const queue = new PostgresGenerationQueue({ pool, repository });
+  const worker = new GenerationWorker({
+    queue,
+    repository,
+    provider: new MockImageProvider(),
+  });
+
+  const completed = await worker.runOnce();
+  const updatedProject = await repository.getProject(project.id);
+
+  assert.equal(completed.id, generation.id);
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.candidates.length, 1);
+  assert.equal(completed.candidates[0].assetId, `asset_${generation.id}`);
+  assert.equal(updatedProject.runningGenerationId, null);
+  assert.equal(updatedProject.activeRevisionId, project.activeRevisionId);
+  assert.equal((await repository.listRevisions(project.id)).length, 1);
+});
+
+test('worker marks a provider failure and releases the project generation lock', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'worker-failure',
+    patch: editPatch(),
+  });
+  const queue = new PostgresGenerationQueue({ pool, repository });
+  const worker = new GenerationWorker({
+    queue,
+    repository,
+    provider: {
+      async generate() {
+        throw new Error('provider unavailable');
+      },
+    },
+  });
+
+  const failed = await worker.runOnce();
+  const updatedProject = await repository.getProject(project.id);
+
+  assert.equal(failed.id, generation.id);
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(failed.error, { message: 'provider unavailable' });
+  assert.equal(updatedProject.runningGenerationId, null);
+});
+
+
+test('HTTP API exposes the persisted generation and selection vertical slice', async (t) => {
+  const repository = createRepository();
+  const server = createApiServer({ repository });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  let response = await fetch(`${baseUrl}/projects`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      projectId: 'project_api',
+      name: 'API portrait',
+      initialState: initialState(),
+      anchorAssetId: 'asset_api_source',
+    }),
+  });
+  assert.equal(response.status, 201);
+  const project = await response.json();
+
+  response = await fetch(`${baseUrl}/projects/${project.id}/generations`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'idempotency-key': 'api-edit-1',
+    },
+    body: JSON.stringify({
+      baseRevisionId: project.activeRevisionId,
+      patch: editPatch(),
+    }),
+  });
+  assert.equal(response.status, 202);
+  const generation = await response.json();
+  assert.equal(generation.status, 'queued');
+
+  const worker = new GenerationWorker({
+    queue: new PostgresGenerationQueue({ pool, repository }),
+    repository,
+    provider: new MockImageProvider(),
+  });
+  await worker.runOnce();
+
+  response = await fetch(`${baseUrl}/generations/${generation.id}`);
+  assert.equal(response.status, 200);
+  const completed = await response.json();
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.candidates.length, 1);
+
+  response = await fetch(
+    `${baseUrl}/projects/${project.id}/generations/${generation.id}/selections`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ candidateId: completed.candidates[0].id }),
+    },
+  );
+  assert.equal(response.status, 201);
+  const revision = await response.json();
+
+  response = await fetch(`${baseUrl}/projects/${project.id}`);
+  assert.equal(response.status, 200);
+  const updatedProject = await response.json();
+  assert.equal(updatedProject.activeRevisionId, revision.id);
+});
+
+test('HTTP API maps domain conflicts and invalid JSON without leaking internals', async (t) => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const server = createApiServer({ repository });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  let response = await fetch(`${baseUrl}/projects/${project.id}/generations`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'idempotency-key': 'api-stale',
+    },
+    body: JSON.stringify({
+      baseRevisionId: 'revision_stale',
+      patch: editPatch(),
+    }),
+  });
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: {
+      code: 'REVISION_CONFLICT',
+      message:
+        'Revision conflict for project project_1: expected revision_stale, active revision_1',
+    },
+  });
+
+  response = await fetch(`${baseUrl}/projects`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{broken',
+  });
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: { code: 'INVALID_JSON', message: 'Request body is not valid JSON' },
+  });
+
+  response = await fetch(`${baseUrl}/projects`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      projectId: project.id,
+      name: 'Duplicate project',
+      initialState: initialState(),
+    }),
+  });
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: {
+      code: 'RESOURCE_CONFLICT',
+      message: 'Resource already exists',
+    },
+  });
+});

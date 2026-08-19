@@ -1,27 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
+import {
+  GENERATION_TRANSITIONS,
+  SELECTABLE_GENERATION_STATUSES,
+  TERMINAL_GENERATION_STATUSES,
+} from './generation-lifecycle.mjs';
 import { applyPhotoStatePatch } from './photo-state.mjs';
-
-const GENERATION_TRANSITIONS = new Map([
-  ['queued', new Set(['preparing', 'failed', 'cancelled'])],
-  ['preparing', new Set(['submitted', 'failed', 'cancelled'])],
-  ['submitted', new Set(['provider_processing', 'failed', 'cancelled'])],
-  ['provider_processing', new Set(['verifying', 'failed', 'cancelled'])],
-  [
-    'verifying',
-    new Set(['completed', 'partial_failed', 'failed', 'cancelled']),
-  ],
-]);
-const TERMINAL_GENERATION_STATUSES = new Set([
-  'completed',
-  'partial_failed',
-  'failed',
-  'cancelled',
-]);
-const SELECTABLE_GENERATION_STATUSES = new Set([
-  'completed',
-  'partial_failed',
-]);
 
 class DomainError extends Error {
   constructor(message, code) {
