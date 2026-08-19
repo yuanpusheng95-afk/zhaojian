@@ -40,17 +40,24 @@ export class GenerationWorker {
       claimToken: claimed.leaseToken,
     };
     try {
-      await this.#repository.transitionGeneration({
+      const submitted = await this.#repository.transitionGeneration({
         ...writeLease,
         to: 'submitted',
       });
-      const processing = await this.#repository.transitionGeneration({
-        ...writeLease,
-        to: 'provider_processing',
-      });
-      const candidates = await this.#generateWithHeartbeat({
-        generation: processing,
-        ...writeLease,
+      const candidates = await this.#withHeartbeat(writeLease, async () => {
+        const providerJobId = await this.#ensureProviderJob({
+          claimed,
+          generation: submitted,
+          writeLease,
+        });
+        const processing = await this.#repository.transitionGeneration({
+          ...writeLease,
+          to: 'provider_processing',
+        });
+        return this.#provider.waitForResult({
+          generation: processing,
+          jobId: providerJobId,
+        });
       });
       await this.#repository.transitionGeneration({
         ...writeLease,
@@ -97,13 +104,39 @@ export class GenerationWorker {
     }
   }
 
-  async #generateWithHeartbeat({ generation, generationId, claimToken }) {
+  async #ensureProviderJob({ claimed, generation, writeLease }) {
+    requireProvider(this.#provider);
+    if (claimed.providerJobId) {
+      if (claimed.providerName !== this.#provider.name) {
+        throw new Error(
+          `Provider job ${claimed.providerJobId} belongs to ${claimed.providerName}, not ${this.#provider.name}`,
+        );
+      }
+      return claimed.providerJobId;
+    }
+
+    const submission = await this.#provider.submit({
+      generation,
+      idempotencyKey: claimed.id,
+    });
+    if (typeof submission?.jobId !== 'string' || submission.jobId === '') {
+      throw new Error(`Provider ${this.#provider.name} returned no job ID`);
+    }
+    await this.#repository.recordProviderJob({
+      ...writeLease,
+      providerName: this.#provider.name,
+      providerJobId: submission.jobId,
+    });
+    return submission.jobId;
+  }
+
+  async #withHeartbeat({ generationId, claimToken }, operation) {
     if (
       !claimToken ||
       typeof this.#queue.renewLease !== 'function' ||
       this.#heartbeatIntervalMs <= 0
     ) {
-      return this.#provider.generate({ generation });
+      return operation();
     }
 
     let stopped = false;
@@ -122,12 +155,12 @@ export class GenerationWorker {
     };
     const timer = this.#setInterval(heartbeat, this.#heartbeatIntervalMs);
 
-    let candidates;
-    let providerError = null;
+    let result;
+    let operationError = null;
     try {
-      candidates = await this.#provider.generate({ generation });
+      result = await operation();
     } catch (error) {
-      providerError = error;
+      operationError = error;
     } finally {
       stopped = true;
       this.#clearInterval(timer);
@@ -135,8 +168,19 @@ export class GenerationWorker {
     }
 
     if (heartbeatError) throw heartbeatError;
-    if (providerError) throw providerError;
-    return candidates;
+    if (operationError) throw operationError;
+    return result;
+  }
+}
+
+function requireProvider(provider) {
+  if (
+    typeof provider?.name !== 'string' ||
+    provider.name === '' ||
+    typeof provider.submit !== 'function' ||
+    typeof provider.waitForResult !== 'function'
+  ) {
+    throw new Error('Image provider must implement name, submit(), and waitForResult()');
   }
 }
 

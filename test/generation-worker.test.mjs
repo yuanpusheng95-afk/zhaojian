@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { GenerationLeaseLostError } from '../src/infrastructure/postgres/photo-project-repository.mjs';
 import { GenerationWorker } from '../src/worker/generation-worker.mjs';
 
-function createHarness({ renewError = null } = {}) {
+function createHarness({ renewError = null, providerJobId = null } = {}) {
   const calls = [];
   let heartbeat;
   let status = 'preparing';
@@ -12,6 +12,11 @@ function createHarness({ renewError = null } = {}) {
     id: 'generation_1',
     status,
     leaseToken: 'lease_1',
+    providerName: providerJobId ? 'mock' : null,
+    providerJobId,
+    providerSubmittedAt: providerJobId
+      ? '2026-08-19T06:39:00.000Z'
+      : null,
   };
   const queue = {
     async claimNext() {
@@ -27,7 +32,18 @@ function createHarness({ renewError = null } = {}) {
     async transitionGeneration(input) {
       calls.push(['transitionGeneration', input]);
       status = input.to;
-      return { ...claimed, status, candidates: status === 'completed' ? [{}] : [] };
+      return {
+        ...claimed,
+        status,
+        candidates: status === 'completed' ? [{}] : [],
+      };
+    },
+    async recordProviderJob(input) {
+      calls.push(['recordProviderJob', input]);
+      return {
+        providerName: input.providerName,
+        providerJobId: input.providerJobId,
+      };
     },
     async addCandidate(input) {
       calls.push(['addCandidate', input]);
@@ -39,7 +55,13 @@ function createHarness({ renewError = null } = {}) {
     },
   };
   const provider = {
-    async generate() {
+    name: 'mock',
+    async submit(input) {
+      calls.push(['submit', input]);
+      return { jobId: 'provider_job_1' };
+    },
+    async waitForResult(input) {
+      calls.push(['waitForResult', input]);
       await heartbeat();
       return [{ candidateId: 'candidate_1', assetId: 'asset_1' }];
     },
@@ -60,25 +82,49 @@ function createHarness({ renewError = null } = {}) {
   return { calls, worker };
 }
 
-test('worker carries the claim token through writes and renews during provider work', async () => {
+test('worker submits with a stable idempotency key, persists the provider job, and waits for it', async () => {
   const { calls, worker } = createHarness();
 
   const completed = await worker.runOnce();
 
   assert.equal(completed.status, 'completed');
-  const writes = calls.filter(([name]) =>
-    ['transitionGeneration', 'addCandidate'].includes(name),
+  const submit = calls.find(([name]) => name === 'submit');
+  assert.equal(submit[1].idempotencyKey, 'generation_1');
+  assert.equal(submit[1].generation.id, 'generation_1');
+  assert.deepEqual(calls.find(([name]) => name === 'recordProviderJob'), [
+    'recordProviderJob',
+    {
+      generationId: 'generation_1',
+      claimToken: 'lease_1',
+      providerName: 'mock',
+      providerJobId: 'provider_job_1',
+    },
+  ]);
+  assert.equal(
+    calls.find(([name]) => name === 'waitForResult')[1].jobId,
+    'provider_job_1',
   );
-  assert.ok(writes.length > 0);
+  const writes = calls.filter(([name]) =>
+    ['transitionGeneration', 'recordProviderJob', 'addCandidate'].includes(name),
+  );
   assert.ok(writes.every(([, input]) => input.claimToken === 'lease_1'));
-  assert.deepEqual(calls.find(([name]) => name === 'renewLease'), [
-    'renewLease',
-    { generationId: 'generation_1', claimToken: 'lease_1' },
-  ]);
-  assert.deepEqual(calls.find(([name]) => name === 'clearInterval'), [
-    'clearInterval',
-    'timer_1',
-  ]);
+  assert.ok(calls.some(([name]) => name === 'renewLease'));
+});
+
+test('worker resumes a persisted provider job without submitting it again', async () => {
+  const { calls, worker } = createHarness({
+    providerJobId: 'provider_job_existing',
+  });
+
+  const completed = await worker.runOnce();
+
+  assert.equal(completed.status, 'completed');
+  assert.equal(calls.some(([name]) => name === 'submit'), false);
+  assert.equal(calls.some(([name]) => name === 'recordProviderJob'), false);
+  assert.equal(
+    calls.find(([name]) => name === 'waitForResult')[1].jobId,
+    'provider_job_existing',
+  );
 });
 
 test('worker stops writing and does not fail a generation after losing its lease', async () => {

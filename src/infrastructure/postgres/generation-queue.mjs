@@ -41,7 +41,8 @@ export class PostgresGenerationQueue {
       while (!lease) {
         const now = this.#now();
         const result = await client.query(
-          `SELECT id, project_id, status, attempt_count
+          `SELECT id, project_id, status, attempt_count,
+                  provider_name, provider_job_id, provider_submitted_at
            FROM generation_jobs
            WHERE status = 'queued'
               OR (
@@ -88,6 +89,9 @@ export class PostgresGenerationQueue {
           leaseToken: claimToken,
           leaseExpiresAt,
           attemptCount: claimed.rows[0].attempt_count,
+          providerName: job.provider_name,
+          providerJobId: job.provider_job_id,
+          providerSubmittedAt: toIso(job.provider_submitted_at),
         };
       }
       await client.query('COMMIT');
@@ -154,4 +158,8 @@ export class PostgresGenerationQueue {
 
 function addMilliseconds(isoTime, durationMs) {
   return new Date(new Date(isoTime).getTime() + durationMs).toISOString();
+}
+
+function toIso(value) {
+  return value instanceof Date ? value.toISOString() : value;
 }

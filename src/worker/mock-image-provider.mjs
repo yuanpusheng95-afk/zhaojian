@@ -1,5 +1,11 @@
 export class MockImageProvider {
-  async generate({ generation }) {
+  name = 'mock';
+
+  async submit({ generation }) {
+    return { jobId: `mock_job_${generation.id}` };
+  }
+
+  async waitForResult({ generation }) {
     return [
       {
         candidateId: `candidate_${generation.id}`,

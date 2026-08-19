@@ -11,6 +11,7 @@ import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
 import {
   GenerationLeaseLostError,
   PostgresPhotoProjectRepository,
+  ProviderJobConflictError,
 } from '../src/infrastructure/postgres/photo-project-repository.mjs';
 import { PostgresGenerationQueue } from '../src/infrastructure/postgres/generation-queue.mjs';
 import { GenerationWorker } from '../src/worker/generation-worker.mjs';
@@ -335,7 +336,11 @@ test('worker marks a provider failure and releases the project generation lock',
     queue,
     repository,
     provider: {
-      async generate() {
+      name: 'failing',
+      async submit() {
+        return { jobId: 'failing_job_1' };
+      },
+      async waitForResult() {
         throw new Error('provider unavailable');
       },
     },
@@ -672,4 +677,143 @@ test('fails an expired generation after max attempts and releases the project lo
     message: 'Generation lease exhausted after 2 attempts',
   });
   assert.equal(updatedProject.runningGenerationId, null);
+});
+
+test('migration adds persisted provider job fields', async () => {
+  const result = await pool.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'generation_jobs'
+      AND column_name IN (
+        'provider_name',
+        'provider_job_id',
+        'provider_submitted_at'
+      )
+    ORDER BY column_name
+  `);
+
+  assert.deepEqual(
+    result.rows.map((row) => row.column_name),
+    ['provider_job_id', 'provider_name', 'provider_submitted_at'],
+  );
+});
+
+test('provider job binding is idempotent and cannot be replaced', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'provider-binding',
+    patch: editPatch(),
+  });
+  const queue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    tokenFactory: () => 'lease_provider_binding',
+  });
+  const claimed = await queue.claimNext();
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'submitted',
+    claimToken: claimed.leaseToken,
+  });
+
+  const first = await repository.recordProviderJob({
+    generationId: generation.id,
+    claimToken: claimed.leaseToken,
+    providerName: 'mock',
+    providerJobId: 'provider_job_fixed',
+  });
+  const repeated = await repository.recordProviderJob({
+    generationId: generation.id,
+    claimToken: claimed.leaseToken,
+    providerName: 'mock',
+    providerJobId: 'provider_job_fixed',
+  });
+
+  assert.deepEqual(repeated, first);
+  await assert.rejects(
+    repository.recordProviderJob({
+      generationId: generation.id,
+      claimToken: claimed.leaseToken,
+      providerName: 'mock',
+      providerJobId: 'provider_job_replacement',
+    }),
+    ProviderJobConflictError,
+  );
+});
+
+test('reclaimed worker resumes the persisted provider job without duplicate submission', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'provider-resume',
+    patch: editPatch(),
+  });
+  const firstQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:00.000Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_provider_old',
+  });
+  const firstClaim = await firstQueue.claimNext();
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'submitted',
+    claimToken: firstClaim.leaseToken,
+  });
+  await repository.recordProviderJob({
+    generationId: generation.id,
+    claimToken: firstClaim.leaseToken,
+    providerName: 'mock',
+    providerJobId: 'provider_job_existing',
+  });
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'provider_processing',
+    claimToken: firstClaim.leaseToken,
+  });
+
+  const providerCalls = [];
+  const worker = new GenerationWorker({
+    queue: new PostgresGenerationQueue({
+      pool,
+      repository,
+      now: () => '2026-08-19T06:40:02.000Z',
+      leaseDurationMs: 1_000,
+      tokenFactory: () => 'lease_provider_new',
+    }),
+    repository,
+    provider: {
+      name: 'mock',
+      async submit() {
+        providerCalls.push('submit');
+        throw new Error('must not submit an existing provider job');
+      },
+      async waitForResult({ jobId }) {
+        providerCalls.push(['waitForResult', jobId]);
+        return [
+          {
+            candidateId: 'candidate_provider_resumed',
+            assetId: 'asset_provider_resumed',
+          },
+        ];
+      },
+    },
+    heartbeatIntervalMs: 0,
+  });
+
+  const completed = await worker.runOnce();
+  const publicGeneration = await repository.getGeneration(generation.id);
+
+  assert.equal(completed.status, 'completed');
+  assert.deepEqual(providerCalls, [
+    ['waitForResult', 'provider_job_existing'],
+  ]);
+  assert.equal('providerJobId' in publicGeneration, false);
 });

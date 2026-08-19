@@ -25,6 +25,14 @@ export class GenerationLeaseLostError extends Error {
   }
 }
 
+export class ProviderJobConflictError extends Error {
+  constructor(generationId) {
+    super(`Generation already has a different provider job: ${generationId}`);
+    this.name = 'ProviderJobConflictError';
+    this.code = 'PROVIDER_JOB_CONFLICT';
+  }
+}
+
 export class PostgresPhotoProjectRepository {
   #pool;
   #idFactory;
@@ -222,6 +230,51 @@ export class PostgresPhotoProjectRepository {
     });
   }
 
+  async recordProviderJob({
+    generationId,
+    claimToken,
+    providerName,
+    providerJobId,
+  }) {
+    return this.#transaction(async (client) => {
+      const generation = await this.#requireGeneration(client, generationId, {
+        forUpdate: true,
+        includeLease: true,
+        includeProvider: true,
+      });
+      requireLease(generation, claimToken);
+      if (generation.status !== 'submitted') {
+        throw new GenerationTransitionError(
+          generationId,
+          generation.status,
+          'record_provider_job',
+        );
+      }
+      if (generation.providerJobId) {
+        if (
+          generation.providerName === providerName &&
+          generation.providerJobId === providerJobId
+        ) {
+          return providerJobFromGeneration(generation);
+        }
+        throw new ProviderJobConflictError(generationId);
+      }
+
+      const now = this.#now();
+      const result = await client.query(
+        `UPDATE generation_jobs
+         SET provider_name = $2,
+             provider_job_id = $3,
+             provider_submitted_at = $4,
+             updated_at = $4
+         WHERE id = $1
+         RETURNING provider_name, provider_job_id, provider_submitted_at`,
+        [generationId, providerName, providerJobId, now],
+      );
+      return mapProviderJob(result.rows[0]);
+    });
+  }
+
   async addCandidate({
     generationId,
     candidateId,
@@ -407,7 +460,11 @@ export class PostgresPhotoProjectRepository {
   async #requireGeneration(
     database,
     generationId,
-    { forUpdate = false, includeLease = false } = {},
+    {
+      forUpdate = false,
+      includeLease = false,
+      includeProvider = false,
+    } = {},
   ) {
     const result = await database.query(
       `SELECT * FROM generation_jobs WHERE id = $1${forUpdate ? ' FOR UPDATE' : ''}`,
@@ -422,7 +479,10 @@ export class PostgresPhotoProjectRepository {
        ORDER BY created_at, id`,
       [generationId],
     );
-    return mapGeneration(result.rows[0], candidates.rows, { includeLease });
+    return mapGeneration(result.rows[0], candidates.rows, {
+      includeLease,
+      includeProvider,
+    });
   }
 
   async #requireRevision(database, revisionId) {
@@ -477,7 +537,11 @@ function mapRevision(row) {
   };
 }
 
-function mapGeneration(row, candidateRows, { includeLease = false } = {}) {
+function mapGeneration(
+  row,
+  candidateRows,
+  { includeLease = false, includeProvider = false } = {},
+) {
   const generation = {
     id: row.id,
     projectId: row.project_id,
@@ -500,7 +564,28 @@ function mapGeneration(row, candidateRows, { includeLease = false } = {}) {
     generation.leaseExpiresAt = toIso(row.lease_expires_at);
     generation.attemptCount = row.attempt_count;
   }
+  if (includeProvider) {
+    generation.providerName = row.provider_name;
+    generation.providerJobId = row.provider_job_id;
+    generation.providerSubmittedAt = toIso(row.provider_submitted_at);
+  }
   return generation;
+}
+
+function providerJobFromGeneration(generation) {
+  return {
+    providerName: generation.providerName,
+    providerJobId: generation.providerJobId,
+    providerSubmittedAt: generation.providerSubmittedAt,
+  };
+}
+
+function mapProviderJob(row) {
+  return {
+    providerName: row.provider_name,
+    providerJobId: row.provider_job_id,
+    providerSubmittedAt: toIso(row.provider_submitted_at),
+  };
 }
 
 function requireLease(generation, claimToken) {
