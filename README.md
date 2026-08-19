@@ -1,6 +1,6 @@
 # 照见（Zhaojian）Photo Agent
 
-PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、SQL Job Queue、独立 Generation Worker 和 Mock Image Provider。
+PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、带租约的 SQL Job Queue、独立 Generation Worker 和 Mock Image Provider。
 
 ## 已实现闭环
 
@@ -8,7 +8,8 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 创建 Project 与初始 Revision
 → 提交带幂等键的 State Patch
 → 创建 Generation Job 并锁定 Project
-→ Worker 使用 FOR UPDATE SKIP LOCKED 领取任务
+→ Worker 使用 FOR UPDATE SKIP LOCKED 领取任务并持有租约
+→ Provider 长调用期间心跳续租
 → Mock Provider 生成 Candidate
 → 用户选择 Candidate
 → 事务内创建新 Revision 并切换 activeRevisionId
@@ -23,6 +24,8 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 - 每个生成请求必须携带幂等键。
 - 过期 `baseRevisionId` 返回 Revision Conflict。
 - 项目锁、幂等记录、Candidate 选择和 Revision 切换由 PostgreSQL 事务保证。
+- Worker 写入必须携带领取时获得的 lease token；过期任务可重领，旧 Worker 不能继续写。
+- 默认租约 30 秒、心跳 10 秒、最多尝试 3 次；耗尽后任务失败并释放项目锁。
 
 ## 运行环境
 
@@ -109,4 +112,6 @@ test-integration/                   真实 PostgreSQL 与 HTTP 纵切测试
 
 - 只接 Mock Image Provider，尚未接真实图像供应商。
 - 尚未实现对象存储上传、鉴权、SSE、LLM Edit Parser 和前端。
-- **assumption：V1 当前按单 Worker 运行。** Worker 进程在任务中途崩溃时，尚未实现租约超时和自动回收；下一阶段接真实 Provider 前必须补上。
+- 租约只能阻止 stale worker 写数据库，不能撤销已经发给真实 Provider 的外部调用。
+- **assumption：真实 Provider 调用需要可重入，最好支持供应商侧幂等键。** 否则 Worker 崩溃重领可能产生重复费用或孤立结果。
+- 过期任务重领会删除旧 Candidate 关联，但当前保留其生成 Asset，后续需要垃圾回收。

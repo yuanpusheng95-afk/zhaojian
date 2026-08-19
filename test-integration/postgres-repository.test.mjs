@@ -8,7 +8,10 @@ import {
   RevisionConflictError,
 } from '../src/domain/photo-project-service.mjs';
 import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
-import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
+import {
+  GenerationLeaseLostError,
+  PostgresPhotoProjectRepository,
+} from '../src/infrastructure/postgres/photo-project-repository.mjs';
 import { PostgresGenerationQueue } from '../src/infrastructure/postgres/generation-queue.mjs';
 import { GenerationWorker } from '../src/worker/generation-worker.mjs';
 import { MockImageProvider } from '../src/worker/mock-image-provider.mjs';
@@ -469,4 +472,204 @@ test('HTTP API maps domain conflicts and invalid JSON without leaking internals'
       message: 'Resource already exists',
     },
   });
+});
+
+
+test('migration adds generation lease fields', async () => {
+  const result = await pool.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'generation_jobs'
+      AND column_name IN (
+        'claim_token',
+        'claimed_at',
+        'lease_expires_at',
+        'attempt_count'
+      )
+    ORDER BY column_name
+  `);
+
+  assert.deepEqual(
+    result.rows.map((row) => row.column_name),
+    ['attempt_count', 'claim_token', 'claimed_at', 'lease_expires_at'],
+  );
+});
+
+test('reclaims an expired generation and rejects writes from the stale worker', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'lease-reclaim',
+    patch: editPatch(),
+  });
+  const firstQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:00.000Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_old',
+  });
+  const firstClaim = await firstQueue.claimNext();
+
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'submitted',
+    claimToken: firstClaim.leaseToken,
+  });
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'provider_processing',
+    claimToken: firstClaim.leaseToken,
+  });
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'verifying',
+    claimToken: firstClaim.leaseToken,
+  });
+  await repository.addCandidate({
+    generationId: generation.id,
+    candidateId: 'candidate_abandoned',
+    assetId: 'asset_abandoned',
+    claimToken: firstClaim.leaseToken,
+  });
+
+  const recoveryQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:02.000Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_new',
+  });
+  const recovered = await recoveryQueue.claimNext();
+
+  assert.equal(recovered.id, generation.id);
+  assert.equal(recovered.status, 'preparing');
+  assert.equal(recovered.leaseToken, 'lease_new');
+  assert.equal(recovered.attemptCount, 2);
+  assert.equal(recovered.candidates.length, 0);
+
+  await assert.rejects(
+    repository.transitionGeneration({
+      generationId: generation.id,
+      to: 'submitted',
+      claimToken: firstClaim.leaseToken,
+    }),
+    GenerationLeaseLostError,
+  );
+  await assert.rejects(
+    repository.addCandidate({
+      generationId: generation.id,
+      candidateId: 'candidate_stale',
+      assetId: 'asset_stale',
+      claimToken: firstClaim.leaseToken,
+    }),
+    GenerationLeaseLostError,
+  );
+  assert.equal('leaseToken' in (await repository.getGeneration(generation.id)), false);
+
+  const submitted = await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'submitted',
+    claimToken: recovered.leaseToken,
+  });
+  assert.equal(submitted.status, 'submitted');
+});
+
+test('renews a lease so another worker cannot reclaim it early', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'lease-renew',
+    patch: editPatch(),
+  });
+  let now = '2026-08-19T06:40:00.000Z';
+  const queue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => now,
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_renewed',
+  });
+  const claimed = await queue.claimNext();
+
+  now = '2026-08-19T06:40:00.500Z';
+  const renewed = await queue.renewLease({
+    generationId: generation.id,
+    claimToken: claimed.leaseToken,
+  });
+  assert.equal(renewed.leaseExpiresAt, '2026-08-19T06:40:01.500Z');
+
+  const earlyQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:01.200Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_too_early',
+  });
+  assert.equal(await earlyQueue.claimNext(), null);
+
+  const lateQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:01.600Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_after_expiry',
+  });
+  const reclaimed = await lateQueue.claimNext();
+  assert.equal(reclaimed.leaseToken, 'lease_after_expiry');
+  assert.equal(reclaimed.attemptCount, 2);
+});
+
+test('fails an expired generation after max attempts and releases the project lock', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'lease-exhausted',
+    patch: editPatch(),
+  });
+
+  const firstQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:00.000Z',
+    leaseDurationMs: 1_000,
+    maxAttempts: 2,
+    tokenFactory: () => 'lease_attempt_1',
+  });
+  await firstQueue.claimNext();
+
+  const secondQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:02.000Z',
+    leaseDurationMs: 1_000,
+    maxAttempts: 2,
+    tokenFactory: () => 'lease_attempt_2',
+  });
+  await secondQueue.claimNext();
+
+  const exhaustedQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:04.000Z',
+    leaseDurationMs: 1_000,
+    maxAttempts: 2,
+    tokenFactory: () => 'lease_attempt_3',
+  });
+  assert.equal(await exhaustedQueue.claimNext(), null);
+
+  const failed = await repository.getGeneration(generation.id);
+  const updatedProject = await repository.getProject(project.id);
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(failed.error, {
+    message: 'Generation lease exhausted after 2 attempts',
+  });
+  assert.equal(updatedProject.runningGenerationId, null);
 });

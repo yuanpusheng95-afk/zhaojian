@@ -17,6 +17,14 @@ import {
 } from '../../domain/generation-lifecycle.mjs';
 import { applyPhotoStatePatch } from '../../domain/photo-state.mjs';
 
+export class GenerationLeaseLostError extends Error {
+  constructor(generationId) {
+    super(`Generation lease lost: ${generationId}`);
+    this.name = 'GenerationLeaseLostError';
+    this.code = 'GENERATION_LEASE_LOST';
+  }
+}
+
 export class PostgresPhotoProjectRepository {
   #pool;
   #idFactory;
@@ -160,20 +168,20 @@ export class PostgresPhotoProjectRepository {
     });
   }
 
-  async transitionGeneration({ generationId, to, error = null }) {
+  async transitionGeneration({
+    generationId,
+    to,
+    error = null,
+    claimToken,
+  }) {
     return this.#transaction(async (client) => {
-      const identity = await client.query(
-        'SELECT project_id FROM generation_jobs WHERE id = $1',
-        [generationId],
-      );
-      if (identity.rowCount === 0) {
-        throw new GenerationNotFoundError(generationId);
-      }
-      const projectId = identity.rows[0].project_id;
-      await this.#requireProject(client, projectId, { forUpdate: true });
       const generation = await this.#requireGeneration(client, generationId, {
         forUpdate: true,
+        includeLease: true,
       });
+      const projectId = generation.projectId;
+      await this.#requireProject(client, projectId, { forUpdate: true });
+      requireLease(generation, claimToken);
       const allowed = GENERATION_TRANSITIONS.get(generation.status);
       if (!allowed?.has(to)) {
         throw new GenerationTransitionError(
@@ -193,9 +201,14 @@ export class PostgresPhotoProjectRepository {
       const now = this.#now();
       await client.query(
         `UPDATE generation_jobs
-         SET status = $2, last_error_json = $3, updated_at = $4
+         SET status = $2,
+             last_error_json = $3,
+             updated_at = $4,
+             claim_token = CASE WHEN $5 THEN NULL ELSE claim_token END,
+             claimed_at = CASE WHEN $5 THEN NULL ELSE claimed_at END,
+             lease_expires_at = CASE WHEN $5 THEN NULL ELSE lease_expires_at END
          WHERE id = $1`,
-        [generationId, to, error, now],
+        [generationId, to, error, now, TERMINAL_GENERATION_STATUSES.has(to)],
       );
       if (TERMINAL_GENERATION_STATUSES.has(to)) {
         await client.query(
@@ -214,11 +227,14 @@ export class PostgresPhotoProjectRepository {
     candidateId,
     assetId,
     verification = {},
+    claimToken,
   }) {
     return this.#transaction(async (client) => {
       const generation = await this.#requireGeneration(client, generationId, {
         forUpdate: true,
+        includeLease: true,
       });
+      requireLease(generation, claimToken);
       if (generation.status !== 'verifying') {
         throw new GenerationTransitionError(
           generationId,
@@ -259,10 +275,10 @@ export class PostgresPhotoProjectRepository {
 
   async selectCandidate({ projectId, generationId, candidateId }) {
     return this.#transaction(async (client) => {
-      const project = await this.#requireProject(client, projectId, {
+      const generation = await this.#requireGeneration(client, generationId, {
         forUpdate: true,
       });
-      const generation = await this.#requireGeneration(client, generationId, {
+      const project = await this.#requireProject(client, projectId, {
         forUpdate: true,
       });
       if (generation.projectId !== projectId) {
@@ -388,7 +404,11 @@ export class PostgresPhotoProjectRepository {
     return mapProject(result.rows[0]);
   }
 
-  async #requireGeneration(database, generationId, { forUpdate = false } = {}) {
+  async #requireGeneration(
+    database,
+    generationId,
+    { forUpdate = false, includeLease = false } = {},
+  ) {
     const result = await database.query(
       `SELECT * FROM generation_jobs WHERE id = $1${forUpdate ? ' FOR UPDATE' : ''}`,
       [generationId],
@@ -402,7 +422,7 @@ export class PostgresPhotoProjectRepository {
        ORDER BY created_at, id`,
       [generationId],
     );
-    return mapGeneration(result.rows[0], candidates.rows);
+    return mapGeneration(result.rows[0], candidates.rows, { includeLease });
   }
 
   async #requireRevision(database, revisionId) {
@@ -457,8 +477,8 @@ function mapRevision(row) {
   };
 }
 
-function mapGeneration(row, candidateRows) {
-  return {
+function mapGeneration(row, candidateRows, { includeLease = false } = {}) {
+  const generation = {
     id: row.id,
     projectId: row.project_id,
     inputRevisionId: row.input_revision_id,
@@ -474,6 +494,19 @@ function mapGeneration(row, candidateRows) {
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
   };
+  if (includeLease) {
+    generation.leaseToken = row.claim_token;
+    generation.claimedAt = toIso(row.claimed_at);
+    generation.leaseExpiresAt = toIso(row.lease_expires_at);
+    generation.attemptCount = row.attempt_count;
+  }
+  return generation;
+}
+
+function requireLease(generation, claimToken) {
+  if (generation.leaseToken && generation.leaseToken !== claimToken) {
+    throw new GenerationLeaseLostError(generation.id);
+  }
 }
 
 function mapCandidate(row) {
