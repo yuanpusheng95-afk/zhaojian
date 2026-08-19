@@ -1,6 +1,6 @@
 # 照见（Zhaojian）Photo Agent
 
-PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、带租约的 SQL Job Queue、独立 Generation Worker 和 Mock Image Provider。
+PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、带租约的 SQL Job Queue、独立 Generation Worker 和 Mock ImageGenerationProvider。
 
 ## 已实现闭环
 
@@ -10,7 +10,7 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 → 创建 Generation Job 并锁定 Project
 → Worker 使用 FOR UPDATE SKIP LOCKED 领取任务并持有租约
 → 使用 Generation ID 作为 Provider 幂等键提交任务
-→ 持久化 Provider Job ID
+→ 持久化 Provider、模型和 Job ID
 → Provider 长调用期间心跳续租
 → Mock Provider 返回 Candidate
 → 用户选择 Candidate
@@ -19,7 +19,9 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 
 关键边界：
 
-- LLM/客户端只能提交结构化 Patch，不能直接改 Photo State。
+- LanguageModel/客户端只能提交结构化 Patch，不能直接改 Photo State。
+- LanguageModel 负责自然语言理解与 Patch 规划，不参与 Generation Worker。
+- ImageGenerationProvider 负责异步生图、Job 幂等提交和崩溃恢复。
 - 同一项目同时只允许一个运行中的 Generation Job。
 - `Generation`、`Candidate`、`Revision` 是三个独立概念。
 - Generation 完成不会自动创建 Revision；用户选择 Candidate 后才创建。
@@ -28,8 +30,25 @@ PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久
 - 项目锁、幂等记录、Candidate 选择和 Revision 切换由 PostgreSQL 事务保证。
 - Worker 写入必须携带领取时获得的 lease token；过期任务可重领，旧 Worker 不能继续写。
 - 默认租约 30 秒、心跳 10 秒、最多尝试 3 次；耗尽后任务失败并释放项目锁。
-- Provider Job 与 Generation 一对一绑定；重领任务会恢复已有 Job，不重复 submit。
-- Provider Job ID 只在 Queue/Worker 内部流转，不通过 HTTP 暴露。
+- Provider Job 与 Generation 一对一绑定；新任务持久化 `providerName + providerModel + providerJobId`，重领时只恢复完全匹配的 Provider/模型。
+- 历史 Provider Job 允许 `providerModel` 为空；这类记录只按 Provider 匹配，避免 migration 破坏旧任务。
+- Provider 名称、模型和 Job ID 只在 Queue/Worker 内部流转，不通过公共 Generation/HTTP 暴露。
+
+## 模型能力边界
+
+```text
+用户自然语言
+→ LanguageModel：理解意图并输出结构化 Photo State Patch
+→ Domain：校验 Patch 并创建 Generation
+→ ImageGenerationProvider：提交异步生图 Job 并返回 Candidate
+```
+
+两类能力是互不继承的 Port，不使用带 `modelType` 分支的万能 `ModelProvider`：
+
+- `LanguageModel` 不接触 Generation、Candidate 或 Revision。
+- `ImageGenerationProvider` 必须声明 `capability = image_generation`、`providerName` 和 `modelName`。
+- Generation Worker 构造时拒绝语言模型 Adapter。
+- 当前纵切只实现 ImageGenerationProvider；LanguageModel/Edit Interpreter 仍是后续独立纵切。
 
 ## 运行环境
 
@@ -114,9 +133,9 @@ test-integration/                   真实 PostgreSQL 与 HTTP 纵切测试
 
 ## 当前限制
 
-- 只接 Mock Image Provider，尚未接真实图像供应商。
-- 尚未实现对象存储上传、鉴权、SSE、LLM Edit Parser 和前端。
+- 只接 Mock ImageGenerationProvider，尚未接真实图像供应商。
+- 尚未实现对象存储上传、鉴权、SSE、LanguageModel/Edit Interpreter 和前端。
 - 租约只能阻止 stale worker 写数据库，不能撤销已经发给真实 Provider 的外部调用。
-- Worker 已把稳定的 Generation ID 作为供应商幂等键，并持久化 Provider Job ID。
+- Worker 已把稳定的 Generation ID 作为供应商幂等键，并持久化 Provider、模型和 Job ID。
 - **assumption：真实 Provider 必须真正兑现该幂等键。** 如果供应商忽略幂等键，崩溃发生在“提交成功、Job ID 落库前”时仍可能重复扣费。
 - 过期任务重领会删除旧 Candidate 关联，但当前保留其生成 Asset，后续需要垃圾回收。
