@@ -811,6 +811,7 @@ test('reclaimed worker resumes the persisted provider job without duplicate subm
     generationId: generation.id,
     claimToken: firstClaim.leaseToken,
     providerName: 'mock',
+    providerModel: 'mock-image-v1',
     providerJobId: 'provider_job_existing',
   });
   await repository.transitionGeneration({
@@ -820,17 +821,26 @@ test('reclaimed worker resumes the persisted provider job without duplicate subm
   });
 
   const providerCalls = [];
+  const recoveryQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:02.000Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_provider_new',
+  });
   const worker = new GenerationWorker({
-    queue: new PostgresGenerationQueue({
-      pool,
-      repository,
-      now: () => '2026-08-19T06:40:02.000Z',
-      leaseDurationMs: 1_000,
-      tokenFactory: () => 'lease_provider_new',
-    }),
+    queue: {
+      async claimNext() {
+        const reclaimed = await recoveryQueue.claimNext();
+        assert.equal(reclaimed.providerModel, 'mock-image-v1');
+        return reclaimed;
+      },
+    },
     repository,
     provider: {
-      name: 'mock',
+      capability: 'image_generation',
+      providerName: 'mock',
+      modelName: 'mock-image-v1',
       async submit() {
         providerCalls.push('submit');
         throw new Error('must not submit an existing provider job');
@@ -856,4 +866,87 @@ test('reclaimed worker resumes the persisted provider job without duplicate subm
     ['waitForResult', 'provider_job_existing'],
   ]);
   assert.equal('providerJobId' in publicGeneration, false);
+  assert.equal('providerModel' in publicGeneration, false);
+});
+
+test('reclaimed worker resumes a legacy provider job without model identity', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await repository.requestGeneration({
+    projectId: project.id,
+    baseRevisionId: project.activeRevisionId,
+    idempotencyKey: 'legacy-provider-resume',
+    patch: editPatch(),
+  });
+  const firstQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:00.000Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_legacy_provider_old',
+  });
+  const firstClaim = await firstQueue.claimNext();
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'submitted',
+    claimToken: firstClaim.leaseToken,
+  });
+  await pool.query(
+    `UPDATE generation_jobs
+     SET provider_name = 'mock',
+         provider_job_id = 'legacy_provider_job',
+         provider_submitted_at = $2
+     WHERE id = $1`,
+    [generation.id, '2026-08-19T06:40:00.000Z'],
+  );
+  await repository.transitionGeneration({
+    generationId: generation.id,
+    to: 'provider_processing',
+    claimToken: firstClaim.leaseToken,
+  });
+
+  let submitCalls = 0;
+  const waitCalls = [];
+  const recoveryQueue = new PostgresGenerationQueue({
+    pool,
+    repository,
+    now: () => '2026-08-19T06:40:02.000Z',
+    leaseDurationMs: 1_000,
+    tokenFactory: () => 'lease_legacy_provider_new',
+  });
+  const worker = new GenerationWorker({
+    queue: {
+      async claimNext() {
+        const reclaimed = await recoveryQueue.claimNext();
+        assert.equal(reclaimed.providerModel, null);
+        return reclaimed;
+      },
+    },
+    repository,
+    provider: {
+      capability: 'image_generation',
+      providerName: 'mock',
+      modelName: 'mock-image-v1',
+      async submit() {
+        submitCalls += 1;
+        throw new Error('must not submit a legacy provider job');
+      },
+      async waitForResult({ jobId }) {
+        waitCalls.push(jobId);
+        return [
+          {
+            candidateId: 'candidate_legacy_provider_resumed',
+            assetId: 'asset_legacy_provider_resumed',
+          },
+        ];
+      },
+    },
+    heartbeatIntervalMs: 0,
+  });
+
+  const completed = await worker.runOnce();
+
+  assert.equal(completed.status, 'completed');
+  assert.equal(submitCalls, 0);
+  assert.deepEqual(waitCalls, ['legacy_provider_job']);
 });
