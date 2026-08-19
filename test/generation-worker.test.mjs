@@ -4,7 +4,11 @@ import { test } from 'node:test';
 import { GenerationLeaseLostError } from '../src/infrastructure/postgres/photo-project-repository.mjs';
 import { GenerationWorker } from '../src/worker/generation-worker.mjs';
 
-function createHarness({ renewError = null, providerJobId = null } = {}) {
+function createHarness({
+  renewError = null,
+  providerJobId = null,
+  providerModel = providerJobId ? 'mock-image-v1' : null,
+} = {}) {
   const calls = [];
   let heartbeat;
   let status = 'preparing';
@@ -13,6 +17,7 @@ function createHarness({ renewError = null, providerJobId = null } = {}) {
     status,
     leaseToken: 'lease_1',
     providerName: providerJobId ? 'mock' : null,
+    providerModel,
     providerJobId,
     providerSubmittedAt: providerJobId
       ? '2026-08-19T06:39:00.000Z'
@@ -42,6 +47,7 @@ function createHarness({ renewError = null, providerJobId = null } = {}) {
       calls.push(['recordProviderJob', input]);
       return {
         providerName: input.providerName,
+        providerModel: input.providerModel,
         providerJobId: input.providerJobId,
       };
     },
@@ -55,7 +61,9 @@ function createHarness({ renewError = null, providerJobId = null } = {}) {
     },
   };
   const provider = {
-    name: 'mock',
+    capability: 'image_generation',
+    providerName: 'mock',
+    modelName: 'mock-image-v1',
     async submit(input) {
       calls.push(['submit', input]);
       return { jobId: 'provider_job_1' };
@@ -97,6 +105,7 @@ test('worker submits with a stable idempotency key, persists the provider job, a
       generationId: 'generation_1',
       claimToken: 'lease_1',
       providerName: 'mock',
+      providerModel: 'mock-image-v1',
       providerJobId: 'provider_job_1',
     },
   ]);
@@ -125,6 +134,40 @@ test('worker resumes a persisted provider job without submitting it again', asyn
     calls.find(([name]) => name === 'waitForResult')[1].jobId,
     'provider_job_existing',
   );
+});
+
+test('worker rejects a language model adapter', () => {
+  assert.throws(
+    () => new GenerationWorker({
+      queue: {},
+      repository: {},
+      provider: {
+        capability: 'language',
+        providerName: 'mock',
+        modelName: 'mock-language-v1',
+        async submit() {},
+        async waitForResult() {},
+      },
+    }),
+    /Image generation provider must implement/,
+  );
+});
+
+test('worker fails instead of resuming a provider job from another image model', async () => {
+  const { calls, worker } = createHarness({
+    providerJobId: 'provider_job_existing',
+    providerModel: 'mock-image-v2',
+  });
+
+  const failed = await worker.runOnce();
+
+  assert.equal(failed.status, 'failed');
+  assert.equal(calls.some(([name]) => name === 'submit'), false);
+  assert.equal(calls.some(([name]) => name === 'waitForResult'), false);
+  const failure = calls.find(
+    ([name, input]) => name === 'transitionGeneration' && input.to === 'failed',
+  );
+  assert.match(failure[1].error.message, /belongs to model mock-image-v2/);
 });
 
 test('worker stops writing and does not fail a generation after losing its lease', async () => {

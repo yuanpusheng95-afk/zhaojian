@@ -1,5 +1,7 @@
 export class MockImageProvider {
-  name = 'mock';
+  capability = 'image_generation';
+  providerName = 'mock';
+  modelName = 'mock-image-v1';
 
   async submit({ generation }) {
     return { jobId: `mock_job_${generation.id}` };

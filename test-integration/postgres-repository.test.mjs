@@ -336,7 +336,9 @@ test('worker marks a provider failure and releases the project generation lock',
     queue,
     repository,
     provider: {
-      name: 'failing',
+      capability: 'image_generation',
+      providerName: 'failing',
+      modelName: 'failing-image-v1',
       async submit() {
         return { jobId: 'failing_job_1' };
       },

@@ -10,7 +10,7 @@ const TERMINAL_STATUSES = new Set([
 export class GenerationWorker {
   #queue;
   #repository;
-  #provider;
+  #imageProvider;
   #heartbeatIntervalMs;
   #setInterval;
   #clearInterval;
@@ -23,9 +23,10 @@ export class GenerationWorker {
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
   }) {
+    requireImageGenerationProvider(provider);
     this.#queue = queue;
     this.#repository = repository;
-    this.#provider = provider;
+    this.#imageProvider = provider;
     this.#heartbeatIntervalMs = heartbeatIntervalMs;
     this.#setInterval = setIntervalFn;
     this.#clearInterval = clearIntervalFn;
@@ -54,7 +55,7 @@ export class GenerationWorker {
           ...writeLease,
           to: 'provider_processing',
         });
-        return this.#provider.waitForResult({
+        return this.#imageProvider.waitForResult({
           generation: processing,
           jobId: providerJobId,
         });
@@ -105,26 +106,36 @@ export class GenerationWorker {
   }
 
   async #ensureProviderJob({ claimed, generation, writeLease }) {
-    requireProvider(this.#provider);
     if (claimed.providerJobId) {
-      if (claimed.providerName !== this.#provider.name) {
+      if (claimed.providerName !== this.#imageProvider.providerName) {
         throw new Error(
-          `Provider job ${claimed.providerJobId} belongs to ${claimed.providerName}, not ${this.#provider.name}`,
+          `Provider job ${claimed.providerJobId} belongs to ${claimed.providerName}, not ${this.#imageProvider.providerName}`,
+        );
+      }
+      if (
+        claimed.providerModel != null &&
+        claimed.providerModel !== this.#imageProvider.modelName
+      ) {
+        throw new Error(
+          `Provider job ${claimed.providerJobId} belongs to model ${claimed.providerModel}, not ${this.#imageProvider.modelName}`,
         );
       }
       return claimed.providerJobId;
     }
 
-    const submission = await this.#provider.submit({
+    const submission = await this.#imageProvider.submit({
       generation,
       idempotencyKey: claimed.id,
     });
     if (typeof submission?.jobId !== 'string' || submission.jobId === '') {
-      throw new Error(`Provider ${this.#provider.name} returned no job ID`);
+      throw new Error(
+        `Provider ${this.#imageProvider.providerName} returned no job ID`,
+      );
     }
     await this.#repository.recordProviderJob({
       ...writeLease,
-      providerName: this.#provider.name,
+      providerName: this.#imageProvider.providerName,
+      providerModel: this.#imageProvider.modelName,
       providerJobId: submission.jobId,
     });
     return submission.jobId;
@@ -173,14 +184,19 @@ export class GenerationWorker {
   }
 }
 
-function requireProvider(provider) {
+function requireImageGenerationProvider(provider) {
   if (
-    typeof provider?.name !== 'string' ||
-    provider.name === '' ||
+    provider?.capability !== 'image_generation' ||
+    typeof provider.providerName !== 'string' ||
+    provider.providerName.trim() === '' ||
+    typeof provider.modelName !== 'string' ||
+    provider.modelName.trim() === '' ||
     typeof provider.submit !== 'function' ||
     typeof provider.waitForResult !== 'function'
   ) {
-    throw new Error('Image provider must implement name, submit(), and waitForResult()');
+    throw new Error(
+      'Image generation provider must implement capability, providerName, modelName, submit(), and waitForResult()',
+    );
   }
 }
 
