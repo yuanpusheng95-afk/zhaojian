@@ -439,26 +439,43 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 
 ## 11. Session 存储与可观测性
 
-### 11.1 目标状态：PostgreSQL 后端
+### 11.1 决定：PostgreSQL SessionStorage，切片 1 内完成
 
-Web 系统下 jsonl 文件后端要求共享文件系统，不可接受。目标是自实现 `SessionStorage`。
+**Agent 轨迹必须入 PostgreSQL，不使用 `MemorySessionStorage`，不使用 jsonl 文件后端。**
 
-成本已核实：
+理由：
 
-- 契约为 `SessionStorage`，**20 个方法**，本质是 append-only entries + records + lane 指针 + 少量 kv fact
-- pi 提供**官方一致性测试套件** `@earendil-works/pi-agent-core/session/testing` 的 `createSessionBackendConformance`（1016 行），可直接用于验收
-- pi 提供**可逐文件对照的 SQL 参考实现** `packages/session-backends/sqlite-node`，storage 层约 800 行（`entries.ts` 78 / `records.ts` 95 / `lanes.ts` 124 / `sessions.ts` 131 / `branch-entries.ts` 174 / `facts.ts` 64 / `session-stats.ts` 54 / `session-sequences.ts` 29 / `branch-tips.ts` 35 / `writer-leases.ts` 58）
-- `memory.ts` 仅 192 行即实现完整契约，证明契约是薄的
+- Session 就是轨迹日志（§11.3）。Web 系统里轨迹是产品资产——回溯用户改了什么、复现问题、将来做审计与成本归因，全依赖它。
+- 内存后端在进程重启即丢失；jsonl 文件后端要求多 Worker 共享文件系统。两者都不能进生产。
+- PostgreSQL 已是本系统唯一事实来源（§3.1）。轨迹落在别处会造成事实分裂。
+- 中间态没有价值：先上 Memory 或 jsonl 再换 Postgres，等于为一个必然被替换的实现付出集成与调试成本。
 
-估算：800–1000 行 SQL storage 层，有现成验收套件与对照实现。
+**否决"把 session 后端推到 Agent 接线之后"：** 该方案的唯一收益是早几天摸到真实生图，代价是 MVP 期间没有可回溯轨迹——而首次接真实中转站恰恰是最需要翻现场的时候（见 §17）。
 
-### 11.2 MVP 阶段：MemorySessionStorage
+### 11.2 实现成本与路径
 
-切片 1 使用 pi 自带的 `MemorySessionStorage`。
+契约为 `SessionStorage`，**20 个方法**，本质是 append-only entries + records + lane 指针 + 少量 kv fact。
 
-**后果：session 不跨轮持久化，多轮对话在切片 1 中不工作。** 发第二条消息时 Agent 看不到第一轮历史。
+pi 提供两样东西使这项工作可控：
 
-这不影响 MVP 验收线（一轮，一次真实生图）。切片 2 换成 PostgreSQL 后端后多轮自动生效，**Tools 与 Worker 代码零改动**——这是 `SessionStorage` 作为注入契约的直接收益。
+- **官方一致性测试套件** `@earendil-works/pi-agent-core/session/testing` 的 `createSessionBackendConformance`（1016 行），直接用作验收标准
+- **可逐文件对照的 SQL 参考实现** `packages/session-backends/sqlite-node`，storage 层约 800 行：`entries.ts` 78 / `records.ts` 95 / `lanes.ts` 124 / `sessions.ts` 131 / `branch-entries.ts` 174 / `facts.ts` 64 / `session-stats.ts` 54 / `session-sequences.ts` 29 / `branch-tips.ts` 35 / `writer-leases.ts` 58
+
+`memory.ts` 仅 192 行即实现完整契约，证明契约是薄的。
+
+**估算：800–1000 行 SQL storage 层。** 这是本次 MVP 中最大的单块工作量，实施计划中应作为独立可验收单元，先于 Agent 接线完成——因为它有确定性的验收标准（conformance 套件全绿），不依赖真实模型。
+
+表结构对应 sqlite 参考实现的分解：
+
+```text
+session_sessions   会话元数据
+session_entries    entries（append-only，seq 单调）
+session_records    records（operation 生命周期）
+session_lanes      lane → leafId 指针
+session_facts      name / label 等 kv
+```
+
+`seq` 的单调分配在事务内完成，对应参考实现的 `session-sequences.ts`。
 
 ### 11.3 三层可观测性
 
@@ -490,13 +507,18 @@ pi.session.write
 
 注入点：`AgentHarnessOptions.context?: TelemetryContext`。pi 现成实现只有 `InMemoryTelemetryContext`（参考）与 `NOOP_TELEMETRY_CONTEXT`（默认）。落到任何后端都需自实现 adapter，pi 提供 conformance 套件验收。
 
-### 11.4 切片 1 必须接 stdout telemetry adapter
+### 11.4 切片 2 必须接 stdout telemetry adapter
 
 **这是一条硬要求，不是可选优化。**
 
-切片 1 同时使用 `MemorySessionStorage`（轨迹不落库）与默认的 `NOOP_TELEMETRY_CONTEXT`（无 span 输出）。两者叠加的后果是：**切片 1 出问题时没有任何可查的日志**——而切片 1 恰恰是风险最高的一刀（首次接真实中转站，function calling 稳定性仍是 assumption，见 §17）。
+Session 与 telemetry 记录的是**不重叠的两类事实**：
 
-因此切片 1 实现一个最简 `TelemetryContext` adapter，按结构化 JSON 行输出到 stdout：
+- Session 记「Agent 做了什么」——消息、工具调用、参数、结果，入 PostgreSQL（§11.1）
+- Telemetry span 记「花了多久、在哪一层失败」——生图耗时、中转站错误、重试
+
+生图延迟与供应商级失败**只在 span 里有**，session 不记录这些。切片 2 首次接真实中转站，function calling 稳定性与响应格式均为 assumption（§17），缺少这层数据会让排障退化成猜测。
+
+因此切片 2 实现一个最简 `TelemetryContext` adapter，按结构化 JSON 行输出到 stdout：
 
 ```text
 src/infrastructure/telemetry/stdout-telemetry.mjs
@@ -508,7 +530,7 @@ src/infrastructure/telemetry/stdout-telemetry.mjs
 - 每个 `pi.harness.tool` 调用了什么、是否出错
 - 整轮 `pi.harness.run` 的边界与终态
 
-通过 `TELEMETRY=stdout|noop` 切换（§12.1），默认 `stdout`。
+通过 `TELEMETRY=stdout|noop` 切换（§12.1），**默认 `stdout`**。`NOOP_TELEMETRY_CONTEXT` 是 pi 的默认值，本项目显式覆盖它；`noop` 仅供测试中静音使用。
 
 将来做成本统计与配额（§16 Non-goals）时，基础就是这些 span 加 `AgentHarness.recordUsage()`，无需另起炉灶。
 
@@ -528,13 +550,21 @@ src/infrastructure/storage/asset-storage.mjs
 src/infrastructure/storage/s3-asset-storage.mjs
 src/infrastructure/telemetry/stdout-telemetry.mjs   TelemetryContext adapter（§11.4）
 src/infrastructure/postgres/agent-turn-queue.mjs
+src/infrastructure/postgres/session/storage.mjs      SessionStorage 20 方法（§11.2）
+src/infrastructure/postgres/session/entries.mjs
+src/infrastructure/postgres/session/records.mjs
+src/infrastructure/postgres/session/lanes.mjs
+src/infrastructure/postgres/session/facts.mjs
+src/infrastructure/postgres/session/sequences.mjs
 migrations/005_agent_turns.sql          创建 agent_turns
 migrations/006_generations_slim.sql     generation_jobs → generations；状态机砍到 2 态；删 lease 列；加 turn_id
 migrations/007_projects_owner.sql       running_generation_id → running_turn_id；新增 owner_id
 migrations/008_drop_provider_jobs.sql   删除 provider_jobs
+migrations/009_agent_sessions.sql       session_sessions / _entries / _records / _lanes / _facts
 test/agent-tools.test.mjs
 test/agent-turn-worker.test.mjs
 test/relay-images-provider.test.mjs
+test/session-storage-conformance.test.mjs            跑 pi 官方套件
 test/support/fake-stream-fn.mjs         可编程 StreamFn
 scripts/smoke-e2e.mjs
 .env.example                            运行配置模板（见 §12.1）
@@ -658,7 +688,7 @@ GET  /generations/:id                             删除
 | Worker 轮次单测 | 编排正确性：自评重生、超限后停、fatal 中止 | fake StreamFn + fake provider |
 | 集成测试 | 全链路 | 真实 PostgreSQL + 真实 MinIO + fake StreamFn + fake provider |
 | 端到端冒烟 | 真实中转站真出图 | `npm run smoke:e2e`，手动执行，**不进 CI** |
-| 切片 2 | PostgreSQL SessionStorage | pi 官方 `createSessionBackendConformance` |
+| PostgreSQL SessionStorage | 20 个方法的契约一致性 | pi 官方 `createSessionBackendConformance` + 真实 PostgreSQL |
 
 **集成测试用真基础设施 + 假模型**：基础设施是 bug 藏身处，模型是花钱的地方。
 
@@ -666,13 +696,17 @@ GET  /generations/:id                             删除
 
 ## 15. 实施切片
 
-### 切片 1（MVP 验收线）
+### 切片 1：PostgreSQL SessionStorage
 
-自定义 ImagesProvider → Tools → AgentHarness（MemorySessionStorage）→ Worker → 真实出图 → 新 Revision。
+实现 `SessionStorage` 的 20 个方法，对照 sqlite 参考实现移植（§11.2）。
 
-### 切片 2
+**独立可验收：pi 的 `createSessionBackendConformance` 套件全绿。** 不依赖真实模型、不依赖中转站、不依赖对象存储，因此可以先于所有 Agent 接线完成，风险最低、验收标准最确定。
 
-`SessionStorage` 换 PostgreSQL 实现，跑 pi conformance 套件。多轮对话生效。**接口不变，纯替换，零返工。**
+### 切片 2（MVP 验收线）
+
+自定义 ImagesProvider → Tools → AgentHarness（注入切片 1 的 Postgres session + stdout telemetry）→ Worker → 真实出图 → 新 Revision。
+
+多轮对话在本切片即可用——轨迹已在 PostgreSQL 里。
 
 ### 切片 3
 
@@ -685,7 +719,6 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - 鉴权与用户体系（仅预埋 `owner_id`）
 - 前端
 - SSE / 流式（切片 3）
-- PostgreSQL SessionStorage（切片 2）
 - 轮次自动重试与语义指纹幂等（§8.3）
 - 对象存储垃圾回收
 - 多模型路由与 fallback
@@ -695,19 +728,22 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 
 ## 17. Risks And Assumptions
 
-- **assumption：中转站的 `/v1/chat/completions` 支持稳定的 function calling。** 若工具调用不稳定，整个 agent 循环不成立。这是切片 1 必须最先验证的一点。
+- **assumption：中转站的 `/v1/chat/completions` 支持稳定的 function calling。** 若工具调用不稳定，整个 agent 循环不成立。这是切片 2 必须最先验证的一点。
 - **assumption：中转站的 `/v1/images/edits` 接受原图 + prompt 并返回可解析的 b64 或 URL。** 实际响应格式在实现 `relayGenerateImages` 时以真实响应为准。
 - **assumption：中转站返回的图片 URL 若有时效，必须在轮次内立即下载并转存对象存储。** 不直接把中转站 URL 存入 `assets.uri`。
 - 模型输出只能当作不可信输入，必须经过 Domain 校验；结构化输出不等于合法业务操作。
-- MemorySessionStorage 阶段 Worker 崩溃即丢失该轮；`attempt_count = 1` 使其不可恢复。这是明确的阶段性限制。
+- 切片 2 的 Worker 崩溃时轨迹已入 PostgreSQL 可查，但 `attempt_count = 1` 使该轮本身不可恢复。这是明确的取舍（§8.2）。
+- PostgreSQL SessionStorage 是本次最大单块工作量（800–1000 行）。若 conformance 套件暴露出 pi 契约中未文档化的语义（分支、lane 移动、seq 单调性边界），切片 1 可能超出预估。这是把它排在最前的另一个理由：早暴露。
 - pi 版本 0.84.2 处于 0.x，API 可能变化。锁定精确版本，升级作为独立任务处理。
 - 生图耗时受中转站影响，10 分钟整轮上限可能需要按实测调整。
 
 ## 18. Acceptance Criteria
 
 - `npm test` 全绿：Domain 17 个（不变）+ Tools + Worker 轮次 + ImagesProvider
-- `npm run test:integration` 全绿：真实 PostgreSQL + 真实 MinIO 全链路
+- `npm run test:integration` 全绿：真实 PostgreSQL + 真实 MinIO 全链路，**含 pi `createSessionBackendConformance` 套件**
 - `npm run smoke:e2e` 跑通：用户消息 → Agent 调工具 → 中转站真实出图 → MinIO 中可见图片对象 → 新 Revision 创建且 `active_revision_id` 切换
+- **Agent 轨迹可从 PostgreSQL 回放**：一轮结束后能查到该轮的全部 entries（用户消息、工具调用、参数、结果）
+- 多轮对话可用：第二条消息时 Agent 能看到第一轮历史
 - Agent 能看到自己生成的图（`generate_image` 返回 `ImageContent`）
 - 成本护栏生效：超过每轮生图上限后 Agent 转向选图
 - 不可纠正错误中止整轮，不让模型空转
