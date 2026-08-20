@@ -437,7 +437,7 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 
 变量清单见 §12.1。
 
-## 11. Session 存储
+## 11. Session 存储与可观测性
 
 ### 11.1 目标状态：PostgreSQL 后端
 
@@ -460,6 +460,58 @@ Web 系统下 jsonl 文件后端要求共享文件系统，不可接受。目标
 
 这不影响 MVP 验收线（一轮，一次真实生图）。切片 2 换成 PostgreSQL 后端后多轮自动生效，**Tools 与 Worker 代码零改动**——这是 `SessionStorage` 作为注入契约的直接收益。
 
+### 11.3 三层可观测性
+
+pi 提供三种互不重叠的观测手段，不可混为一谈。
+
+| 层 | 内容 | pi 是否自带 | 持久化 |
+|---|---|---|---|
+| **Session（轨迹）** | entries：message / model_change / compaction / branch_summary / custom；records：operation 生命周期 | 自带 | 是，落 `SessionStorage` |
+| **Telemetry（span）** | 12 个 span 的 schema 与埋点 | **契约自带，exporter 不带** | 取决于 adapter |
+| **Agent events（实时）** | `agent_start` / `turn_start` / `message_update` / `tool_execution_start` / `tool_execution_end` / `agent_end` | 自带 | 否，仅供 UI 订阅 |
+
+**Session 是"发生了什么"的可回放记录**，也是切片 3 的 SSE 数据源（§15）。`CustomEntry { type: 'custom', customType, data }` 允许把业务自定义日志条目并入同一条时间线，无需另开表。
+
+**Telemetry 的边界必须写清楚。** `@earendil-works/pi-telemetry` 的定位是：
+
+> no exporter, global current-span state, or dependency on a telemetry backend
+
+pi 声明的 span（见 `packages/agent/docs/telemetry-schema.md`，该文档由脚本生成）：
+
+```text
+pi.ai.request        operation ∈ {stream, fetch_deferred, cancel_deferred, generate_images}
+pi.harness.run / .turn / .step / .tool / .hook
+pi.harness.compaction / .navigation / .checkpoint / .sleep / .event_handler
+pi.session.write
+```
+
+`pi.harness.tool` 携带 `pi.tool.name`、`pi.tool.call_id`、`pi.tool.is_error`、`pi.tool.recovery`。
+`pi.ai.request` 的 operation 枚举含 `generate_images`，**生图调用在 span 覆盖范围内**。
+
+注入点：`AgentHarnessOptions.context?: TelemetryContext`。pi 现成实现只有 `InMemoryTelemetryContext`（参考）与 `NOOP_TELEMETRY_CONTEXT`（默认）。落到任何后端都需自实现 adapter，pi 提供 conformance 套件验收。
+
+### 11.4 切片 1 必须接 stdout telemetry adapter
+
+**这是一条硬要求，不是可选优化。**
+
+切片 1 同时使用 `MemorySessionStorage`（轨迹不落库）与默认的 `NOOP_TELEMETRY_CONTEXT`（无 span 输出）。两者叠加的后果是：**切片 1 出问题时没有任何可查的日志**——而切片 1 恰恰是风险最高的一刀（首次接真实中转站，function calling 稳定性仍是 assumption，见 §17）。
+
+因此切片 1 实现一个最简 `TelemetryContext` adapter，按结构化 JSON 行输出到 stdout：
+
+```text
+src/infrastructure/telemetry/stdout-telemetry.mjs
+```
+
+`TelemetryContext` 是 callback 契约，实现成本低，但可直接观测到：
+
+- 每次 `pi.ai.request` 的耗时与 operation（含 `generate_images`）
+- 每个 `pi.harness.tool` 调用了什么、是否出错
+- 整轮 `pi.harness.run` 的边界与终态
+
+通过 `TELEMETRY=stdout|noop` 切换（§12.1），默认 `stdout`。
+
+将来做成本统计与配额（§16 Non-goals）时，基础就是这些 span 加 `AgentHarness.recordUsage()`，无需另起炉灶。
+
 ## 12. File Layout 与运行配置
 
 新增：
@@ -474,6 +526,7 @@ src/infrastructure/models/relay-text-provider.mjs
 src/infrastructure/models/relay-images-provider.mjs   relayGenerateImages 实现
 src/infrastructure/storage/asset-storage.mjs
 src/infrastructure/storage/s3-asset-storage.mjs
+src/infrastructure/telemetry/stdout-telemetry.mjs   TelemetryContext adapter（§11.4）
 src/infrastructure/postgres/agent-turn-queue.mjs
 migrations/005_agent_turns.sql          创建 agent_turns
 migrations/006_generations_slim.sql     generation_jobs → generations；状态机砍到 2 态；删 lease 列；加 turn_id
@@ -555,6 +608,7 @@ typebox
 | `TURN_TIMEOUT_MS` | `600000` | 整轮超时，超时触发 `harness.abort()`（§10.2） | 用默认值 |
 | `TURN_LEASE_MS` | `30000` | 轮次租约时长 | 用默认值 |
 | `TURN_HEARTBEAT_MS` | `10000` | 心跳续租间隔 | 用默认值 |
+| `TELEMETRY` | `stdout` | span 输出方式，`stdout` \| `noop`（§11.4） | 用默认值 |
 
 规则：
 
@@ -657,5 +711,6 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - Agent 能看到自己生成的图（`generate_image` 返回 `ImageContent`）
 - 成本护栏生效：超过每轮生图上限后 Agent 转向选图
 - 不可纠正错误中止整轮，不让模型空转
+- `npm run smoke:e2e` 的 stdout 中可见 `pi.harness.run`、`pi.harness.tool`、`pi.ai.request`（`operation=generate_images`）三类 span，且带耗时（§11.4）
 - `src/domain/**` 未修改
 - README 与设计文档使用同一套术语：Agent Turn / Tool / ImagesProvider / SessionStorage
