@@ -409,7 +409,7 @@ pi 的契约明确：
 
 ### 9.3 成本护栏
 
-**每轮 `generate_image` 调用次数硬上限，默认 3 次**，由轮次上下文计数，走环境变量配置。超限后 tool 抛错："本轮生图次数已用尽，请从已有候选中选择"。模型收到后转向选图而非继续生成。
+**每轮 `generate_image` 调用次数硬上限，默认 3 次**，由轮次上下文计数，通过 `MAX_IMAGES_PER_TURN` 配置（§12.1）。超限后 tool 抛错："本轮生图次数已用尽，请从已有候选中选择"。模型收到后转向选图而非继续生成。
 
 没有这条护栏，模型的自评循环会持续烧钱。
 
@@ -431,9 +431,11 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 
 ### 10.2 超时
 
-- **单次生图**：`ImagesOptions.timeoutMs`，默认 180 秒
-- **整轮**：Worker 持 `AbortController`，默认上限 10 分钟，超时 `harness.abort()` → `RunOutcome.kind = 'aborted'`
-- **lease**：30 秒租约 + 10 秒心跳，覆盖整轮（含多次生图）
+- **单次生图**：`ImagesOptions.timeoutMs`，默认 180 秒（`IMAGE_TIMEOUT_MS`）
+- **整轮**：Worker 持 `AbortController`，默认上限 10 分钟（`TURN_TIMEOUT_MS`），超时 `harness.abort()` → `RunOutcome.kind = 'aborted'`
+- **lease**：30 秒租约（`TURN_LEASE_MS`）+ 10 秒心跳（`TURN_HEARTBEAT_MS`），覆盖整轮（含多次生图）
+
+变量清单见 §12.1。
 
 ## 11. Session 存储
 
@@ -458,7 +460,7 @@ Web 系统下 jsonl 文件后端要求共享文件系统，不可接受。目标
 
 这不影响 MVP 验收线（一轮，一次真实生图）。切片 2 换成 PostgreSQL 后端后多轮自动生效，**Tools 与 Worker 代码零改动**——这是 `SessionStorage` 作为注入契约的直接收益。
 
-## 12. File Layout
+## 12. File Layout 与运行配置
 
 新增：
 
@@ -482,6 +484,7 @@ test/agent-turn-worker.test.mjs
 test/relay-images-provider.test.mjs
 test/support/fake-stream-fn.mjs         可编程 StreamFn
 scripts/smoke-e2e.mjs
+.env.example                            运行配置模板（见 §12.1）
 ```
 
 修改：
@@ -523,6 +526,43 @@ test/project-workflow.test.mjs          （11 个用例）
 @aws-sdk/client-s3
 typebox
 ```
+
+### 12.1 运行配置
+
+现有变量，不变：
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `DATABASE_URL` | `postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent` | PostgreSQL 连接 |
+| `PORT` | `3000` | API 监听端口 |
+| `WORKER_POLL_INTERVAL_MS` | `1000` | Worker 轮询间隔 |
+
+本次新增：
+
+| 变量 | 默认值 | 用途 | 缺失时行为 |
+|---|---|---|---|
+| `RELAY_BASE_URL` | 无 | 中转站 base URL，文本与图像共用 | Worker 启动失败 |
+| `RELAY_API_KEY` | 无 | 中转站 API key | Worker 启动失败 |
+| `RELAY_TEXT_MODEL` | `gpt-5.4` | Agent 大脑模型 id | 用默认值 |
+| `RELAY_IMAGE_MODEL` | `gpt-image-2` | 图像模型 id | 用默认值 |
+| `S3_ENDPOINT` | `http://127.0.0.1:9000` | 对象存储 endpoint（MinIO / OSS / COS） | 用默认值 |
+| `S3_BUCKET` | `photo-agent` | bucket 名 | 用默认值 |
+| `S3_ACCESS_KEY` | 无 | 对象存储 access key | Worker 启动失败 |
+| `S3_SECRET_KEY` | 无 | 对象存储 secret key | Worker 启动失败 |
+| `S3_REGION` | `us-east-1` | S3 兼容 API 要求非空，MinIO 忽略该值 | 用默认值 |
+| `MAX_IMAGES_PER_TURN` | `3` | 每轮 `generate_image` 硬上限（§9.3 成本护栏） | 用默认值 |
+| `IMAGE_TIMEOUT_MS` | `180000` | 单次生图超时（§10.2） | 用默认值 |
+| `TURN_TIMEOUT_MS` | `600000` | 整轮超时，超时触发 `harness.abort()`（§10.2） | 用默认值 |
+| `TURN_LEASE_MS` | `30000` | 轮次租约时长 | 用默认值 |
+| `TURN_HEARTBEAT_MS` | `10000` | 心跳续租间隔 | 用默认值 |
+
+规则：
+
+- **凭证类变量（`RELAY_API_KEY`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`RELAY_BASE_URL`）缺失时 Worker 启动即失败**，不允许延迟到第一次生图才报错——那会让一轮白白进入 running 状态再失败。
+- 其余变量有默认值，本地开箱可跑。
+- API 进程只需 `DATABASE_URL`、`PORT`、`S3_*`（生成候选图的签名 URL 用），**不需要中转站凭证**——API 不加载 pi Agent（§3.1）。
+
+`.env.example` 随实现一并提供。
 
 ## 13. API 变更
 
