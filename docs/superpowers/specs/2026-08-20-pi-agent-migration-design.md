@@ -52,7 +52,7 @@ pi 提供的三样东西恰好覆盖需求，且都是公开扩展点，无需 f
 
 - `src/application/edit-interpreter.mjs` 与 `mock-language-model.mjs` 删除
 - HTTP API：`POST /projects/:id/generations`、`GET /generations/:id` 删除
-- `generation_jobs` 表改名并瘦身，`provider_jobs` 表删除
+- `generation_jobs` 表改名并瘦身，`provider_jobs` 与 `idempotency_requests` 表删除
 - `src/worker/generation-worker.mjs` 重写
 
 **不破坏：**
@@ -69,9 +69,10 @@ pi 提供的三样东西恰好覆盖需求，且都是公开扩展点，无需 f
 ```text
 ┌─ API 进程（无状态，不加载 pi Agent）─────────────────┐
 │  POST /projects/:id/messages                       │
-│    → 事务：写 agent_turns + 幂等记录 + 锁 project    │
+│    → 事务：写 agent_turns（含幂等唯一约束）+ 锁 project│
 │    → 202 { turnId }                                 │
-│  GET  /turns/:turnId                                │
+│  GET  /projects/:id/turns/:turnId                   │
+│  POST /projects/:id/turns/:turnId/selections        │
 │  GET  /projects/:id                                 │
 └────────────────────────────────────────────────────┘
                      │ PostgreSQL（唯一事实来源）
@@ -207,7 +208,7 @@ select_candidate({ generationId, candidateId })
   → { revisionId }
 ```
 
-两个参数分工不同，不可合并：
+**`generate_image` 的两个参数分工不同，不可合并：**
 
 - **`patch`** 是结构化 Photo State Patch，**持久化**，经 Domain 校验，决定新 Revision 的状态。它是系统的事实记录。
 - **`renderPrompt`** 是发给图像模型的自然语言指令，**不持久化到 Photo State**，仅记入 `generations.metadata_json` 供审计。它承载 patch 表达不了的渲染细节（"柔和黄昏侧光""保持人物面部特征不变"）。
@@ -231,12 +232,20 @@ select_candidate({ generationId, candidateId })
 ```text
 用户："把背景换成海边"
   → read_photo_state
-  → generate_image({ background: '海边沙滩，黄昏' })
+  → generate_image({
+      patch: { background: '海边沙滩' },
+      renderPrompt: '黄昏光线，保持人物面部特征不变',
+    })
   → [模型看图] "人物边缘有光晕，背景过曝"
-  → generate_image({ background: '海边沙滩，柔和黄昏侧光' })
+  → generate_image({
+      patch: { background: '海边沙滩' },
+      renderPrompt: '柔和黄昏侧光，避免边缘光晕与过曝，保持人物面部特征不变',
+    })
   → [模型看图] "这版好"
   → select_candidate
 ```
+
+注意第二次调用的 `patch` 与第一次**完全相同**——目标状态没变，变的只是渲染指令。这正是 §5.2 里两个参数不可合并的实证。
 
 「自主多步：生成 → 自评 → 重试」**不需要任何额外机制**。
 
@@ -324,7 +333,17 @@ CREATE TABLE agent_turns (
 
 理由：供应商变同步。Worker 内 `await generateImages()` 要么拿到图要么抛错，**中间态在新架构下不可达**。保留无法到达的状态只会误导后续维护者。
 
-同时：删除 lease 相关列（迁至 `agent_turns`），新增 `turn_id` 外键。
+同时：删除 lease 相关列（迁至 `agent_turns`），新增 `turn_id text NOT NULL REFERENCES agent_turns(id)`。
+
+**改名的连带影响（迁移里必须处理）：** 三个外键约束指向旧表名，重命名后需一并重建——
+
+```text
+photo_revisions.source_generation_id  → REFERENCES generations(id)
+generation_outputs.generation_id      → REFERENCES generations(id)
+projects.running_generation_id        → 该列本身被替换，见 §7.4
+```
+
+PostgreSQL 的 `ALTER TABLE ... RENAME TO` 会自动携带约束，但约束**名字**仍带旧表名，需显式改名，否则后续维护者读 `\d` 时会看到指向不存在概念的约束名。
 
 ### 7.3 provider_jobs：删除
 
@@ -332,12 +351,18 @@ CREATE TABLE agent_turns (
 
 ### 7.4 projects
 
-- `running_generation_id` → `running_turn_id`
+- `running_generation_id`（FK → `generation_jobs`）→ **替换为** `running_turn_id text REFERENCES agent_turns(id)`。这不是列改名，是换了引用目标：项目锁的持有者从「一次生图」变成「一轮 Agent」（§7.1）。旧列与旧 FK 一并删除。
 - 新增 `owner_id text NOT NULL DEFAULT 'dev'`
 
-### 7.5 photo_revisions / assets
+### 7.5 idempotency_requests：删除
 
-不变。
+旧表结构是 `(project_id, idempotency_key) → generation_id`，即幂等键指向一次生图。新架构下幂等作用域是 agent turn，而 `agent_turns` 已带 `UNIQUE (project_id, idempotency_key)`（§7.1），**约束本身就是幂等记录**，单独一张映射表是冗余的。
+
+重复提交同一 `Idempotency-Key` 时，插入 `agent_turns` 触发唯一约束冲突，转为查询既有行并返回其 `turnId`，语义与旧实现一致。
+
+### 7.6 photo_revisions / assets / generation_outputs
+
+列定义不变。`photo_revisions.source_generation_id` 与 `generation_outputs.generation_id` 的外键目标随表改名重建（§7.2）。`assets.uri` 语义从"未使用"变为"对象存储键"（§6.3）。
 
 ## 8. 幂等与重试
 
@@ -557,15 +582,15 @@ src/infrastructure/postgres/session/lanes.mjs
 src/infrastructure/postgres/session/facts.mjs
 src/infrastructure/postgres/session/sequences.mjs
 migrations/005_agent_turns.sql          创建 agent_turns
-migrations/006_generations_slim.sql     generation_jobs → generations；状态机砍到 2 态；删 lease 列；加 turn_id
-migrations/007_projects_owner.sql       running_generation_id → running_turn_id；新增 owner_id
-migrations/008_drop_provider_jobs.sql   删除 provider_jobs
+migrations/006_generations_slim.sql     generation_jobs → generations；状态机砍到 2 态；删 lease 列；加 turn_id；重建并改名三个外键约束（§7.2）
+migrations/007_projects_owner.sql       删 running_generation_id 及其 FK，新增 running_turn_id → agent_turns；新增 owner_id
+migrations/008_drop_legacy.sql          删除 provider_jobs 与 idempotency_requests（§7.3、§7.5）
 migrations/009_agent_sessions.sql       session_sessions / _entries / _records / _lanes / _facts
 test/agent-tools.test.mjs
 test/agent-turn-worker.test.mjs
 test/relay-images-provider.test.mjs
-test/session-storage-conformance.test.mjs            跑 pi 官方套件
 test/support/fake-stream-fn.mjs         可编程 StreamFn
+test-integration/session-storage-conformance.test.mjs   跑 pi 官方套件（需真实 PostgreSQL）
 scripts/smoke-e2e.mjs
 .env.example                            运行配置模板（见 §12.1）
 ```
@@ -626,7 +651,7 @@ typebox
 |---|---|---|---|
 | `RELAY_BASE_URL` | 无 | 中转站 base URL，文本与图像共用 | Worker 启动失败 |
 | `RELAY_API_KEY` | 无 | 中转站 API key | Worker 启动失败 |
-| `RELAY_TEXT_MODEL` | `gpt-5.4` | Agent 大脑模型 id | 用默认值 |
+| `RELAY_TEXT_MODEL` | **无** | Agent 大脑模型 id | 启动失败 |
 | `RELAY_IMAGE_MODEL` | `gpt-image-2` | 图像模型 id | 用默认值 |
 | `S3_ENDPOINT` | `http://127.0.0.1:9000` | 对象存储 endpoint（MinIO / OSS / COS） | 用默认值 |
 | `S3_BUCKET` | `photo-agent` | bucket 名 | 用默认值 |
@@ -642,9 +667,10 @@ typebox
 
 规则：
 
-- **凭证类变量（`RELAY_API_KEY`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`RELAY_BASE_URL`）缺失时 Worker 启动即失败**，不允许延迟到第一次生图才报错——那会让一轮白白进入 running 状态再失败。
+- **`RELAY_TEXT_MODEL` 无默认值，必须显式配置。** 本设计不假定中转站提供哪些文本模型——猜一个默认值等于把未经验证的假设伪装成决策。启动时校验存在性；模型 id 由使用者按中转站实际清单填写。
+- **凭证与端点类变量缺失时进程启动即失败**，不允许延迟到第一次调用才报错——那会让一轮白白进入 running 状态再失败。Worker 需要 `RELAY_BASE_URL`、`RELAY_API_KEY`、`RELAY_TEXT_MODEL`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`；**API 需要 `S3_ACCESS_KEY`、`S3_SECRET_KEY`**（生成候选图签名 URL 用），缺失时 API 同样启动失败。
 - 其余变量有默认值，本地开箱可跑。
-- API 进程只需 `DATABASE_URL`、`PORT`、`S3_*`（生成候选图的签名 URL 用），**不需要中转站凭证**——API 不加载 pi Agent（§3.1）。
+- API 进程**不需要中转站凭证**（`RELAY_*`）——API 不加载 pi Agent（§3.1）。
 
 `.env.example` 随实现一并提供。
 
@@ -654,13 +680,15 @@ typebox
 POST /projects                                    保留
 GET  /projects/:id                                保留
 POST /projects/:id/messages                       新增（替代 generations）
-GET  /turns/:turnId                               新增
+GET  /projects/:id/turns/:turnId                  新增
 POST /projects/:id/turns/:turnId/selections       改造（用户手动选，与 select_candidate 走同一 Domain 方法）
 GET  /health                                      保留
 
 POST /projects/:id/generations                    删除
 GET  /generations/:id                             删除
 ```
+
+**路径一律嵌在 `/projects/:id` 下。** turn 属于 project，且接入鉴权后（§6.2 的 `owner_id`）授权检查以 project 为单位；嵌套路径让「先验证 project 归属、再取 turn」成为路径的自然读法，不需要额外反查 turn → project。
 
 幂等键继续通过 `Idempotency-Key` 请求头传递，作用域变为 agent turn。
 
@@ -734,6 +762,7 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - 模型输出只能当作不可信输入，必须经过 Domain 校验；结构化输出不等于合法业务操作。
 - 切片 2 的 Worker 崩溃时轨迹已入 PostgreSQL 可查，但 `attempt_count = 1` 使该轮本身不可恢复。这是明确的取舍（§8.2）。
 - PostgreSQL SessionStorage 是本次最大单块工作量（800–1000 行）。若 conformance 套件暴露出 pi 契约中未文档化的语义（分支、lane 移动、seq 单调性边界），切片 1 可能超出预估。这是把它排在最前的另一个理由：早暴露。
+- **open：`RELAY_TEXT_MODEL` 的具体值待定。** 该模型必须同时满足两个条件：支持 function calling（否则 agent 循环不成立），且 `input` 含 `'image'`（否则 §5.3 的自评看不到图）。选定前无法跑通切片 2，需在实施前从中转站模型清单确认。
 - pi 版本 0.84.2 处于 0.x，API 可能变化。锁定精确版本，升级作为独立任务处理。
 - 生图耗时受中转站影响，10 分钟整轮上限可能需要按实测调整。
 
