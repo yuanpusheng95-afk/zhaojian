@@ -198,7 +198,8 @@ edit_photo({ message })
 
 ```js
 read_photo_state()
-  → { revisionId, state, anchorAssetUri }
+  → { revisionId, state, baseImage: { assetId, origin } }
+      origin ∈ { 'revision_anchor', 'turn_candidate' }
 
 generate_image({ patch, renderPrompt })
   → { generationId, candidates: [{ candidateId, assetId }] }
@@ -206,7 +207,14 @@ generate_image({ patch, renderPrompt })
 
 select_candidate({ generationId, candidateId })
   → { revisionId }
+  → terminate: true —— 本轮到此结束
 ```
+
+**`read_photo_state` 返回的是当前基准图，不是 Revision 的锚定图。** 两者在一轮内会分叉：调过一次 `generate_image` 后基准图指针已推进到候选（§5.6）。若这里仍返回 Revision 锚定图，模型读到的"当前的图"与它下一次实际编辑的图不是同一张，自评和后续 patch 都会建立在错误认知上。`origin` 字段显式告诉模型这是原始锚定图还是本轮的中间产物。
+
+不返回 URI：Agent 没有取图工具，图由 `generate_image` 内部按 `assetId` 取。给模型一个它用不了的 URI 只是在烧 token。
+
+**`select_candidate` 一轮只能调一次，且调用即结束本轮。** 返回结果带 `terminate: true`。理由：选中意味着用户意图已达成，继续留在同一轮里编辑会让「一轮 = 一次用户意图」的语义失效，也让项目锁的释放时机变得含糊。用户想接着改，发下一条消息即可——那本来就是新一轮。
 
 **`generate_image` 的两个参数分工不同，不可合并：**
 
@@ -222,8 +230,9 @@ select_candidate({ generationId, candidateId })
 | 场景 | 旧工作流 | 新契约 |
 |---|---|---|
 | 一次改背景 + 改衣服 | 两次请求 | 一个 patch 多字段，一次生图 |
-| 同条件重 roll | 做不到（幂等键绑死 patch） | 再调一次 `generate_image` |
+| 同条件重 roll | 做不到（幂等键绑死 patch） | 再调一次 `generate_image`（前提：§7.2 必须删掉旧唯一约束） |
 | 先看现状再决定 | 做不到 | `read_photo_state` |
+| 在上一版结果上继续微调 | 做不到 | 基准图指针自动推进（§5.6） |
 
 ### 5.3 Agent 看得见自己生成的图
 
@@ -268,12 +277,12 @@ Tool 是薄适配层，只做三件事：typebox schema 声明、调用 Domain �
 规则：
 
 ```text
-轮次开始           currentBaseAssetId = 当前 Revision 的 anchorAssetId
-generate_image 后  currentBaseAssetId = 本次产出的候选（多张时取第一张）
-select_candidate 后 currentBaseAssetId = 被选中的候选，并固化为新 Revision 的 anchor
+轮次开始           currentBaseAssetId = 当前 Revision 的 anchorAssetId    origin = revision_anchor
+generate_image 后  currentBaseAssetId = 本次产出的候选（多张时取第一张）    origin = turn_candidate
+select_candidate 后 固化为新 Revision 的 anchor，本轮结束（§5.2）
 ```
 
-一句话：**选中优先，否则用上一次候选图。**
+一句话：**选中优先，否则用上一次候选图。** `read_photo_state` 始终返回这个指针的当前值，不是 Revision 的锚定图。
 
 数据流：
 
@@ -388,7 +397,25 @@ CREATE TABLE agent_turns (
 
 理由：供应商变同步。Worker 内 `await generateImages()` 要么拿到图要么抛错，**中间态在新架构下不可达**。保留无法到达的状态只会误导后续维护者。
 
-同时：删除 lease 相关列（迁至 `agent_turns`），新增 `turn_id text NOT NULL REFERENCES agent_turns(id)`。
+同时逐列清算——旧表每一列都要有明确去留，不能只改状态机就算完：
+
+| 列 | 处置 | 理由 |
+|---|---|---|
+| `id` / `project_id` | 保留 | |
+| `input_revision_id` | 保留，语义收窄 | 只表示「patch 基于哪个 Revision 的状态计算」，**不再表示输入图** |
+| **`input_asset_id`（新增）** | `NOT NULL REFERENCES assets(id)` | 实际喂给图像模型的基准图。可能是 Revision 锚定图，也可能是本轮的候选图（§5.6）——后者不属于任何 Revision，`input_revision_id` 表达不了 |
+| `patch_json` / `proposed_state_json` | 保留 | |
+| `status` | 9 态 → 2 态 | 见上 |
+| **`idempotency_key`** | **删除** | 幂等作用域已移至 `agent_turns`（§7.5） |
+| **`UNIQUE (project_id, idempotency_key)`** | **删除** | 留着会直接打死「同条件重 roll」（§5.2）：同一轮内两次相同条件的生图必然撞约束 |
+| `selected_candidate_id` / `selected_revision_id` | 保留 | 语义不变，记录哪个候选被选中、产生了哪个 Revision |
+| `operation` | 删除 | 旧值恒为 `'edit'`，是 EditInterpreter 时代的遗留。新架构下「做什么」由 tool 名和 patch 表达 |
+| `last_error_json` | 保留 | |
+| lease 相关列 | 删除 | 迁至 `agent_turns` |
+| **`turn_id`（新增）** | `NOT NULL REFERENCES agent_turns(id)` | |
+| `generation_jobs_queue_idx` | 删除 | 按 `status, created_at` 的队列索引——它不再是队列 |
+
+**`UNIQUE (project_id, idempotency_key)` 这条最危险**：它不会报错，只会让重 roll 静默失败，而重 roll 恰是本次架构宣称的新能力。
 
 **改名的连带影响（迁移里必须处理）：** 三个外键约束指向旧表名，重命名后需一并重建——
 
@@ -640,7 +667,7 @@ src/infrastructure/postgres/session/lanes.mjs
 src/infrastructure/postgres/session/facts.mjs
 src/infrastructure/postgres/session/sequences.mjs
 migrations/005_agent_turns.sql          创建 agent_turns
-migrations/006_generations_slim.sql     generation_jobs → generations；状态机砍到 2 态；删 lease 列；加 turn_id；重建并改名三个外键约束（§7.2）
+migrations/006_generations_slim.sql     generation_jobs → generations；逐列清算（§7.2 表）：删 idempotency_key 及其唯一约束、删 operation 与 lease 列、删队列索引、加 input_asset_id 与 turn_id、状态机砍到 2 态、重建并改名外键约束
 migrations/007_projects_owner.sql       删 running_generation_id 及其 FK，新增 running_turn_id → agent_turns；新增 owner_id
 migrations/008_drop_legacy.sql          删除 provider_jobs 与 idempotency_requests（§7.3、§7.5）
 migrations/009_agent_sessions.sql       session_sessions / _entries / _records / _lanes / _facts
@@ -748,6 +775,30 @@ GET  /generations/:id                             删除
 
 **路径一律嵌在 `/projects/:id` 下。** turn 属于 project，且接入鉴权后（§6.2 的 `owner_id`）授权检查以 project 为单位；嵌套路径让「先验证 project 归属、再取 turn」成为路径的自然读法，不需要额外反查 turn → project。
 
+`GET /projects/:id/turns/:turnId` 返回体：
+
+```jsonc
+{
+  "turnId": "t_...",
+  "status": "queued | running | completed | failed | aborted",
+  "generations": [
+    {
+      "generationId": "g_...",
+      "patch": { },
+      "renderPrompt": "...",
+      "candidates": [{ "candidateId": "c_...", "assetId": "a_...", "url": "<签名 URL>" }]
+    }
+  ],
+  "selectedCandidateId": "c_... | null",
+  "newRevisionId": "r_... | null",
+  "error": { "code": "...", "message": "..." }   // 仅 failed 时出现
+}
+```
+
+`url` 是对象存储签名 URL，由 API 进程按 `assets.uri` 现签（这也是 §12.1 里 API 需要 `S3_*` 凭证的原因）。**不返回图片字节。**
+
+一轮可能有多次 `generate_image`，因此 `generations` 是数组；`selectedCandidateId` 与 `newRevisionId` 最多一个（§5.2：一轮只能选一次）。
+
 幂等键继续通过 `Idempotency-Key` 请求头传递，作用域变为 agent turn。
 
 ## 14. Test Strategy
@@ -771,7 +822,7 @@ GET  /generations/:id                             删除
 | Domain 单测（保留现有 17 个） | photo-state、状态机、patch 校验 | 无，一行不改 |
 | Tools 单测 | 参数校验、错误分类、成本护栏计数、**基准图指针推进规则（§5.6）** | fake repository + fake images provider + fake storage |
 | ImagesProvider 单测 | multipart 组装、b64/URL 响应解析、401/429 归类为 fatal | fake fetch |
-| Worker 轮次单测 | 编排正确性：自评重生、超限后停、fatal 中止 | fake StreamFn + fake provider |
+| Worker 轮次单测 | 编排正确性：自评重生、同条件重 roll、超限后停、`select_candidate` 终止轮次、fatal 中止 | fake StreamFn + fake provider |
 | 集成测试 | 全链路 | 真实 PostgreSQL + 真实 MinIO + fake StreamFn + fake provider |
 | 端到端冒烟 | 真实中转站真出图 | `npm run smoke:e2e`，手动执行，**不进 CI** |
 | PostgreSQL SessionStorage | 17 个方法的契约一致性 | pi 官方 `createSessionBackendConformance` + 真实 PostgreSQL |
@@ -834,6 +885,8 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - **Agent 轨迹可从 PostgreSQL 回放**：一轮结束后能查到该轮的全部 entries（用户消息、工具调用、参数、结果）
 - 多轮对话可用：第二条消息时 Agent 能看到第一轮历史
 - 基准图规则生效：连续两次 `generate_image` 时，第二次的输入图是第一次的产出（§5.6）
+- 同条件重 roll 生效：同一轮内用**完全相同**的 `patch` + `renderPrompt` 调两次 `generate_image`，两次都成功且产生两条 `generations` 记录（验证 §7.2 的旧唯一约束确已删除）
+- `select_candidate` 结束本轮：调用后 Agent 不再发起新的工具调用，轮次进入 `completed`
 - Agent 能看到自己生成的图（`generate_image` 返回 `ImageContent`）
 - 成本护栏生效：超过每轮生图上限后 Agent 转向选图
 - 不可纠正错误中止整轮，不让模型空转
