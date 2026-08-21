@@ -61,8 +61,10 @@ pi 提供的三样东西恰好覆盖需求，且都是公开扩展点，无需 f
 - `src/domain/photo-state.mjs` 与全部 patch 校验规则，**6 个单测一行不改**
 - `project-workflow.test.mjs` 11 个中的 9 个（Revision 冲突、幂等、候选选择、状态机迁移）
 - `photo_revisions`、`assets`、`projects` 的核心语义
-- Lease + heartbeat + `FOR UPDATE SKIP LOCKED` 队列机制（换 payload，不换机制）
+- Lease + heartbeat + `FOR UPDATE SKIP LOCKED` 的**思路**沿用（默认值也不变：30s 租约 / 10s 心跳）
 - Revision 冲突检测、幂等语义
+
+**注意：队列是重写，不是改 payload。** `generation-queue.mjs` 现有的 `claimNext()` 会重领过期租约（`status = ANY(ACTIVE_STATUSES) AND lease_expires_at <= now`）、递增 `attempt_count`、`maxAttempts=3` 耗尽后 `#failExhausted()`。新设计不重领、无计数（§8.2），且 `ACTIVE_STATUSES` 依赖的四个中间态在新状态机下已不存在（§7.2）。**照抄旧队列会引入一套没有依据的重试逻辑。**
 
 ## 3. Decision
 
@@ -409,7 +411,17 @@ users/{ownerId}/projects/{projectId}/{assetId}.{ext}
 
 ### 6.3 assets 表
 
-不变。`uri` 字段存对象键。
+**表结构不变，但写入代码必须改。**
+
+现有两处插入（`photo-project-repository.mjs` 第 63、310 行）都是：
+
+```sql
+INSERT INTO assets (id, kind, created_at)
+```
+
+**`uri` 与 `metadata_json` 从来没被写过。** 不改的话 `uri` 恒为 NULL，§5.6 数据流里「按 `assetId` 查 `assets.uri` 取基准图字节」会取空——这是整条 img2img 链路上的断点。
+
+两处都要补写 `uri`（对象键）与 `metadata_json`（至少含 content type，供签名 URL 设头与扩展名推导）。
 
 `compose.yaml` 新增 MinIO 服务，与 postgres 并列；`npm run db:up` 改名 `npm run dev:up`。
 
@@ -438,7 +450,7 @@ CREATE TABLE agent_turns (
 
 **没有 `attempt_count` 列。** 上限既然是 1（§8.2），计数器就是多余的状态：`status='queued'` 表示从未被领取，`status='running'` 且 lease 过期表示已尝试过一次——直接判 `failed`。用一个计数器表达一个布尔事实，是在给未来的读者制造"这里可以重试多次"的错觉。
 
-**队列的作业单位从 Generation 升级为 Agent Turn。** 一轮内 Agent 可调用 N 次工具、生 M 次图。`FOR UPDATE SKIP LOCKED`、lease token、heartbeat、幂等逻辑全部复用，仅 payload 改变。
+**队列的作业单位从 Generation 升级为 Agent Turn。** 一轮内 Agent 可调用 N 次工具、生 M 次图。`FOR UPDATE SKIP LOCKED` 的领取思路与 lease/heartbeat 的默认值沿用，但**重领与重试逻辑不沿用**（§2.3、§8.2）。
 
 ### 7.2 generation_jobs → generations
 
@@ -574,7 +586,7 @@ pi 的契约明确：
 
 ### 9.3 成本护栏
 
-**每轮 `generate_image` 调用次数硬上限，默认 3 次**，由轮次上下文计数，通过 `MAX_IMAGES_PER_TURN` 配置（§12.1）。超限后 tool 抛错："本轮生图次数已用尽，请从已有候选中选择"。模型收到后转向选图而非继续生成。
+**每轮 `generate_image` 调用次数硬上限，默认 3 次**，由轮次上下文计数，通过 `MAX_IMAGES_PER_TURN` 配置（§12.2）。超限后 tool 抛错："本轮生图次数已用尽，请从已有候选中选择"。模型收到后转向选图而非继续生成。
 
 没有这条护栏，模型的自评循环会持续烧钱。
 
@@ -600,7 +612,7 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 - **整轮**：Worker 持 `AbortController`，默认上限 10 分钟（`TURN_TIMEOUT_MS`），超时 `harness.abort()` → `RunOutcome.kind = 'aborted'`
 - **lease**：30 秒租约（`TURN_LEASE_MS`）+ 10 秒心跳（`TURN_HEARTBEAT_MS`），覆盖整轮（含多次生图）
 
-变量清单见 §12.1。
+变量清单见 §12.2。
 
 ### 10.3 项目锁从 Generation 上移到 Turn（domain 必须改）
 
@@ -725,7 +737,7 @@ src/infrastructure/telemetry/stdout-telemetry.mjs
 - 每个 `pi.harness.tool` 调用了什么、是否出错
 - 整轮 `pi.harness.run` 的边界与终态
 
-通过 `TELEMETRY=stdout|noop` 切换（§12.1），**默认 `stdout`**。`NOOP_TELEMETRY_CONTEXT` 是 pi 的默认值，本项目显式覆盖它；`noop` 仅供测试中静音使用。
+通过 `TELEMETRY=stdout|noop` 切换（§12.2），**默认 `stdout`**。`NOOP_TELEMETRY_CONTEXT` 是 pi 的默认值，本项目显式覆盖它；`noop` 仅供测试中静音使用。
 
 将来做成本统计与配额（§16 Non-goals）时，基础就是这些 span 加 `AgentHarness.recordUsage()`，无需另起炉灶。
 
@@ -763,7 +775,7 @@ test/relay-images-provider.test.mjs
 test/support/fake-stream-fn.mjs         可编程 StreamFn
 test-integration/session-storage-conformance.test.mjs   跑 pi 官方套件（需真实 PostgreSQL）
 scripts/smoke-e2e.mjs
-.env.example                            运行配置模板（见 §12.1）
+.env.example                            运行配置模板（见 §12.2）
 ```
 
 修改：
@@ -807,7 +819,30 @@ test/photo-state.test.mjs               （6 个用例）
 typebox
 ```
 
-### 12.1 运行配置
+### 12.1 photo-project-repository.mjs 方法级改动
+
+该文件 635 行、11 个公开方法。「修改」两个字给不出指引，逐个标明——与 §7.2 的逐列清算同理，避免实施时漏改。
+
+| 方法 | 处置 | 理由 |
+|---|---|---|
+| `createProject` | **改** | `INSERT INTO assets` 补 `uri` + `metadata_json`（§6.3）；新增 `owner_id` |
+| `requestGeneration` | **改** | 移除项目锁检查与设置（§10.3）；删 `idempotency_key` 与 `operation`（§7.2）；新增 `input_asset_id` 与 `turn_id` |
+| `transitionGeneration` | **大改** | 九态 `GENERATION_TRANSITIONS` 图砍到 `completed \| failed`；移除 `claimToken`（lease 已迁至 turn） |
+| `recordProviderJob` | **删除** | 唯一作用是写 `provider_jobs`，该表删除（§7.3） |
+| `addCandidate` | **改** | 移除 `status === 'verifying'` 前置检查（该状态已不存在）与 `claimToken`；`INSERT INTO assets` 补 `uri` + `metadata_json` |
+| `selectCandidate` | **小改** | 移除 `runningGenerationId` 相关检查（§10.3）。`selectedCandidateId` 非空则拒绝的逻辑**保留**，与「一轮只选一次」天然兼容 |
+| `getProject` / `getGeneration` / `getRevision` | 基本不变 | 随列变更调整投影 |
+| `listRevisions` / `listGenerations` | 基本不变 | |
+
+**`addCandidate` 是最容易被漏掉的一个。** 它的两个前置条件在新架构下都塌了：`verifying` 状态不存在，generation 也不再持有 lease。而它正是 `generate_image` 落候选的必经之路——不改则每次生图都抛 `GenerationTransitionError`。
+
+新增（不在现有文件内）：
+
+| 方法 | 归属 | 说明 |
+|---|---|---|
+| `claimNextTurn` / `renewTurnLease` / `finishTurn` | `agent-turn-queue.mjs` | 见 §2.3：重写，不照抄旧队列 |
+
+### 12.2 运行配置
 
 现有变量，不变：
 
@@ -882,7 +917,7 @@ GET  /generations/:id                             删除
 }
 ```
 
-`url` 是对象存储签名 URL，由 API 进程按 `assets.uri` 现签（这也是 §12.1 里 API 需要 `S3_*` 凭证的原因）。**不返回图片字节。**
+`url` 是对象存储签名 URL，由 API 进程按 `assets.uri` 现签（这也是 §12.2 里 API 需要 `S3_*` 凭证的原因）。**不返回图片字节。**
 
 一轮可能有多次 `generate_image`，因此 `generations` 是数组；`selectedCandidateId` 与 `newRevisionId` 最多一个（§5.2：一轮只能选一次）。
 
@@ -980,4 +1015,5 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - `npm run smoke:e2e` 的 stdout 中可见 `pi.harness.run`、`pi.harness.tool`、`pi.ai.request`（`operation=generate_images`）三类 span，且带耗时（§11.4）
 - `src/domain/photo-state.mjs` 未修改；`photo-project-service.mjs` 的改动**仅限项目锁**（§10.3），patch 校验、Revision 冲突、候选选择逻辑不动
 - 一轮内可连续调用 `generate_image` 至上限而不触发 `ProjectBusyError`（验证 §10.3 的锁迁移确已完成）
+- `assets.uri` 非空：生图后该行能查到对象键，且据此能从 MinIO 取回字节（验证 §6.3 的写入代码确已改）
 - README 与设计文档使用同一套术语：Agent Turn / Tool / ImagesProvider / SessionStorage
