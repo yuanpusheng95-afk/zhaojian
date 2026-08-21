@@ -64,19 +64,47 @@ test-integration/session-storage-unit.test.mjs          本项目自己的窄用
 
 按职责拆分而非技术分层：`entries.mjs` 同时包含它的 SQL 和它的语义，改一个概念只碰一个文件。`storage.mjs` 只做组装，不含 SQL。
 
+## 测试夹具的既有约定（必须遵守）
+
+`test-integration/postgres-repository.test.mjs` 已经确立了本仓库的集成测试形状，新文件必须照做：
+
+```js
+const pool = new Pool({ connectionString });     // 模块级，全文件共享
+
+async function resetDatabase() {
+  const database = await pool.query('SELECT current_database() AS name');
+  if (!database.rows[0].name.endsWith('_test')) {
+    throw new Error(`Refusing to reset non-test database: ${database.rows[0].name}`);
+  }
+  await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+  await runMigrations(pool);
+}
+
+after(async () => { await pool.end(); });
+```
+
+三条不可省略的理由：
+
+1. **`_test` 后缀检查是安全护栏。** 若 `DATABASE_URL` 被指向生产库，必须拒绝执行而不是清表。
+2. **迁移必须在这里跑。** `scripts/prepare-test-database.mjs` 只 `CREATE DATABASE`，不跑迁移。不调 `runMigrations` 则 `agent_sessions` 表根本不存在。
+3. **pool 由 `after()` 统一关闭。** conformance 夹具的 `[Symbol.asyncDispose]` 必须是空实现——它每个用例调一次，若在里面 `pool.end()`，第一个用例跑完后面 29 个全挂。
+
+代价是每个用例都 `DROP SCHEMA` + 跑全部迁移，53 个用例会慢。这是既有约定换来的隔离与安全，第一版不优化。
+
 ## 测试文件的共享夹具
 
 `test-integration/session-storage-unit.test.mjs` 是**逐任务追加**的单一文件。Task 2 建立以下辅助，Task 3 补充两个，之后所有任务直接复用——**不要重复定义**：
 
 | 辅助 | 定义于 | 用途 |
 |---|---|---|
-| `connectionString` | Task 2 | 测试库连接串，默认指向 `photo_agent_test` |
-| `withClient(fn)` | Task 2 | 开一个 client、清库、`BEGIN`，结束时 `ROLLBACK` 并关池 |
+| `pool` / `connectionString` | Task 2 | 模块级连接池，默认指向 `photo_agent_test` |
+| `resetDatabase()` | Task 2 | `_test` 后缀检查 + DROP SCHEMA + `runMigrations` |
+| `withClient(fn)` | Task 2 | `resetDatabase()` 后取一个 client 交给 `fn`，结束释放（不关池） |
 | `messageEntry(id, text)` | Task 3 | 造一条最小的 `MessageEntry` provisioned 结构 |
 | `seedSession(client, id?)` | Task 3 | 插入 session 行并建好 `main` lane，返回 sessionId |
 | `startedRecord(id, lane)` | Task 4 | 造 `operation_started` 记录 |
 | `finishedRecord(id, lane, runId)` | Task 4 | 造 `operation_finished` 记录 |
-| `withRepo(fn)` | Task 8 | 清库并交出一个 `SessionRepo` |
+| `withRepo(fn)` | Task 8 | `resetDatabase()` 后交出一个 `SessionRepo` |
 
 执行某个任务前，先读一遍该文件已有的顶部导入与辅助定义，只追加自己那部分测试。
 
@@ -255,30 +283,41 @@ export function createPostgresSessionRepo({ pool }) {
 创建 `test-integration/session-storage-conformance.test.mjs`：
 
 ```js
-import test from 'node:test';
+import { after, test } from 'node:test';
 import pg from 'pg';
 
 import { createSessionBackendConformance } from '@earendil-works/pi-agent-core/session/testing';
 
+import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
 import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.mjs';
-import { SESSION_TABLES } from '../src/infrastructure/postgres/session/schema.mjs';
 
 const { Pool } = pg;
 
-const connectionString =
-  process.env.DATABASE_URL ??
-  'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent_test';
+const pool = new Pool({
+  connectionString:
+    process.env.DATABASE_URL ??
+    'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent_test',
+});
 
-/** 每个用例一个隔离夹具：清空全部会话表，用例之间互不可见。 */
+/** 与 postgres-repository.test.mjs 同一套护栏：拒绝重置非 _test 库。 */
+async function resetDatabase() {
+  const database = await pool.query('SELECT current_database() AS name');
+  if (!database.rows[0].name.endsWith('_test')) {
+    throw new Error(
+      `Refusing to reset non-test database: ${database.rows[0].name}`,
+    );
+  }
+  await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+  await runMigrations(pool);
+}
+
+/** 每个 conformance 用例一个隔离夹具。pool 是共享的，由 after() 关闭。 */
 async function createFixture() {
-  const pool = new Pool({ connectionString });
-  await pool.query(
-    `TRUNCATE ${SESSION_TABLES.sessions} RESTART IDENTITY CASCADE`,
-  );
+  await resetDatabase();
   return {
     repository: createPostgresSessionRepo({ pool }),
     async [Symbol.asyncDispose]() {
-      await pool.end();
+      // 故意留空：pool 由 after() 统一关闭，在这里 end() 会让后续用例全挂
     },
   };
 }
@@ -288,6 +327,10 @@ for (const conformanceCase of createSessionBackendConformance(createFixture)) {
     await conformanceCase.run();
   });
 }
+
+after(async () => {
+  await pool.end();
+});
 ```
 
 - [ ] **Step 6: 跑迁移并确认 30 个用例全红**
@@ -337,34 +380,49 @@ git commit -m "test: wire pi session conformance suite against postgres"
 
 ```js
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { after, test } from 'node:test';
 import pg from 'pg';
 
+import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
 import { nextSeq } from '../src/infrastructure/postgres/session/sequences.mjs';
 import {
   insertSession,
   readSession,
 } from '../src/infrastructure/postgres/session/sessions.mjs';
-import { SESSION_TABLES } from '../src/infrastructure/postgres/session/schema.mjs';
 
 const { Pool } = pg;
-const connectionString =
-  process.env.DATABASE_URL ??
-  'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent_test';
+const pool = new Pool({
+  connectionString:
+    process.env.DATABASE_URL ??
+    'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent_test',
+});
 
+/** 与 postgres-repository.test.mjs 同一套护栏：拒绝重置非 _test 库。 */
+async function resetDatabase() {
+  const database = await pool.query('SELECT current_database() AS name');
+  if (!database.rows[0].name.endsWith('_test')) {
+    throw new Error(
+      `Refusing to reset non-test database: ${database.rows[0].name}`,
+    );
+  }
+  await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+  await runMigrations(pool);
+}
+
+/** 重置库后交出一个 client。pool 不在这里关闭。 */
 async function withClient(fn) {
-  const pool = new Pool({ connectionString });
+  await resetDatabase();
   const client = await pool.connect();
   try {
-    await client.query(`TRUNCATE ${SESSION_TABLES.sessions} RESTART IDENTITY CASCADE`);
-    await client.query('BEGIN');
     return await fn(client);
   } finally {
-    await client.query('ROLLBACK').catch(() => {});
     client.release();
-    await pool.end();
   }
 }
+
+after(async () => {
+  await pool.end();
+});
 
 test('nextSeq starts at 1 and increases by one per call', async () => {
   await withClient(async (client) => {
@@ -420,6 +478,8 @@ test('readSession round-trips metadata and parent', async () => {
   });
 });
 ```
+
+**注意：** 各用例之间不再共用事务——`withClient` 每次都重置整个 schema，因此不需要 `BEGIN` / `ROLLBACK`。
 
 - [ ] **Step 2: 跑测试确认失败**
 
