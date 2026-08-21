@@ -504,11 +504,30 @@ PostgreSQL 的 `ALTER TABLE ... RENAME TO` 会自动携带约束，但约束**�
 - `running_generation_id`（FK → `generation_jobs`）→ **替换为** `running_turn_id text REFERENCES agent_turns(id)`。这不是列改名，是换了引用目标：项目锁的持有者从「一次生图」变成「一轮 Agent」（§7.1）。旧列与旧 FK 一并删除。
 - 新增 `owner_id text NOT NULL DEFAULT 'dev'`
 
-### 7.5 idempotency_requests：删除
+### 7.5 idempotency_requests：删除，指纹改用 user_message
 
-旧表结构是 `(project_id, idempotency_key) → generation_id`，即幂等键指向一次生图。新架构下幂等作用域是 agent turn，而 `agent_turns` 已带 `UNIQUE (project_id, idempotency_key)`（§7.1），**约束本身就是幂等记录**，单独一张映射表是冗余的。
+旧表结构是 `(project_id, idempotency_key, request_fingerprint) → generation_id`，两个职责：**去重**（同 key 返回同一 generation）与**冲突检测**（同 key 但请求内容不同 → `IDEMPOTENCY_CONFLICT`）。
 
-重复提交同一 `Idempotency-Key` 时，插入 `agent_turns` 触发唯一约束冲突，转为查询既有行并返回其 `turnId`，语义与旧实现一致。
+新架构下这两个职责都由 `agent_turns` 自己承担，不需要独立映射表：
+
+| 职责 | 旧实现 | 新实现 |
+|---|---|---|
+| 去重 | `idempotency_requests` 主键 | `agent_turns` 的 `UNIQUE (project_id, idempotency_key)` |
+| 冲突检测 | `request_fingerprint` 列（patch 等多字段哈希） | **直接比对 `agent_turns.user_message`** |
+
+**不新增 fingerprint 列。** 一轮的全部输入就是那条用户消息，`user_message` 已经在表里——再存一个它的哈希，只是多一处会不同步的状态。
+
+`POST /projects/:id/messages` 的处理：
+
+```text
+INSERT INTO agent_turns ... ON CONFLICT (project_id, idempotency_key) DO NOTHING
+  ├─ 插入成功            → 新轮次，占项目锁，202 { turnId }
+  └─ 冲突（0 行受影响）  → SELECT 既有行
+       ├─ user_message 相同  → 200 { turnId, replayed: true }   幂等重放
+       └─ user_message 不同  → 409 IDEMPOTENCY_CONFLICT
+```
+
+**冲突必须在这里就地处理，不能让 `23505` 冒泡。** 现有 `server.mjs:126` 的 `mapError` 把所有唯一约束冲突一律映射成 `409 RESOURCE_CONFLICT`——若让它冒泡，正常的幂等重放会返回 409 而不是原 `turnId`（§12.2）。
 
 ### 7.6 photo_revisions / assets / generation_outputs
 
@@ -586,7 +605,7 @@ pi 的契约明确：
 
 ### 9.3 成本护栏
 
-**每轮 `generate_image` 调用次数硬上限，默认 3 次**，由轮次上下文计数，通过 `MAX_IMAGES_PER_TURN` 配置（§12.2）。超限后 tool 抛错："本轮生图次数已用尽，请从已有候选中选择"。模型收到后转向选图而非继续生成。
+**每轮 `generate_image` 调用次数硬上限，默认 3 次**，由轮次上下文计数，通过 `MAX_IMAGES_PER_TURN` 配置（§12.3）。超限后 tool 抛错："本轮生图次数已用尽，请从已有候选中选择"。模型收到后转向选图而非继续生成。
 
 没有这条护栏，模型的自评循环会持续烧钱。
 
@@ -612,7 +631,7 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 - **整轮**：Worker 持 `AbortController`，默认上限 10 分钟（`TURN_TIMEOUT_MS`），超时 `harness.abort()` → `RunOutcome.kind = 'aborted'`
 - **lease**：30 秒租约（`TURN_LEASE_MS`）+ 10 秒心跳（`TURN_HEARTBEAT_MS`），覆盖整轮（含多次生图）
 
-变量清单见 §12.2。
+变量清单见 §12.3。
 
 ### 10.3 项目锁从 Generation 上移到 Turn（domain 必须改）
 
@@ -737,7 +756,7 @@ src/infrastructure/telemetry/stdout-telemetry.mjs
 - 每个 `pi.harness.tool` 调用了什么、是否出错
 - 整轮 `pi.harness.run` 的边界与终态
 
-通过 `TELEMETRY=stdout|noop` 切换（§12.2），**默认 `stdout`**。`NOOP_TELEMETRY_CONTEXT` 是 pi 的默认值，本项目显式覆盖它；`noop` 仅供测试中静音使用。
+通过 `TELEMETRY=stdout|noop` 切换（§12.3），**默认 `stdout`**。`NOOP_TELEMETRY_CONTEXT` 是 pi 的默认值，本项目显式覆盖它；`noop` 仅供测试中静音使用。
 
 将来做成本统计与配额（§16 Non-goals）时，基础就是这些 span 加 `AgentHarness.recordUsage()`，无需另起炉灶。
 
@@ -775,13 +794,13 @@ test/relay-images-provider.test.mjs
 test/support/fake-stream-fn.mjs         可编程 StreamFn
 test-integration/session-storage-conformance.test.mjs   跑 pi 官方套件（需真实 PostgreSQL）
 scripts/smoke-e2e.mjs
-.env.example                            运行配置模板（见 §12.2）
+.env.example                            运行配置模板（见 §12.3）
 ```
 
 修改：
 
 ```text
-src/api/server.mjs
+src/api/server.mjs                    路由重写 + mapError 改（§12.2）
 src/worker/generation-worker.mjs        → src/worker/agent-turn-worker.mjs
 src/domain/photo-project-service.mjs    项目锁从 generation 上移到 turn（§10.3）
 src/infrastructure/postgres/photo-project-repository.mjs
@@ -789,7 +808,7 @@ test/project-workflow.test.mjs          11 个中的 2 个改断言（§10.3）
 compose.yaml                            新增 MinIO
 package.json                            新增依赖与脚本
 README.md
-test-integration/postgres-repository.test.mjs
+test-integration/postgres-repository.test.mjs   接近重写，22 个用例（§12.2）
 ```
 
 删除：
@@ -841,8 +860,33 @@ typebox
 | 方法 | 归属 | 说明 |
 |---|---|---|
 | `claimNextTurn` / `renewTurnLease` / `finishTurn` | `agent-turn-queue.mjs` | 见 §2.3：重写，不照抄旧队列 |
+| `requestTurn` | `agent-turn-queue.mjs` 或 repository | 实现 §7.5 的 `ON CONFLICT` + `user_message` 比对；**唯一约束冲突就地处理，不得冒泡** |
 
-### 12.2 运行配置
+### 12.2 api/server.mjs 与集成测试的真实工作量
+
+**`mapError` 必须改。** 现有第 126 行：
+
+```js
+if (error.code === '23505') return new HttpError(409, 'RESOURCE_CONFLICT', ...)
+```
+
+把所有 Postgres 唯一约束冲突一律映射成 409。幂等重放依赖 `agent_turns` 的唯一约束冲突转查询（§7.5），若冒泡到这里就会返回 409 而非原 `turnId`。此外错误码表里的 `INVALID_GENERATION_TRANSITION` 随九态状态机消失，`PROJECT_BUSY` 语义变为轮次级（§10.3）。
+
+**集成测试接近重写，不是「修改」。** `test-integration/postgres-repository.test.mjs` 共 1082 行、22 个用例，对将被删改能力的引用：
+
+| 能力 | 引用次数 | 新架构下 |
+|---|---|---|
+| `requestGeneration` | 17 | 签名改（§12.1） |
+| `transitionGeneration` | 13 | 九态砍到二态，删 claimToken |
+| `recordProviderJob` | 6 | **方法删除**，这 6 处直接作废 |
+| `addCandidate` | 3 | 前置条件全塌（§12.1） |
+| `selectCandidate` | 2 | 小改 |
+
+实施计划里应把它当成独立工作单元估算，而不是跟在某个改动后面顺手带过。
+
+（README 现写「19 个集成测试」，实际 22 个，一并更正。）
+
+### 12.3 运行配置
 
 现有变量，不变：
 
@@ -895,6 +939,17 @@ POST /projects/:id/generations                    删除
 GET  /generations/:id                             删除
 ```
 
+`POST /projects/:id/messages` 的状态码（§7.5 的完整规则）：
+
+| 情况 | 状态码 | 返回体 |
+|---|---|---|
+| 新轮次入队成功 | `202` | `{ turnId }` |
+| 同 key 同消息（幂等重放） | `200` | `{ turnId, replayed: true }` |
+| 同 key 不同消息 | `409` | `IDEMPOTENCY_CONFLICT` |
+| 该项目已有轮次在跑 | `409` | `PROJECT_BUSY` |
+
+用 `202` / `200` 区分「新建」与「重放」，让客户端不必靠猜；`replayed` 标记是给幂等语义留的显式出口。
+
 **路径一律嵌在 `/projects/:id` 下。** turn 属于 project，且接入鉴权后（§6.2 的 `owner_id`）授权检查以 project 为单位；嵌套路径让「先验证 project 归属、再取 turn」成为路径的自然读法，不需要额外反查 turn → project。
 
 `GET /projects/:id/turns/:turnId` 返回体：
@@ -917,7 +972,7 @@ GET  /generations/:id                             删除
 }
 ```
 
-`url` 是对象存储签名 URL，由 API 进程按 `assets.uri` 现签（这也是 §12.2 里 API 需要 `S3_*` 凭证的原因）。**不返回图片字节。**
+`url` 是对象存储签名 URL，由 API 进程按 `assets.uri` 现签（这也是 §12.3 里 API 需要 `S3_*` 凭证的原因）。**不返回图片字节。**
 
 一轮可能有多次 `generate_image`，因此 `generations` 是数组；`selectedCandidateId` 与 `newRevisionId` 最多一个（§5.2：一轮只能选一次）。
 
@@ -1016,4 +1071,5 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - `src/domain/photo-state.mjs` 未修改；`photo-project-service.mjs` 的改动**仅限项目锁**（§10.3），patch 校验、Revision 冲突、候选选择逻辑不动
 - 一轮内可连续调用 `generate_image` 至上限而不触发 `ProjectBusyError`（验证 §10.3 的锁迁移确已完成）
 - `assets.uri` 非空：生图后该行能查到对象键，且据此能从 MinIO 取回字节（验证 §6.3 的写入代码确已改）
+- 幂等三态正确：同 key 同消息返回 `200 { replayed: true }`，同 key 不同消息返回 `409 IDEMPOTENCY_CONFLICT`，新 key 返回 `202`（验证 §7.5 的指纹语义未丢失）
 - README 与设计文档使用同一套术语：Agent Turn / Tool / ImagesProvider / SessionStorage
