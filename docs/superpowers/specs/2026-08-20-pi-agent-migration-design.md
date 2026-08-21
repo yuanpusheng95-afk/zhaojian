@@ -261,6 +261,58 @@ Tool 是薄适配层，只做三件事：typebox schema 声明、调用 Domain �
 - **加新动作**（放大、去水印、扩图）→ 加一个 tool，复用同一套 revision/candidate 机制
 - **加领域知识**（证件照规范、电商主图规范）→ 走 `AgentHarnessOptions.resources` 挂 skill，**零代码**
 
+### 5.6 基准图与输入图
+
+`generate_image` 的参数里没有图。输入图由**轮次上下文维护的基准图指针** `currentBaseAssetId` 决定，Agent 不能直接指定——否则模型可以任意挑图，产生无法解释的编辑链。
+
+规则：
+
+```text
+轮次开始           currentBaseAssetId = 当前 Revision 的 anchorAssetId
+generate_image 后  currentBaseAssetId = 本次产出的候选（多张时取第一张）
+select_candidate 后 currentBaseAssetId = 被选中的候选，并固化为新 Revision 的 anchor
+```
+
+一句话：**选中优先，否则用上一次候选图。**
+
+数据流：
+
+```text
+generate_image({ patch, renderPrompt })
+  → 从 currentBaseAssetId 查 assets.uri
+  → 对象存储取字节
+  → ImageContent + TextContent(renderPrompt) 组成 ImagesContext.input
+  → imagesModels.generateImages(...)
+  → 产出字节 PUT 对象存储 → INSERT assets + generations + generation_outputs
+  → 更新 currentBaseAssetId
+  → 返回 { generationId, candidates } + ImageContent 给模型
+```
+
+`candidateId` 即 `generation_outputs.id`。
+
+**已知代价（用户已确认接受）：** 在生成物上反复编辑会逐代劣化——人脸漂移、画质衰减，三四轮后明显。缓解手段不进 MVP，但路径是现成的：`patch` 是持久化的累积事实，随时可以从原始锚定图带全量 patch 重生一次。将来可作为「重置画质」动作暴露。
+
+### 5.7 System Prompt
+
+Agent 的行为不是架构的自然结果，而是 system prompt 的产物。§5.3 那条「生成 → 自评 → 重试」链路，没有明确引导不会发生。
+
+MVP 的 system prompt 必须覆盖以下几条，逐条对应一个已知失败模式：
+
+| 指令要点 | 不写会怎样 |
+|---|---|
+| 先 `read_photo_state` 再动手 | 模型凭空猜当前状态，patch 与事实不符 |
+| `patch` 写目标状态，`renderPrompt` 写渲染细节 | 两者混用，Photo State 被塞进自然语言 |
+| 一次意图尽量合并进一个 patch | 拆成多次生图，成本翻倍 |
+| 生成后必须看图评估 | 拿到图就 `select_candidate`，自评能力形同虚设 |
+| 明显缺陷才重生，最多 `MAX_IMAGES_PER_TURN` 次 | 无限追求完美，烧到护栏才停 |
+| 用户意图不明确时**反问而非猜测** | 猜错方向，白花一次生图 |
+| 满意后调 `select_candidate` 结束 | 轮次跑到超时才结束 |
+| 人像编辑默认保持人物身份特征 | 换背景顺手把脸也换了 |
+
+存放位置 `src/agent/system-prompt.mjs`，纯文本导出，不做模板引擎。
+
+**它是需要迭代调优的产物，不是一次写对的代码。** 因此实施计划中应把「跑通」与「调好」分开：切片 2 的验收只要求链路走通，prompt 的效果调优是随后的独立工作。将来沉淀出的领域规范（证件照、电商主图）走 `resources` 挂 skill（§5.5），不往 system prompt 里堆。
+
 ## 6. 对象存储
 
 ### 6.1 决策
@@ -271,9 +323,11 @@ Tool 是薄适配层，只做三件事：typebox schema 声明、调用 Domain �
 
 ```text
 src/infrastructure/storage/
-  asset-storage.mjs        Port：put(key, bytes, contentType) / getSignedUrl(key) / delete(key)
+  asset-storage.mjs        Port：put(key, bytes, contentType) / get(key) / getSignedUrl(key)
   s3-asset-storage.mjs     S3 兼容实现（MinIO / OSS / COS 通吃）
 ```
+
+`get(key)` 是必需的——`generate_image` 要把基准图字节喂给图像模型（§5.6）。**不提供 `delete()`**：垃圾回收是 non-goal（§16），MVP 无人调用，加一个死方法只会让人以为清理逻辑已经存在。
 
 **否决 PostgreSQL bytea**：图片进数据库是会后悔的决定，仅为 MVP 省事不成立。
 **否决本地文件系统**：多 Worker / 多 API 实例部署下失效，需要共享文件系统。
@@ -307,7 +361,6 @@ CREATE TABLE agent_turns (
   user_message text NOT NULL,
   idempotency_key text NOT NULL,
   status text NOT NULL CHECK (status IN ('queued','running','completed','failed','aborted')),
-  attempt_count int NOT NULL DEFAULT 0,
   lease_token text,
   lease_expires_at timestamptz,
   outcome_json jsonb,
@@ -317,6 +370,8 @@ CREATE TABLE agent_turns (
   UNIQUE (project_id, idempotency_key)
 );
 ```
+
+**没有 `attempt_count` 列。** 上限既然是 1（§8.2），计数器就是多余的状态：`status='queued'` 表示从未被领取，`status='running'` 且 lease 过期表示已尝试过一次——直接判 `failed`。用一个计数器表达一个布尔事实，是在给未来的读者制造"这里可以重试多次"的错觉。
 
 **队列的作业单位从 Generation 升级为 Agent Turn。** 一轮内 Agent 可调用 N 次工具、生 M 次图。`FOR UPDATE SKIP LOCKED`、lease token、heartbeat、幂等逻辑全部复用，仅 payload 改变。
 
@@ -374,7 +429,9 @@ Tool 级幂等在此**不成立**：重跑时模型重新推理，`toolCallId` �
 
 ### 8.2 决定
 
-**`agent_turns.attempt_count` 上限设为 1。一轮失败即失败，不自动重试。**
+**一轮只尝试一次。失败即失败，不自动重试。**
+
+具体规则：Worker 领取时把 `queued` 置为 `running` 并写 lease；若发现某轮 `status='running'` 而 lease 已过期（原 Worker 崩溃或假死），**不重新领取，直接置 `failed` 并释放项目锁**。
 
 - 不重跑 → 不存在重复扣费
 - 让用户重发消息本就是更合理的产品行为（用户往往想换说法）
@@ -479,7 +536,7 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 
 ### 11.2 实现成本与路径
 
-契约为 `SessionStorage`，**20 个方法**，本质是 append-only entries + records + lane 指针 + 少量 kv fact。
+契约为 `SessionStorage`，**17 个方法**，本质是 append-only entries + records + lane 指针 + 少量 kv fact。
 
 pi 提供两样东西使这项工作可控：
 
@@ -565,10 +622,11 @@ src/infrastructure/telemetry/stdout-telemetry.mjs
 
 ```text
 src/agent/harness-factory.mjs           构造 AgentHarness（models、tools、systemPrompt、session）
+src/agent/system-prompt.mjs             Agent 行为引导（§5.7）
 src/agent/tools/read-photo-state.mjs
 src/agent/tools/generate-image.mjs
 src/agent/tools/select-candidate.mjs
-src/agent/turn-context.mjs              轮次上下文：fatal 标记、生图计数
+src/agent/turn-context.mjs              轮次上下文：基准图指针、fatal 标记、生图计数（§5.6、§9.2、§9.3）
 src/infrastructure/models/relay-text-provider.mjs
 src/infrastructure/models/relay-images-provider.mjs   relayGenerateImages 实现
 src/infrastructure/storage/asset-storage.mjs
@@ -711,12 +769,12 @@ GET  /generations/:id                             删除
 | 层 | 内容 | 依赖 |
 |---|---|---|
 | Domain 单测（保留现有 17 个） | photo-state、状态机、patch 校验 | 无，一行不改 |
-| Tools 单测 | 参数校验、错误分类、成本护栏计数 | fake repository + fake images provider |
+| Tools 单测 | 参数校验、错误分类、成本护栏计数、**基准图指针推进规则（§5.6）** | fake repository + fake images provider + fake storage |
 | ImagesProvider 单测 | multipart 组装、b64/URL 响应解析、401/429 归类为 fatal | fake fetch |
 | Worker 轮次单测 | 编排正确性：自评重生、超限后停、fatal 中止 | fake StreamFn + fake provider |
 | 集成测试 | 全链路 | 真实 PostgreSQL + 真实 MinIO + fake StreamFn + fake provider |
 | 端到端冒烟 | 真实中转站真出图 | `npm run smoke:e2e`，手动执行，**不进 CI** |
-| PostgreSQL SessionStorage | 20 个方法的契约一致性 | pi 官方 `createSessionBackendConformance` + 真实 PostgreSQL |
+| PostgreSQL SessionStorage | 17 个方法的契约一致性 | pi 官方 `createSessionBackendConformance` + 真实 PostgreSQL |
 
 **集成测试用真基础设施 + 假模型**：基础设施是 bug 藏身处，模型是花钱的地方。
 
@@ -726,7 +784,7 @@ GET  /generations/:id                             删除
 
 ### 切片 1：PostgreSQL SessionStorage
 
-实现 `SessionStorage` 的 20 个方法，对照 sqlite 参考实现移植（§11.2）。
+实现 `SessionStorage` 的 17 个方法，对照 sqlite 参考实现移植（§11.2）。
 
 **独立可验收：pi 的 `createSessionBackendConformance` 套件全绿。** 不依赖真实模型、不依赖中转站、不依赖对象存储，因此可以先于所有 Agent 接线完成，风险最低、验收标准最确定。
 
@@ -760,11 +818,13 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - **assumption：中转站的 `/v1/images/edits` 接受原图 + prompt 并返回可解析的 b64 或 URL。** 实际响应格式在实现 `relayGenerateImages` 时以真实响应为准。
 - **assumption：中转站返回的图片 URL 若有时效，必须在轮次内立即下载并转存对象存储。** 不直接把中转站 URL 存入 `assets.uri`。
 - 模型输出只能当作不可信输入，必须经过 Domain 校验；结构化输出不等于合法业务操作。
-- 切片 2 的 Worker 崩溃时轨迹已入 PostgreSQL 可查，但 `attempt_count = 1` 使该轮本身不可恢复。这是明确的取舍（§8.2）。
+- 切片 2 的 Worker 崩溃时轨迹已入 PostgreSQL 可查，但「只尝试一次」使该轮本身不可恢复，用户需重发消息。这是明确的取舍（§8.2）。
 - PostgreSQL SessionStorage 是本次最大单块工作量（800–1000 行）。若 conformance 套件暴露出 pi 契约中未文档化的语义（分支、lane 移动、seq 单调性边界），切片 1 可能超出预估。这是把它排在最前的另一个理由：早暴露。
 - **open：`RELAY_TEXT_MODEL` 的具体值待定。** 该模型必须同时满足两个条件：支持 function calling（否则 agent 循环不成立），且 `input` 含 `'image'`（否则 §5.3 的自评看不到图）。选定前无法跑通切片 2，需在实施前从中转站模型清单确认。
 - pi 版本 0.84.2 处于 0.x，API 可能变化。锁定精确版本，升级作为独立任务处理。
 - 生图耗时受中转站影响，10 分钟整轮上限可能需要按实测调整。
+- **System prompt 的效果无法在设计阶段验证。** §5.7 列的是必须覆盖的要点，不是最终文案；实际行为需要真实模型上迭代。切片 2 的验收只要求链路走通（§15），prompt 调优是随后的独立工作。
+- 在生成物上迭代编辑会逐代劣化（§5.6）。MVP 接受该代价，缓解手段（从原图带全量 patch 重生）不进本次范围。
 
 ## 18. Acceptance Criteria
 
@@ -773,6 +833,7 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - `npm run smoke:e2e` 跑通：用户消息 → Agent 调工具 → 中转站真实出图 → MinIO 中可见图片对象 → 新 Revision 创建且 `active_revision_id` 切换
 - **Agent 轨迹可从 PostgreSQL 回放**：一轮结束后能查到该轮的全部 entries（用户消息、工具调用、参数、结果）
 - 多轮对话可用：第二条消息时 Agent 能看到第一轮历史
+- 基准图规则生效：连续两次 `generate_image` 时，第二次的输入图是第一次的产出（§5.6）
 - Agent 能看到自己生成的图（`generate_image` 返回 `ImageContent`）
 - 成本护栏生效：超过每轮生图上限后 Agent 转向选图
 - 不可纠正错误中止整轮，不让模型空转
