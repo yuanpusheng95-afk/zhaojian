@@ -54,13 +54,15 @@ pi 提供的三样东西恰好覆盖需求，且都是公开扩展点，无需 f
 - HTTP API：`POST /projects/:id/generations`、`GET /generations/:id` 删除
 - `generation_jobs` 表改名并瘦身，`provider_jobs` 与 `idempotency_requests` 表删除
 - `src/worker/generation-worker.mjs` 重写
+- **`src/domain/photo-project-service.mjs` 的项目锁逻辑必须改**（§10.3）。锁从「一次生图」上移到「一轮」，`project-workflow.test.mjs` 11 个用例中 2 个随之调整
 
 **不破坏：**
 
-- `src/domain/**` 全部保留，17 个 domain 单测一行不改（`photo-state` 6 + `project-workflow` 11）
+- `src/domain/photo-state.mjs` 与全部 patch 校验规则，**6 个单测一行不改**
+- `project-workflow.test.mjs` 11 个中的 9 个（Revision 冲突、幂等、候选选择、状态机迁移）
 - `photo_revisions`、`assets`、`projects` 的核心语义
 - Lease + heartbeat + `FOR UPDATE SKIP LOCKED` 队列机制（换 payload，不换机制）
-- Revision 冲突检测、项目锁、幂等语义
+- Revision 冲突检测、幂等语义
 
 ## 3. Decision
 
@@ -119,7 +121,59 @@ interface AgentHarnessOptions {
 
 `RunOutcome` 的四种取值 `completed | aborted | failed | suspended` 直接映射轮次终态，不自研状态机。
 
+### 3.4 一轮的完整时序
+
+分散在 §5、§7、§13 的细节在此串成一条线，作为实施时的对照基准。
+
+```text
+POST /projects/p1/messages { message: "把背景换成海边" }   Idempotency-Key: m-1
+ │
+ ├─ 单事务：INSERT agent_turns(queued)         ← UNIQUE 冲突则查既有行返回其 turnId
+ │          UPDATE projects.running_turn_id    ← 已被占用则 409 PROJECT_BUSY
+ └─ 202 { turnId }
+
+Worker
+ ├─ FOR UPDATE SKIP LOCKED 领 queued 轮次 → status=running + lease_token
+ ├─ 启动心跳（10s 续租），覆盖整轮
+ ├─ 打开该 project 的 Session（PostgreSQL backend）
+ ├─ 初始化轮次上下文：currentBaseAssetId = Revision.anchorAssetId, imageCount = 0
+ ├─ new AgentHarness({ session, models, model, tools, systemPrompt, context: telemetry })
+ └─ harness.run(userMessage)
+      │
+      ├─ read_photo_state
+      │    └─ SELECT revision → { revisionId, state, baseImage:{assetId, origin} }
+      │
+      ├─ generate_image({ patch, renderPrompt })
+      │    ├─ imageCount >= MAX_IMAGES_PER_TURN ? 抛错并返回
+      │    ├─ Domain 校验 patch（非法 → 抛错，pi 转 error result 让模型自纠）
+      │    ├─ 对象存储 get(currentBaseAssetId 对应的 uri) → 基准图字节
+      │    ├─ ImagesContext.input = [ImageContent(基准图), TextContent(renderPrompt)]
+      │    ├─ imagesModels.generateImages(...)      ← 唯一花钱的调用，30–90s
+      │    ├─ 产出字节 PUT 对象存储（扩展名按 content type）
+      │    ├─ 单事务：INSERT assets + generations + generation_outputs
+      │    ├─ currentBaseAssetId = 首张候选; imageCount++
+      │    └─ 返回 { generationId, candidates } + ImageContent(候选图) 给模型
+      │
+      ├─ [模型看图自评 → 可能再次 generate_image，回到上一步]
+      │
+      └─ select_candidate({ generationId, candidateId })
+           ├─ 单事务：INSERT photo_revisions + UPDATE projects.active_revision_id
+           │           + UPDATE generations.selected_candidate_id/selected_revision_id
+           └─ 返回 { revisionId } + terminate:true → 本轮结束
+
+Worker 收尾
+ ├─ RunOutcome(completed|aborted|failed) + 轮次上下文的 fatal 标记 → 判定终态
+ ├─ 单事务：UPDATE agent_turns(status, outcome_json, error_json)
+ │           + UPDATE projects.running_turn_id = NULL
+ └─ 停止心跳，释放 lease
+
+GET /projects/p1/turns/{turnId} → §13 的返回体（候选图带签名 URL）
+```
+
+**所有写库动作都标了事务边界。** 三处单事务是不变量的守护点：入队与占锁必须原子（否则轮次入队后没锁住项目），产出落库必须原子（否则出现有 asset 无 generation 的孤儿），收尾必须原子（否则轮次结束了但项目锁没释放）。
+
 ## 4. 模型接线
+
 
 两条独立管道，均指向同一个 OpenAI 兼容中转站。
 
@@ -344,8 +398,10 @@ src/infrastructure/storage/
 ### 6.2 路径结构
 
 ```text
-users/{ownerId}/projects/{projectId}/{assetId}.png
+users/{ownerId}/projects/{projectId}/{assetId}.{ext}
 ```
+
+`ext` 由图像模型响应的 content type 推导（`image/png` → `png`、`image/webp` → `webp`、`image/jpeg` → `jpg`），**不写死 `.png`**——gpt-image-2 及后续供应商可能返回 webp 或 jpeg，写死会让文件名骗人。content type 同时存入 `assets.metadata_json`，签名 URL 据此设 `Content-Type`。
 
 `projects` 表新增 `owner_id text NOT NULL DEFAULT 'dev'`。MVP 阶段 `ownerId` 从请求头取、缺省 `dev`；接入鉴权后换成真实用户 ID，**路径结构不变、已存对象不搬迁**。
 
@@ -546,7 +602,37 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 
 变量清单见 §12.1。
 
+### 10.3 项目锁从 Generation 上移到 Turn（domain 必须改）
+
+**现状：锁绑在一次生图上，在 domain 里。**
+
+```js
+// src/domain/photo-project-service.mjs
+168:    if (project.runningGenerationId) {
+169:      throw new ProjectBusyError(projectId, project.runningGenerationId);
+202:    project.runningGenerationId = generation.id;
+273:      project.runningGenerationId && project.runningGenerationId !== generation.id
+276:      throw new ProjectBusyError(...)
+367:    if (project.runningGenerationId === generation.id) { ... = null }
+```
+
+**这挡死了本设计的中心前提。** 一轮 Agent 第一次调 `generate_image` 会设上 `runningGenerationId`，第二次调用直接撞 168 行抛 `ProjectBusyError`。「一轮内多次生图」不成立，则 §5.2 的重 roll、§5.3 的自评重试、§5.6 的基准图推进、§9.3 的三次上限全部作废。
+
+**变更：**
+
+| 位置 | 改法 |
+|---|---|
+| `requestGeneration()` | 移除 `runningGenerationId` 的检查（168–169）与设置（202）。一轮内可自由多次创建 generation |
+| `selectCandidate()` | 移除 `runningGenerationId !== generation.id` 检查（273–276） |
+| 清锁逻辑（367–368） | 移除 |
+| 互斥的新归属 | `projects.running_turn_id` + `FOR UPDATE SKIP LOCKED`（§7.4、§10.1），由 Worker 领取/释放轮次时维护 |
+
+**语义没有变弱，只是粒度变对了。** 旧规则「同一项目同时只能跑一次生图」在新架构下的正确表述是「同一项目同时只能跑一轮」——而一轮本来就串行执行其内部的生图。互斥强度不变，但允许一轮内多次生图。
+
+**测试影响：** `test/project-workflow.test.mjs` 的 11 个用例中 2 个断言 `ProjectBusyError`（157 行的 `requestGeneration`、326 行的 `selectCandidate`），需改为断言新的轮次级互斥。其余 9 个与 `photo-state.test.mjs` 的 6 个不受影响。
+
 ## 11. Session 存储与可观测性
+
 
 ### 11.1 决定：PostgreSQL SessionStorage，切片 1 内完成
 
@@ -685,7 +771,9 @@ scripts/smoke-e2e.mjs
 ```text
 src/api/server.mjs
 src/worker/generation-worker.mjs        → src/worker/agent-turn-worker.mjs
+src/domain/photo-project-service.mjs    项目锁从 generation 上移到 turn（§10.3）
 src/infrastructure/postgres/photo-project-repository.mjs
+test/project-workflow.test.mjs          11 个中的 2 个改断言（§10.3）
 compose.yaml                            新增 MinIO
 package.json                            新增依赖与脚本
 README.md
@@ -706,9 +794,8 @@ test/generation-worker.test.mjs         （5 个用例，被 agent-turn-worker.t
 不修改：
 
 ```text
-src/domain/**
+src/domain/photo-state.mjs              及全部 patch 校验规则
 test/photo-state.test.mjs               （6 个用例）
-test/project-workflow.test.mjs          （11 个用例）
 ```
 
 新增依赖：
@@ -819,7 +906,7 @@ GET  /generations/:id                             删除
 
 | 层 | 内容 | 依赖 |
 |---|---|---|
-| Domain 单测（保留现有 17 个） | photo-state、状态机、patch 校验 | 无，一行不改 |
+| Domain 单测 | photo-state（6 个不变）、状态机、patch 校验、**轮次级互斥（2 个改断言，§10.3）** | 无外部依赖 |
 | Tools 单测 | 参数校验、错误分类、成本护栏计数、**基准图指针推进规则（§5.6）** | fake repository + fake images provider + fake storage |
 | ImagesProvider 单测 | multipart 组装、b64/URL 响应解析、401/429 归类为 fatal | fake fetch |
 | Worker 轮次单测 | 编排正确性：自评重生、同条件重 roll、超限后停、`select_candidate` 终止轮次、fatal 中止 | fake StreamFn + fake provider |
@@ -879,7 +966,7 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 
 ## 18. Acceptance Criteria
 
-- `npm test` 全绿：Domain 17 个（不变）+ Tools + Worker 轮次 + ImagesProvider
+- `npm test` 全绿：Domain 15 个不变 + 2 个改断言（§10.3）+ Tools + Worker 轮次 + ImagesProvider
 - `npm run test:integration` 全绿：真实 PostgreSQL + 真实 MinIO 全链路，**含 pi `createSessionBackendConformance` 套件**
 - `npm run smoke:e2e` 跑通：用户消息 → Agent 调工具 → 中转站真实出图 → MinIO 中可见图片对象 → 新 Revision 创建且 `active_revision_id` 切换
 - **Agent 轨迹可从 PostgreSQL 回放**：一轮结束后能查到该轮的全部 entries（用户消息、工具调用、参数、结果）
@@ -891,5 +978,6 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - 成本护栏生效：超过每轮生图上限后 Agent 转向选图
 - 不可纠正错误中止整轮，不让模型空转
 - `npm run smoke:e2e` 的 stdout 中可见 `pi.harness.run`、`pi.harness.tool`、`pi.ai.request`（`operation=generate_images`）三类 span，且带耗时（§11.4）
-- `src/domain/**` 未修改
+- `src/domain/photo-state.mjs` 未修改；`photo-project-service.mjs` 的改动**仅限项目锁**（§10.3），patch 校验、Revision 冲突、候选选择逻辑不动
+- 一轮内可连续调用 `generate_image` 至上限而不触发 `ProjectBusyError`（验证 §10.3 的锁迁移确已完成）
 - README 与设计文档使用同一套术语：Agent Turn / Tool / ImagesProvider / SessionStorage
