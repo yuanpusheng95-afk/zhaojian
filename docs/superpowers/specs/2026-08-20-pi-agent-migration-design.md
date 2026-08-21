@@ -58,7 +58,7 @@ pi 提供的三样东西恰好覆盖需求，且都是公开扩展点，无需 f
 
 **不破坏：**
 
-- `src/domain/photo-state.mjs` 与全部 patch 校验规则，**6 个单测一行不改**
+- `src/domain/photo-state.mjs` 与两张路径白名单、patch 校验规则，**6 个单测一行不改**（tools 的 typebox schema 镜像它，见 §5.3）
 - `project-workflow.test.mjs` 11 个中的 9 个（Revision 冲突、幂等、候选选择、状态机迁移）
 - `photo_revisions`、`assets`、`projects` 的核心语义
 - Lease + heartbeat + `FOR UPDATE SKIP LOCKED` 的**思路**沿用（默认值也不变：30s 租约 / 10s 心跳）
@@ -198,7 +198,7 @@ models.setProvider(createProvider({
 }));
 ```
 
-模型必须 `input` 含 `'image'`——Agent 需要看见生成的图做自评（§5.3）。
+模型必须 `input` 含 `'image'`——Agent 需要看见生成的图做自评（§5.4）。
 
 ### 4.2 图像
 
@@ -258,7 +258,7 @@ read_photo_state()
       origin ∈ { 'revision_anchor', 'turn_candidate' }
 
 generate_image({ patch, renderPrompt })
-  → { generationId, candidates: [{ candidateId, assetId }] }
+  → { generationId, candidateId, assetId }      // MVP：一次生图 = 一张候选
   → content 附带生成图本体（ImageContent）
 
 select_candidate({ generationId, candidateId })
@@ -266,7 +266,9 @@ select_candidate({ generationId, candidateId })
   → terminate: true —— 本轮到此结束
 ```
 
-**`read_photo_state` 返回的是当前基准图，不是 Revision 的锚定图。** 两者在一轮内会分叉：调过一次 `generate_image` 后基准图指针已推进到候选（§5.6）。若这里仍返回 Revision 锚定图，模型读到的"当前的图"与它下一次实际编辑的图不是同一张，自评和后续 patch 都会建立在错误认知上。`origin` 字段显式告诉模型这是原始锚定图还是本轮的中间产物。
+**MVP 每次生图只产出一张候选。** 重 roll = 再调一次 `generate_image` 产生新的 generation；选择 = 在多次 generation 的产出中挑一个。这消除了「一次 generation 内多张候选」带来的一整类问题：基准图指针不需要"取第一张"的规则，`partial_failed`（部分候选失败仍可选）也随之失去意义，是 §7.2 把状态机砍到二态的前提。`generation_outputs` 表结构不变，仍支持一对多，将来放开多候选无需迁移。
+
+**`read_photo_state` 返回的是当前基准图，不是 Revision 的锚定图。** 两者在一轮内会分叉：调过一次 `generate_image` 后基准图指针已推进到候选（§5.7）。若这里仍返回 Revision 锚定图，模型读到的"当前的图"与它下一次实际编辑的图不是同一张，自评和后续 patch 都会建立在错误认知上。`origin` 字段显式告诉模型这是原始锚定图还是本轮的中间产物。
 
 不返回 URI：Agent 没有取图工具，图由 `generate_image` 内部按 `assetId` 取。给模型一个它用不了的 URI 只是在烧 token。
 
@@ -275,9 +277,58 @@ select_candidate({ generationId, candidateId })
 **`generate_image` 的两个参数分工不同，不可合并：**
 
 - **`patch`** 是结构化 Photo State Patch，**持久化**，经 Domain 校验，决定新 Revision 的状态。它是系统的事实记录。
-- **`renderPrompt`** 是发给图像模型的自然语言指令，**不持久化到 Photo State**，仅记入 `generations.metadata_json` 供审计。它承载 patch 表达不了的渲染细节（"柔和黄昏侧光""保持人物面部特征不变"）。
+- **`renderPrompt`** 是发给图像模型的自然语言指令，**不持久化到 Photo State**，仅记入 `generations.metadata_json` 供审计。它只承载**真正无法结构化的渲染细节**——光质、氛围、质感等形容性内容。
 
 若只留 `patch`，渲染细节无处安放；若只留 `renderPrompt`，Photo State 失去结构化事实来源，Revision 无法比较和回溯。
+
+**"保持人物身份不变"不属于 `renderPrompt`。** domain 已经有结构化的 `preserve` 约束（下节），带 `soft`/`hard` 强度、经白名单校验、随 Revision 持久化。写进 `renderPrompt` 等于把一个已有的领域概念降级成自由文本——Photo State 里查不到"这一版要求硬保持身份"，Revision 之间也没法比较约束强度。**能进 `patch` 的一律进 `patch`。**
+
+### 5.3 Patch 的真实契约
+
+Tools 的 typebox schema 必须镜像 `src/domain/photo-state.mjs` 的既有结构，**不是扁平对象**：
+
+```js
+{
+  modify: [
+    { path: 'scene.background', operation: 'replace', value: '海边沙滩' },
+    { path: 'appearance.outfit',  operation: 'replace', value: '白衬衫' }
+  ],
+  preserve: [
+    { path: 'subject.identity', strength: 'hard' }
+  ]
+}
+```
+
+硬约束（domain 会拒绝违反者）：
+
+| 约束 | 规则 |
+|---|---|
+| `modify[].path` | 必须在 `ALLOWED_MODIFY_PATHS`（14 条）内 |
+| `modify[].operation` | 只支持 `'replace'` |
+| `modify[].value` | 必须存在（`Object.hasOwn` 检查） |
+| `preserve[].path` | 必须在 `ALLOWED_PRESERVE_PATHS`（12 条）内 |
+| `preserve[].strength` | `'soft'` \| `'hard'`，默认 `'hard'` |
+| 冲突 | 同一路径不能同时出现在 `modify` 与 `preserve`（`PatchConflictError`） |
+
+```text
+ALLOWED_MODIFY_PATHS
+  subject.identity.preserve / subject.hair.preserve / subject.expression / subject.pose
+  scene.location / scene.time / scene.mood / scene.background / scene.lighting
+  appearance.outfit / appearance.makeup
+  composition.shot / composition.cameraAngle
+
+ALLOWED_PRESERVE_PATHS
+  subject.identity / subject.hair / subject.expression / subject.pose
+  scene.background / scene.location / scene.lighting
+  appearance.outfit / appearance.makeup
+  composition / composition.shot / composition.cameraAngle
+```
+
+**白名单是安全边界，不只是校验。** 它和 `UNSAFE_SEGMENTS`（`__proto__` / `prototype` / `constructor`）一起挡住原型污染——模型输出是不可信输入，路径直接用于对象写入。
+
+typebox schema 应把两张白名单编码为 `enum`，让模型在生成阶段就受约束，而不是等 domain 抛错再自纠——省一轮往返。
+
+### 5.4 Agent 看得见自己生成的图
 
 三者正交：`read` 让 Agent 知道现状，`generate` 是唯一花钱的动作，`select` 是唯一改变项目状态的动作。参数 schema 用 typebox（pi 的 `AgentTool<TParameters extends TSchema>`）。
 
@@ -285,12 +336,10 @@ select_candidate({ generationId, candidateId })
 
 | 场景 | 旧工作流 | 新契约 |
 |---|---|---|
-| 一次改背景 + 改衣服 | 两次请求 | 一个 patch 多字段，一次生图 |
+| 一次改背景 + 改衣服 | 两次请求 | 一个 patch 的 `modify` 数组带多条指令，一次生图 |
 | 同条件重 roll | 做不到（幂等键绑死 patch） | 再调一次 `generate_image`（前提：§7.2 必须删掉旧唯一约束） |
 | 先看现状再决定 | 做不到 | `read_photo_state` |
-| 在上一版结果上继续微调 | 做不到 | 基准图指针自动推进（§5.6） |
-
-### 5.3 Agent 看得见自己生成的图
+| 在上一版结果上继续微调 | 做不到 | 基准图指针自动推进（§5.7） |
 
 `AgentToolResult.content` 的类型是 `(TextContent | ImageContent)[]`。`generate_image` 把候选图作为 `ImageContent` 返回，模型下一轮直接看到图：
 
@@ -298,45 +347,53 @@ select_candidate({ generationId, candidateId })
 用户："把背景换成海边"
   → read_photo_state
   → generate_image({
-      patch: { background: '海边沙滩' },
-      renderPrompt: '黄昏光线，保持人物面部特征不变',
+      patch: {
+        modify:   [{ path: 'scene.background', operation: 'replace', value: '海边沙滩' }],
+        preserve: [{ path: 'subject.identity', strength: 'hard' }],
+      },
+      renderPrompt: '黄昏光线',
     })
   → [模型看图] "人物边缘有光晕，背景过曝"
   → generate_image({
-      patch: { background: '海边沙滩' },
-      renderPrompt: '柔和黄昏侧光，避免边缘光晕与过曝，保持人物面部特征不变',
+      patch: {
+        modify:   [{ path: 'scene.background', operation: 'replace', value: '海边沙滩' }],
+        preserve: [{ path: 'subject.identity', strength: 'hard' }],
+      },
+      renderPrompt: '柔和黄昏侧光，避免边缘光晕与过曝',
     })
   → [模型看图] "这版好"
   → select_candidate
 ```
 
-注意第二次调用的 `patch` 与第一次**完全相同**——目标状态没变，变的只是渲染指令。这正是 §5.2 里两个参数不可合并的实证。
+注意第二次调用的 `patch` 与第一次**完全相同**——目标状态没变，变的只是渲染指令。这正是 §5.2 里两个参数不可合并的实证。也注意"保持人物身份"走的是 `preserve` 结构化约束，不是 `renderPrompt` 里的一句话（§5.3）。
 
 「自主多步：生成 → 自评 → 重试」**不需要任何额外机制**。
 
-### 5.4 Tool 与 Domain 的边界
+### 5.5 Tool 与 Domain 的边界
 
 Tool 是薄适配层，只做三件事：typebox schema 声明、调用 Domain 方法、把结果转成 `AgentToolResult`。
 
 **所有业务规则留在 `src/domain/`**：patch 校验、Revision 冲突检测、状态机合法性。理由有二：模型会传出任意参数，校验必须在模型够不着的地方；这些规则已有 17 个单测覆盖，不应搬家。
 
-### 5.5 拓展路径
+### 5.6 拓展路径
 
 - **加编辑维度**（发型、姿势、光线）→ 扩 Photo State patch schema，**零新工具**
 - **加新动作**（放大、去水印、扩图）→ 加一个 tool，复用同一套 revision/candidate 机制
 - **加领域知识**（证件照规范、电商主图规范）→ 走 `AgentHarnessOptions.resources` 挂 skill，**零代码**
 
-### 5.6 基准图与输入图
+### 5.7 基准图与输入图
 
 `generate_image` 的参数里没有图。输入图由**轮次上下文维护的基准图指针** `currentBaseAssetId` 决定，Agent 不能直接指定——否则模型可以任意挑图，产生无法解释的编辑链。
 
 规则：
 
 ```text
-轮次开始           currentBaseAssetId = 当前 Revision 的 anchorAssetId    origin = revision_anchor
-generate_image 后  currentBaseAssetId = 本次产出的候选（多张时取第一张）    origin = turn_candidate
+轮次开始            currentBaseAssetId = 当前 Revision 的 anchorAssetId    origin = revision_anchor
+generate_image 后   currentBaseAssetId = 本次产出的候选                    origin = turn_candidate
 select_candidate 后 固化为新 Revision 的 anchor，本轮结束（§5.2）
 ```
+
+一次生图只产出一张候选（§5.2），因此指针推进没有歧义，不需要"多张时取哪张"的规则。
 
 一句话：**选中优先，否则用上一次候选图。** `read_photo_state` 始终返回这个指针的当前值，不是 Revision 的锚定图。
 
@@ -357,9 +414,9 @@ generate_image({ patch, renderPrompt })
 
 **已知代价（用户已确认接受）：** 在生成物上反复编辑会逐代劣化——人脸漂移、画质衰减，三四轮后明显。缓解手段不进 MVP，但路径是现成的：`patch` 是持久化的累积事实，随时可以从原始锚定图带全量 patch 重生一次。将来可作为「重置画质」动作暴露。
 
-### 5.7 System Prompt
+### 5.8 System Prompt
 
-Agent 的行为不是架构的自然结果，而是 system prompt 的产物。§5.3 那条「生成 → 自评 → 重试」链路，没有明确引导不会发生。
+Agent 的行为不是架构的自然结果，而是 system prompt 的产物。§5.4 那条「生成 → 自评 → 重试」链路，没有明确引导不会发生。
 
 MVP 的 system prompt 必须覆盖以下几条，逐条对应一个已知失败模式：
 
@@ -372,11 +429,12 @@ MVP 的 system prompt 必须覆盖以下几条，逐条对应一个已知失败�
 | 明显缺陷才重生，最多 `MAX_IMAGES_PER_TURN` 次 | 无限追求完美，烧到护栏才停 |
 | 用户意图不明确时**反问而非猜测** | 猜错方向，白花一次生图 |
 | 满意后调 `select_candidate` 结束 | 轮次跑到超时才结束 |
-| 人像编辑默认保持人物身份特征 | 换背景顺手把脸也换了 |
+| 人像编辑默认在 `patch.preserve` 加 `subject.identity` / `hard` | 换背景顺手把脸也换了 |
+| 「保持什么」写进 `preserve`，不写进 `renderPrompt` | 约束降级成自由文本，Photo State 查不到（§5.3） |
 
 存放位置 `src/agent/system-prompt.mjs`，纯文本导出，不做模板引擎。
 
-**它是需要迭代调优的产物，不是一次写对的代码。** 因此实施计划中应把「跑通」与「调好」分开：切片 2 的验收只要求链路走通，prompt 的效果调优是随后的独立工作。将来沉淀出的领域规范（证件照、电商主图）走 `resources` 挂 skill（§5.5），不往 system prompt 里堆。
+**它是需要迭代调优的产物，不是一次写对的代码。** 因此实施计划中应把「跑通」与「调好」分开：切片 2 的验收只要求链路走通，prompt 的效果调优是随后的独立工作。将来沉淀出的领域规范（证件照、电商主图）走 `resources` 挂 skill（§5.6），不往 system prompt 里堆。
 
 ## 6. 对象存储
 
@@ -392,7 +450,7 @@ src/infrastructure/storage/
   s3-asset-storage.mjs     S3 兼容实现（MinIO / OSS / COS 通吃）
 ```
 
-`get(key)` 是必需的——`generate_image` 要把基准图字节喂给图像模型（§5.6）。**不提供 `delete()`**：垃圾回收是 non-goal（§16），MVP 无人调用，加一个死方法只会让人以为清理逻辑已经存在。
+`get(key)` 是必需的——`generate_image` 要把基准图字节喂给图像模型（§5.7）。**不提供 `delete()`**：垃圾回收是 non-goal（§16），MVP 无人调用，加一个死方法只会让人以为清理逻辑已经存在。
 
 **否决 PostgreSQL bytea**：图片进数据库是会后悔的决定，仅为 MVP 省事不成立。
 **否决本地文件系统**：多 Worker / 多 API 实例部署下失效，需要共享文件系统。
@@ -419,7 +477,7 @@ users/{ownerId}/projects/{projectId}/{assetId}.{ext}
 INSERT INTO assets (id, kind, created_at)
 ```
 
-**`uri` 与 `metadata_json` 从来没被写过。** 不改的话 `uri` 恒为 NULL，§5.6 数据流里「按 `assetId` 查 `assets.uri` 取基准图字节」会取空——这是整条 img2img 链路上的断点。
+**`uri` 与 `metadata_json` 从来没被写过。** 不改的话 `uri` 恒为 NULL，§5.7 数据流里「按 `assetId` 查 `assets.uri` 取基准图字节」会取空——这是整条 img2img 链路上的断点。
 
 两处都要补写 `uri`（对象键）与 `metadata_json`（至少含 content type，供签名 URL 设头与扩展名推导）。
 
@@ -465,13 +523,23 @@ CREATE TABLE agent_turns (
 
 理由：供应商变同步。Worker 内 `await generateImages()` 要么拿到图要么抛错，**中间态在新架构下不可达**。保留无法到达的状态只会误导后续维护者。
 
+`src/domain/generation-lifecycle.mjs`（22 行）的三个导出常量随之全部重写：
+
+| 常量 | 旧 | 新 |
+|---|---|---|
+| `GENERATION_TRANSITIONS` | 五条转移规则 | **整个删除**——generation 创建即终态，没有转移 |
+| `TERMINAL_GENERATION_STATUSES` | `completed / partial_failed / failed / cancelled` | `completed / failed` |
+| `SELECTABLE_GENERATION_STATUSES` | `completed / partial_failed` | `completed` |
+
+**`partial_failed` 的消失是有代价的，代价已被接受。** 该状态的意义是「一次生图出 N 张候选，部分失败但剩下的仍可选」。MVP 每次生图只出一张（§5.2），部分失败不存在，因此这个状态没有承载对象。将来放开多候选时需要连同它一起恢复。
+
 同时逐列清算——旧表每一列都要有明确去留，不能只改状态机就算完：
 
 | 列 | 处置 | 理由 |
 |---|---|---|
 | `id` / `project_id` | 保留 | |
 | `input_revision_id` | 保留，语义收窄 | 只表示「patch 基于哪个 Revision 的状态计算」，**不再表示输入图** |
-| **`input_asset_id`（新增）** | `NOT NULL REFERENCES assets(id)` | 实际喂给图像模型的基准图。可能是 Revision 锚定图，也可能是本轮的候选图（§5.6）——后者不属于任何 Revision，`input_revision_id` 表达不了 |
+| **`input_asset_id`（新增）** | `NOT NULL REFERENCES assets(id)` | 实际喂给图像模型的基准图。可能是 Revision 锚定图，也可能是本轮的候选图（§5.7）——后者不属于任何 Revision，`input_revision_id` 表达不了 |
 | `patch_json` / `proposed_state_json` | 保留 | |
 | `status` | 9 态 → 2 态 | 见上 |
 | **`idempotency_key`** | **删除** | 幂等作用域已移至 `agent_turns`（§7.5） |
@@ -647,7 +715,7 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 367:    if (project.runningGenerationId === generation.id) { ... = null }
 ```
 
-**这挡死了本设计的中心前提。** 一轮 Agent 第一次调 `generate_image` 会设上 `runningGenerationId`，第二次调用直接撞 168 行抛 `ProjectBusyError`。「一轮内多次生图」不成立，则 §5.2 的重 roll、§5.3 的自评重试、§5.6 的基准图推进、§9.3 的三次上限全部作废。
+**这挡死了本设计的中心前提。** 一轮 Agent 第一次调 `generate_image` 会设上 `runningGenerationId`，第二次调用直接撞 168 行抛 `ProjectBusyError`。「一轮内多次生图」不成立，则 §5.2 的重 roll、§5.4 的自评重试、§5.7 的基准图推进、§9.3 的三次上限全部作废。
 
 **变更：**
 
@@ -766,11 +834,11 @@ src/infrastructure/telemetry/stdout-telemetry.mjs
 
 ```text
 src/agent/harness-factory.mjs           构造 AgentHarness（models、tools、systemPrompt、session）
-src/agent/system-prompt.mjs             Agent 行为引导（§5.7）
+src/agent/system-prompt.mjs             Agent 行为引导（§5.8）
 src/agent/tools/read-photo-state.mjs
 src/agent/tools/generate-image.mjs
 src/agent/tools/select-candidate.mjs
-src/agent/turn-context.mjs              轮次上下文：基准图指针、fatal 标记、生图计数（§5.6、§9.2、§9.3）
+src/agent/turn-context.mjs              轮次上下文：基准图指针、fatal 标记、生图计数（§5.7、§9.2、§9.3）
 src/infrastructure/models/relay-text-provider.mjs
 src/infrastructure/models/relay-images-provider.mjs   relayGenerateImages 实现
 src/infrastructure/storage/asset-storage.mjs
@@ -803,6 +871,7 @@ scripts/smoke-e2e.mjs
 src/api/server.mjs                    路由重写 + mapError 改（§12.2）
 src/worker/generation-worker.mjs        → src/worker/agent-turn-worker.mjs
 src/domain/photo-project-service.mjs    项目锁从 generation 上移到 turn（§10.3）
+src/domain/generation-lifecycle.mjs     九态转移图整个失效，三个常量全部重写（见下）
 src/infrastructure/postgres/photo-project-repository.mjs
 test/project-workflow.test.mjs          11 个中的 2 个改断言（§10.3）
 compose.yaml                            新增 MinIO
@@ -997,7 +1066,7 @@ GET  /generations/:id                             删除
 | 层 | 内容 | 依赖 |
 |---|---|---|
 | Domain 单测 | photo-state（6 个不变）、状态机、patch 校验、**轮次级互斥（2 个改断言，§10.3）** | 无外部依赖 |
-| Tools 单测 | 参数校验、错误分类、成本护栏计数、**基准图指针推进规则（§5.6）** | fake repository + fake images provider + fake storage |
+| Tools 单测 | 参数校验、错误分类、成本护栏计数、**基准图指针推进规则（§5.7）** | fake repository + fake images provider + fake storage |
 | ImagesProvider 单测 | multipart 组装、b64/URL 响应解析、401/429 归类为 fatal | fake fetch |
 | Worker 轮次单测 | 编排正确性：自评重生、同条件重 roll、超限后停、`select_candidate` 终止轮次、fatal 中止 | fake StreamFn + fake provider |
 | 集成测试 | 全链路 | 真实 PostgreSQL + 真实 MinIO + fake StreamFn + fake provider |
@@ -1048,11 +1117,11 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - 模型输出只能当作不可信输入，必须经过 Domain 校验；结构化输出不等于合法业务操作。
 - 切片 2 的 Worker 崩溃时轨迹已入 PostgreSQL 可查，但「只尝试一次」使该轮本身不可恢复，用户需重发消息。这是明确的取舍（§8.2）。
 - PostgreSQL SessionStorage 是本次最大单块工作量（800–1000 行）。若 conformance 套件暴露出 pi 契约中未文档化的语义（分支、lane 移动、seq 单调性边界），切片 1 可能超出预估。这是把它排在最前的另一个理由：早暴露。
-- **open：`RELAY_TEXT_MODEL` 的具体值待定。** 该模型必须同时满足两个条件：支持 function calling（否则 agent 循环不成立），且 `input` 含 `'image'`（否则 §5.3 的自评看不到图）。选定前无法跑通切片 2，需在实施前从中转站模型清单确认。
+- **open：`RELAY_TEXT_MODEL` 的具体值待定。** 该模型必须同时满足两个条件：支持 function calling（否则 agent 循环不成立），且 `input` 含 `'image'`（否则 §5.4 的自评看不到图）。选定前无法跑通切片 2，需在实施前从中转站模型清单确认。
 - pi 版本 0.84.2 处于 0.x，API 可能变化。锁定精确版本，升级作为独立任务处理。
 - 生图耗时受中转站影响，10 分钟整轮上限可能需要按实测调整。
-- **System prompt 的效果无法在设计阶段验证。** §5.7 列的是必须覆盖的要点，不是最终文案；实际行为需要真实模型上迭代。切片 2 的验收只要求链路走通（§15），prompt 调优是随后的独立工作。
-- 在生成物上迭代编辑会逐代劣化（§5.6）。MVP 接受该代价，缓解手段（从原图带全量 patch 重生）不进本次范围。
+- **System prompt 的效果无法在设计阶段验证。** §5.8 列的是必须覆盖的要点，不是最终文案；实际行为需要真实模型上迭代。切片 2 的验收只要求链路走通（§15），prompt 调优是随后的独立工作。
+- 在生成物上迭代编辑会逐代劣化（§5.7）。MVP 接受该代价，缓解手段（从原图带全量 patch 重生）不进本次范围。
 
 ## 18. Acceptance Criteria
 
@@ -1061,7 +1130,7 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - `npm run smoke:e2e` 跑通：用户消息 → Agent 调工具 → 中转站真实出图 → MinIO 中可见图片对象 → 新 Revision 创建且 `active_revision_id` 切换
 - **Agent 轨迹可从 PostgreSQL 回放**：一轮结束后能查到该轮的全部 entries（用户消息、工具调用、参数、结果）
 - 多轮对话可用：第二条消息时 Agent 能看到第一轮历史
-- 基准图规则生效：连续两次 `generate_image` 时，第二次的输入图是第一次的产出（§5.6）
+- 基准图规则生效：连续两次 `generate_image` 时，第二次的输入图是第一次的产出（§5.7）
 - 同条件重 roll 生效：同一轮内用**完全相同**的 `patch` + `renderPrompt` 调两次 `generate_image`，两次都成功且产生两条 `generations` 记录（验证 §7.2 的旧唯一约束确已删除）
 - `select_candidate` 结束本轮：调用后 Agent 不再发起新的工具调用，轮次进入 `completed`
 - Agent 能看到自己生成的图（`generate_image` 返回 `ImageContent`）
