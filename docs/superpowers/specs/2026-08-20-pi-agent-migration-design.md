@@ -691,6 +691,8 @@ pi 的 `StreamFn` 契约规定不抛异常，错误编码进 stream，最终 `As
 | 进程内 | pi 的 lane 控制（`RunRejected` 含 `LaneBusy`） | 同进程内重入 |
 | 写保护 | lease token | Worker 假死后旧实例继续写库 |
 
+**进程内并发（§10.4）不削弱这三层。** 同一 Worker 进程内同时跑 N 轮，但 `SKIP LOCKED` 保证它们分属不同项目，`running_turn_id` 保证同项目不会被并发领取——三层保护对进程内并发与多进程一视同仁。
+
 pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两层并存，pi 那层是免费的二次保险。
 
 ### 10.2 超时
@@ -729,6 +731,46 @@ pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两�
 **语义没有变弱，只是粒度变对了。** 旧规则「同一项目同时只能跑一次生图」在新架构下的正确表述是「同一项目同时只能跑一轮」——而一轮本来就串行执行其内部的生图。互斥强度不变，但允许一轮内多次生图。
 
 **测试影响：** `test/project-workflow.test.mjs` 的 11 个用例中 2 个断言 `ProjectBusyError`（157 行的 `requestGeneration`、326 行的 `selectCandidate`），需改为断言新的轮次级互斥。其余 9 个与 `photo-state.test.mjs` 的 6 个不受影响。
+
+### 10.4 Worker 并发模型：进程内并发，非多进程
+
+现状是**单进程串行**：
+
+```js
+// src/worker/main.mjs
+while (!stopping) {
+  const generation = await worker.runOnce();   // 一次一轮，串完才继续
+  ...
+}
+```
+
+旧架构下一次生图 30–90 秒尚可忍受。新架构一轮含多次生图加模型思考，**五分钟量级**——串行意味着两个用户同时提交时，第二个人干等第一个人整轮跑完。
+
+**决定：进程内并发，`WORKER_CONCURRENCY` 默认 4，单进程。**
+
+理由是负载性质。一轮的时间构成几乎全是网络等待：
+
+```text
+LLM 调用      几秒        网络等待
+生图 × 1–3    30–90s/次   网络等待
+DB / 对象存储  毫秒~百毫秒
+```
+
+**CPU 全程接近空闲。** 用多进程解决 I/O 等待，等于为每一份等待复制一整套运行时：Node 基线 40–60 MB、pi 模块树、`@aws-sdk/client-s3`，以及**每进程一套 pg 连接池**——PostgreSQL 连接数是有限资源。为纯 I/O 等待付进程级开销，性价比很差。
+
+**改动面很小，因为设计里已经准备好了：**
+
+| 需要 | 现状 |
+|---|---|
+| 每轮独立心跳 | 已是 per-turn（§10.2） |
+| 每轮独立 `AbortController` | 已是 per-turn（§10.2） |
+| 每轮独立轮次上下文 | 已是 per-turn（§5.7、§9.2） |
+| 轮次间无共享可变状态 | 成立——领取靠 `SKIP LOCKED`，session 按 project 隔离，项目锁保证同项目不并发 |
+| **优雅关闭等待在途轮次** | **需要改**：收到 SIGTERM 后停止领取新轮次，等待在途轮次自然结束或超时 |
+
+真正要改的只有主循环：从「串行 `await runOnce()`」变成「维持最多 `WORKER_CONCURRENCY` 个在途轮次」。
+
+**多进程不是被否决，而是留给它真正解决的问题**：跨机器水平扩展、崩溃隔离。两者正交——`FOR UPDATE SKIP LOCKED` 对两种都成立，将来多开进程时每个进程内部仍然并发，代码不用改。
 
 ## 11. Session 存储与可观测性
 
@@ -869,6 +911,8 @@ scripts/smoke-e2e.mjs
 
 ```text
 src/api/server.mjs                    路由重写 + mapError 改（§12.2）
+src/api/main.mjs                      删 runMigrations；配置校验前置（§12.3）
+src/worker/main.mjs                   删 runMigrations；配置校验前置；串行循环改并发 + 优雅关闭（§10.4、§12.3）
 src/worker/generation-worker.mjs        → src/worker/agent-turn-worker.mjs
 src/domain/photo-project-service.mjs    项目锁从 generation 上移到 turn（§10.3）
 src/domain/generation-lifecycle.mjs     九态转移图整个失效，三个常量全部重写（见下）
@@ -957,13 +1001,32 @@ if (error.code === '23505') return new HttpError(409, 'RESOURCE_CONFLICT', ...)
 
 ### 12.3 运行配置
 
+**启动顺序（两个进程都适用）：**
+
+```text
+1. 校验环境变量      ← 缺必填项立即退出，一个变量都不缺再往下走
+2. 建连接池
+3. 构造依赖并启动
+```
+
+**不在启动时跑迁移。** 现有 `api/main.mjs` 与 `worker/main.mjs` **各自**都有 `await runMigrations(pool)`——同时启动就是并发跑同一批迁移。切片 1 要新增 5 张 session 表和 5 个迁移文件，竞态窗口只会变宽；将来多开 Worker 进程更是 N 个进程抢迁移。`package.json` 本就有独立的 `npm run db:migrate`，**迁移交给部署流程显式执行**，两处 `runMigrations` 调用一并删除。
+
+配置校验必须排在最前：若放在构造阶段，会在跑完连接和其他初始化之后才失败，白白浪费启动时间并可能留下半初始化状态。
+
+**日志与 telemetry 分流：**
+
+- **stdout 只走结构化 JSON 行**（telemetry span，§11.4）
+- **人类可读日志走 stderr**
+
+现有 Worker 用 `process.stdout.write` 打自由文本（`main.mjs:35`），会污染 stdout。§18 要求 `smoke:e2e` 从 stdout 读出三类 span，混入自由文本就无法 `| jq`。
+
 现有变量，不变：
 
 | 变量 | 默认值 | 用途 |
 |---|---|---|
 | `DATABASE_URL` | `postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent` | PostgreSQL 连接 |
 | `PORT` | `3000` | API 监听端口 |
-| `WORKER_POLL_INTERVAL_MS` | `1000` | Worker 轮询间隔 |
+| `WORKER_POLL_INTERVAL_MS` | `500` | Worker 轮询间隔（实测自 `worker/main.mjs:23`）|
 
 本次新增：
 
@@ -984,6 +1047,8 @@ if (error.code === '23505') return new HttpError(409, 'RESOURCE_CONFLICT', ...)
 | `TURN_LEASE_MS` | `30000` | 轮次租约时长 | 用默认值 |
 | `TURN_HEARTBEAT_MS` | `10000` | 心跳续租间隔 | 用默认值 |
 | `TELEMETRY` | `stdout` | span 输出方式，`stdout` \| `noop`（§11.4） | 用默认值 |
+| `WORKER_CONCURRENCY` | `4` | 单 Worker 进程内同时在途的轮次上限（§10.4） | 用默认值 |
+| `SHUTDOWN_GRACE_MS` | `600000` | SIGTERM 后等待在途轮次结束的上限，与 `TURN_TIMEOUT_MS` 对齐 | 用默认值 |
 
 规则：
 
@@ -1141,4 +1206,6 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - 一轮内可连续调用 `generate_image` 至上限而不触发 `ProjectBusyError`（验证 §10.3 的锁迁移确已完成）
 - `assets.uri` 非空：生图后该行能查到对象键，且据此能从 MinIO 取回字节（验证 §6.3 的写入代码确已改）
 - 幂等三态正确：同 key 同消息返回 `200 { replayed: true }`，同 key 不同消息返回 `409 IDEMPOTENCY_CONFLICT`，新 key 返回 `202`（验证 §7.5 的指纹语义未丢失）
+- 两个不同项目的轮次可并行推进，互不阻塞（验证 §10.4 的进程内并发）
+- `smoke:e2e` 的 stdout 可直接 `| jq` 逐行解析，无自由文本混入（§12.3）
 - README 与设计文档使用同一套术语：Agent Turn / Tool / ImagesProvider / SessionStorage
