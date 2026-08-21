@@ -17,6 +17,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
     "pg": "^8.16.3"
   }
 }
