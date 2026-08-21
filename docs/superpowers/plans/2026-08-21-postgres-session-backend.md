@@ -1512,65 +1512,55 @@ git commit -m "feat: add postgres session queries with recursive branch scan"
 import { createPostgresSessionStorage } from '../src/infrastructure/postgres/session/storage.mjs';
 
 test('storage exposes every method the SessionStorage contract requires', async () => {
-  const pool = new Pool({ connectionString });
-  try {
-    const storage = createPostgresSessionStorage({ pool, sessionId: 's1' });
-    for (const method of [
-      'getMetadata',
-      'getLanes',
-      'createLane',
-      'moveLane',
-      'appendEntry',
-      'appendRecord',
-      'getEntry',
-      'findEntries',
-      'findEntriesOnBranch',
-      'findRecords',
-      'findOpenOperations',
-      'getLog',
-      'getName',
-      'setName',
-      'getLabel',
-      'setLabel',
-      'getStats',
-    ]) {
-      assert.equal(typeof storage[method], 'function', `missing ${method}`);
-    }
-  } finally {
-    await pool.end();
+  const storage = createPostgresSessionStorage({ pool, sessionId: 's1' });
+  for (const method of [
+    'getMetadata',
+    'getLanes',
+    'createLane',
+    'moveLane',
+    'appendEntry',
+    'appendRecord',
+    'getEntry',
+    'findEntries',
+    'findEntriesOnBranch',
+    'findRecords',
+    'findOpenOperations',
+    'getLog',
+    'getName',
+    'setName',
+    'getLabel',
+    'setLabel',
+    'getStats',
+  ]) {
+    assert.equal(typeof storage[method], 'function', `missing ${method}`);
   }
 });
 
 test('every mutation runs in its own transaction and shares the sequence', async () => {
-  const pool = new Pool({ connectionString });
+  await resetDatabase();
+  const client = await pool.connect();
   try {
-    await pool.query(`TRUNCATE ${SESSION_TABLES.sessions} RESTART IDENTITY CASCADE`);
-    const client = await pool.connect();
-    try {
-      await insertSession(client, {
-        id: 's1',
-        createdAt: 1000,
-        parentSessionId: null,
-        metadata: {},
-      });
-    } finally {
-      client.release();
-    }
-
-    const storage = createPostgresSessionStorage({ pool, sessionId: 's1' });
-    await storage.createLane('main', null);
-    const root = await storage.appendEntry(
-      { type: 'message', id: 'root', message: { role: 'user', content: [], timestamp: 1 } },
-      'main',
-    );
-    await storage.setName('Example');
-
-    assert.equal(root.seq, 2, 'createLane consumed seq 1');
-    assert.equal(await storage.getName(), 'Example');
-    assert.equal((await storage.getEntry('root')).id, 'root');
+    await insertSession(client, {
+      id: 's1',
+      createdAt: 1000,
+      parentSessionId: null,
+      metadata: {},
+    });
   } finally {
-    await pool.end();
+    client.release();
   }
+
+  const storage = createPostgresSessionStorage({ pool, sessionId: 's1' });
+  await storage.createLane('main', null);
+  const root = await storage.appendEntry(
+    { type: 'message', id: 'root', message: { role: 'user', content: [], timestamp: 1 } },
+    'main',
+  );
+  await storage.setName('Example');
+
+  assert.equal(root.seq, 2, 'createLane consumed seq 1');
+  assert.equal(await storage.getName(), 'Example');
+  assert.equal((await storage.getEntry('root')).id, 'root');
 });
 ```
 
@@ -1713,13 +1703,8 @@ git commit -m "feat: assemble postgres SessionStorage contract"
 import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.mjs';
 
 async function withRepo(fn) {
-  const pool = new Pool({ connectionString });
-  try {
-    await pool.query(`TRUNCATE ${SESSION_TABLES.sessions} RESTART IDENTITY CASCADE`);
-    return await fn(createPostgresSessionRepo({ pool }));
-  } finally {
-    await pool.end();
-  }
+  await resetDatabase();
+  return fn(createPostgresSessionRepo({ pool }));
 }
 
 test('create returns a Session and list reports it', async () => {
