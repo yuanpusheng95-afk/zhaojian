@@ -130,11 +130,11 @@ interface AgentHarnessOptions {
 ```text
 POST /projects/p1/messages { message: "把背景换成海边" }   Idempotency-Key: m-1
  │
- ├─ 单事务：INSERT agent_turns(queued)         ← UNIQUE 冲突则查既有行返回其 turnId
+ ├─ 单事务：INSERT agent_turns(queued)         ← UNIQUE 冲突 → 比对 user_message，§7.5 三态
  │          UPDATE projects.running_turn_id    ← 已被占用则 409 PROJECT_BUSY
  └─ 202 { turnId }
 
-Worker
+Worker（进程内可同时跑 WORKER_CONCURRENCY 轮，此处只画一轮，§10.4）
  ├─ FOR UPDATE SKIP LOCKED 领 queued 轮次 → status=running + lease_token
  ├─ 启动心跳（10s 续租），覆盖整轮
  ├─ 打开该 project 的 Session（PostgreSQL backend）
@@ -153,8 +153,8 @@ Worker
       │    ├─ imagesModels.generateImages(...)      ← 唯一花钱的调用，30–90s
       │    ├─ 产出字节 PUT 对象存储（扩展名按 content type）
       │    ├─ 单事务：INSERT assets + generations + generation_outputs
-      │    ├─ currentBaseAssetId = 首张候选; imageCount++
-      │    └─ 返回 { generationId, candidates } + ImageContent(候选图) 给模型
+      │    ├─ currentBaseAssetId = 该候选; imageCount++
+      │    └─ 返回 { generationId, candidateId, assetId } + ImageContent 给模型
       │
       ├─ [模型看图自评 → 可能再次 generate_image，回到上一步]
       │
@@ -1095,9 +1095,9 @@ GET  /generations/:id                             删除
   "generations": [
     {
       "generationId": "g_...",
-      "patch": { },
+      "patch": { "modify": [], "preserve": [] },
       "renderPrompt": "...",
-      "candidates": [{ "candidateId": "c_...", "assetId": "a_...", "url": "<签名 URL>" }]
+      "candidate": { "candidateId": "c_...", "assetId": "a_...", "url": "<签名 URL>" }
     }
   ],
   "selectedCandidateId": "c_... | null",
@@ -1108,7 +1108,7 @@ GET  /generations/:id                             删除
 
 `url` 是对象存储签名 URL，由 API 进程按 `assets.uri` 现签（这也是 §12.3 里 API 需要 `S3_*` 凭证的原因）。**不返回图片字节。**
 
-一轮可能有多次 `generate_image`，因此 `generations` 是数组；`selectedCandidateId` 与 `newRevisionId` 最多一个（§5.2：一轮只能选一次）。
+一轮可能有多次 `generate_image`，因此 `generations` 是数组；每次生图只出一张候选（§5.2），故 `candidate` 是单对象。`selectedCandidateId` 与 `newRevisionId` 最多一个（§5.2：一轮只能选一次）。
 
 幂等键继续通过 `Idempotency-Key` 请求头传递，作用域变为 agent turn。
 
@@ -1133,7 +1133,7 @@ GET  /generations/:id                             删除
 | Domain 单测 | photo-state（6 个不变）、状态机、patch 校验、**轮次级互斥（2 个改断言，§10.3）** | 无外部依赖 |
 | Tools 单测 | 参数校验、错误分类、成本护栏计数、**基准图指针推进规则（§5.7）** | fake repository + fake images provider + fake storage |
 | ImagesProvider 单测 | multipart 组装、b64/URL 响应解析、401/429 归类为 fatal | fake fetch |
-| Worker 轮次单测 | 编排正确性：自评重生、同条件重 roll、超限后停、`select_candidate` 终止轮次、fatal 中止 | fake StreamFn + fake provider |
+| Worker 轮次单测 | 编排正确性：自评重生、同条件重 roll、超限后停、`select_candidate` 终止轮次、fatal 中止、**并发上限与优雅关闭（§10.4）** | fake StreamFn + fake provider |
 | 集成测试 | 全链路 | 真实 PostgreSQL + 真实 MinIO + fake StreamFn + fake provider |
 | 端到端冒烟 | 真实中转站真出图 | `npm run smoke:e2e`，手动执行，**不进 CI** |
 | PostgreSQL SessionStorage | 17 个方法的契约一致性 | pi 官方 `createSessionBackendConformance` + 真实 PostgreSQL |
@@ -1152,9 +1152,11 @@ GET  /generations/:id                             删除
 
 ### 切片 2（MVP 验收线）
 
-自定义 ImagesProvider → Tools → AgentHarness（注入切片 1 的 Postgres session + stdout telemetry）→ Worker → 真实出图 → 新 Revision。
+自定义 ImagesProvider → Tools → AgentHarness（注入切片 1 的 Postgres session + stdout telemetry）→ Worker（进程内并发，§10.4）→ 真实出图 → 新 Revision。
 
 多轮对话在本切片即可用——轨迹已在 PostgreSQL 里。
+
+**本切片的第一件事应是验证 §17 的头号 assumption**：中转站的 `/v1/chat/completions` 能否稳定 function calling。不成立则整个 agent 循环不成立，越早撞上越好。
 
 ### 切片 3
 
