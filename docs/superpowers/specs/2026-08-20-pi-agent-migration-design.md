@@ -121,6 +121,31 @@ interface AgentHarnessOptions {
 
 底层 `Agent` 没有 `session` 注入、没有 `resources`（skills）、没有 lane 并发控制。三条需求都指向 `AgentHarness`。
 
+> **⚠️ 本节结论已被实施推翻（2026-08-22，切片 2c 实施前核实）。**
+>
+> **`AgentHarness` 在 0.84.2 是 API 骨架，不是运行时。** 实测已安装的
+> `dist/harness/agent-harness.js`：**22 个方法返回 `this.unavailable(...)`**，包括
+> `prompt` / `abort` / `runToCompletion` / `steer` / `resume`，以及本节用作理由的
+> `lane` / `createLane` / `lanes`。只有 getter/setter 与 `create()` 是活的。
+>
+> **错误根源：本节的论证只读了 `AgentHarnessOptions` 这个 TypeScript 接口，
+> 没有验证方法是否有实现。** 同类错误在本项目已发生三次（telemetry adapter 的
+> 回调形状、SessionStorage 的查询语义、本节）——**读签名不等于读实现**。
+>
+> 正确的组装（切片 2c 计划，均已实测可用）：
+>
+> | 需求 | 本节以为 | 实际用 |
+> |---|---|---|
+> | agent 循环 | `AgentHarness.prompt()` | **`Agent`**（`unavailable` 出现 0 次，`prompt`/`abort` 真实现） |
+> | session 注入 | `AgentHarnessOptions.session` | **`Session`** 类 + 本项目薄编排（约 150–250 行） |
+> | 轨迹 → 上下文 | harness 内部 | **`buildSessionContext(pathEntries)`** |
+> | 早停 | `RunOutcome` | `AgentToolResult.terminate` + 轮次上下文 fatal 标记 |
+> | lane 并发控制 | `LaneBusy` | **不存在**；互斥全靠 `projects.running_turn_id` + `FOR UPDATE SKIP LOCKED` |
+>
+> **§2.2「不自研 agent 循环」仍然成立**——循环仍是 pi 的 `Agent`，自研的只是
+> harness 本应提供的薄编排层。但 §10.1 「三层保护」里的**进程内 lane 控制那一层
+> 不存在**，跨进程的 PostgreSQL 锁是唯一的互斥机制。
+
 `RunOutcome` 的四种取值 `completed | aborted | failed | suspended` 直接映射轮次终态，不自研状态机。
 
 ### 3.4 一轮的完整时序
@@ -706,12 +731,12 @@ pi 的 `StreamFn` 契约规定不抛异常，错误编码进 stream，最终 `As
 | 层 | 机制 | 防什么 |
 |---|---|---|
 | 跨进程 | `projects.running_turn_id` + `FOR UPDATE SKIP LOCKED` | 同一项目两个 Worker 同时跑 |
-| 进程内 | pi 的 lane 控制（`RunRejected` 含 `LaneBusy`） | 同进程内重入 |
+| ~~进程内~~ | ~~pi 的 lane 控制~~ | **该层不存在**——`AgentHarness` 的 lane API 是空壳（§3.3 的实施修正） |
 | 写保护 | lease token | Worker 假死后旧实例继续写库 |
 
 **进程内并发（§10.4）不削弱这三层。** 同一 Worker 进程内同时跑 N 轮，但 `SKIP LOCKED` 保证它们分属不同项目，`running_turn_id` 保证同项目不会被并发领取——三层保护对进程内并发与多进程一视同仁。
 
-pi 的 lane 控制只在进程内有效，**PostgreSQL 的锁是权威**。两层并存，pi 那层是免费的二次保险。
+**PostgreSQL 的锁是唯一的互斥机制**，没有二次保险。原以为 pi 的 lane 控制能在进程内兜一层，实测该 API 在 0.84.2 未实现（§3.3）。这提高了 `running_turn_id` + `FOR UPDATE SKIP LOCKED` 的重要性：它错了没有第二道防线。
 
 ### 10.2 超时
 
