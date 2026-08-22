@@ -109,7 +109,7 @@ export function createPostgresSessionRepo({ pool }) {
         let forkLanes;
 
         if (options.scope === 'tree') {
-          copiedEntries = await findEntries(client, source.id, {});
+          copiedEntries = await findEntries(client, source.id, { order: 'oldestFirst' });
           forkLanes = await readLanes(client, source.id);
         } else {
           const mainLeaf = await readLaneLeaf(client, source.id, 'main');
@@ -135,7 +135,10 @@ export function createPostgresSessionRepo({ pool }) {
           copiedEntries =
             branchTarget === null
               ? []
-              : await findEntriesOnBranch(client, source.id, { start: branchTarget });
+              : await findEntriesOnBranch(client, source.id, {
+                  start: branchTarget,
+                  order: 'oldestFirst',
+                });
           forkLanes = [{ lane: 'main', leafId: branchTarget }];
         }
 

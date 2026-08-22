@@ -23,6 +23,18 @@ export async function appendRecord(client, sessionId, newRecord) {
   const payload = assertJsonSerializable(rest, `record ${id}`);
 
   await requireLane(client, sessionId, lane);
+
+  // 每个 lane 同时只允许一个未闭合的 operation
+  if (type === 'operation_started') {
+    const open = await findOpenOperations(client, sessionId, lane, { limit: 1 });
+    if (open.length > 0) {
+      throw sessionError(
+        'storage',
+        `Lane ${lane} already has an open operation: ${open[0].id}`,
+      );
+    }
+  }
+
   await claimId(client, sessionId, id, 'record');
 
   const seq = await nextSeq(client, sessionId);
