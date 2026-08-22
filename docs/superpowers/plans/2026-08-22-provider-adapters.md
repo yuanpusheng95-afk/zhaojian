@@ -932,6 +932,22 @@ git commit -m "feat: add relay images provider"
   - `createLlmModels({ baseUrl, modelId }) => Models`
   - `createStdoutTelemetry({ write, now }) => TelemetryContext`（两者都可选，默认写 stdout / `Date.now`）
 
+**契约是回调式的，实现前务必先读 `packages/telemetry/src/index.ts`：**
+
+```ts
+interface TelemetryContext {
+  startSpan<T>(options: { name, attributes? }, cb: (span) => T | Promise<T>): Promise<T>;
+}
+interface TelemetrySpan extends TelemetryContext {   // span 自身能开子 span
+  addEvent(name, attributes?): void;
+  setAttributes(attributes): void;
+  setStatus({ status: 'ok' } | { status: 'error', error? }): void;
+}
+```
+
+**没有 `end()`**，span 的生命周期就是回调执行期；span 名在 `options.name` 里。
+回调抛错时必须照样输出一行并记 error，否则失败的 span 会从流水里凭空消失。
+
 - [ ] **Step 1: 写失败测试**
 
 创建 `test/config.test.mjs`：
