@@ -17,6 +17,16 @@ function required(name) {
   return value;
 }
 
+/**
+ * 拼接 API 路径，容忍 base URL 带不带 /v1。
+ * 中转站的 base URL 写法不统一（https://x.com 与 https://x.com/v1 都常见），
+ * 不做归一化就会拼出 /v1/v1/...。
+ */
+function apiUrl(baseUrl, path) {
+  const base = baseUrl.replace(/\/+$/, '');
+  return base.endsWith('/v1') ? `${base}${path}` : `${base}/v1${path}`;
+}
+
 /** 1x1 红色 PNG，避免探针依赖外部图片。 */
 const RED_PIXEL_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -52,7 +62,7 @@ async function probeChat() {
     ],
   };
 
-  const response = await fetch(`${required('LLM_BASE_URL')}/v1/chat/completions`, {
+  const response = await fetch(apiUrl(required('LLM_BASE_URL'), '/chat/completions'), {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${required('LLM_API_KEY')}`,
@@ -73,7 +83,7 @@ async function probeImages() {
     'base.png',
   );
 
-  const response = await fetch(`${required('IMAGE_BASE_URL')}/v1/images/edits`, {
+  const response = await fetch(apiUrl(required('IMAGE_BASE_URL'), '/images/edits'), {
     method: 'POST',
     headers: { Authorization: `Bearer ${required('IMAGE_API_KEY')}` },
     body: form,
@@ -97,18 +107,32 @@ function summarize(value) {
 
 await mkdir(OUT, { recursive: true });
 
-const chat = await probeChat();
-await writeFile(new URL('chat.json', OUT), JSON.stringify(summarize(chat), null, 2));
-const toolCalls = chat.body?.choices?.[0]?.message?.tool_calls;
-process.stdout.write(
-  `chat: status=${chat.status} tool_calls=${toolCalls ? JSON.stringify(toolCalls) : 'NONE'}\n`,
+/** 两个探针互相独立：只配了一侧凭证时，另一侧的缺失不应中断整个探测。 */
+async function run(label, probe, summarize_) {
+  try {
+    const result = await probe();
+    await writeFile(
+      new URL(`${label}.json`, OUT),
+      JSON.stringify(summarize(result), null, 2),
+    );
+    process.stdout.write(`${label}: ${summarize_(result)}\n`);
+  } catch (error) {
+    process.stdout.write(`${label}: SKIPPED/FAILED — ${error.message}\n`);
+  }
+}
+
+await run(
+  'chat',
+  probeChat,
+  (result) => {
+    const toolCalls = result.body?.choices?.[0]?.message?.tool_calls;
+    return `status=${result.status} tool_calls=${toolCalls ? JSON.stringify(toolCalls) : 'NONE'}`;
+  },
 );
 
-const images = await probeImages();
-await writeFile(new URL('images.json', OUT), JSON.stringify(summarize(images), null, 2));
-const first = images.body?.data?.[0];
-process.stdout.write(
-  `images: status=${images.status} keys=${first ? Object.keys(first).join(',') : 'NONE'}\n`,
-);
+await run('images', probeImages, (result) => {
+  const first = result.body?.data?.[0];
+  return `status=${result.status} keys=${first ? Object.keys(first).join(',') : 'NONE'}`;
+});
 
 process.stdout.write('\nSamples written to .probe/ (git-ignored).\n');

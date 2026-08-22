@@ -584,7 +584,36 @@ git commit -m "feat: add s3-compatible asset storage"
 
 ### Task 3: 自定义 ImagesProvider
 
-**照 `.probe/images.json` 的真实字段写解析，不照文档猜。**
+**探针实测结论（2026-08-22，中转站 qkmss.com）——以下取代本计划此前对响应格式的假设：**
+
+| 端点 | 实测结果 |
+|---|---|
+| `GET /v1/models` | 只有 `gpt-image-2`，无对话模型 |
+| `POST /v1/images/generations` + **显式 `size`** | ✅ 返回 `data[].b64_json` |
+| `POST /v1/images/generations` 不传 `size` | ❌ 502（中转站内部填 `auto`，上游 30 秒超时） |
+| `POST /v1/images/edits` | ❌ **当前**恒 502，与 `size` 无关；**供应商表示后��会支持** |
+| `POST /v1/chat/completions` + `image_url` | ✅ 当前 img2img 唯一可用路径，29 秒 |
+
+**img2img 当前的响应形状与任何标准格式都不同：**
+
+```jsonc
+{ "choices": [ { "message": {
+  "role": "assistant",
+  "content": "![image_1](data:image/png;base64,iVBORw0KGgo…)"   // 图在 content 字符串里
+} } ] }
+```
+
+没有 `images` 字段（不同于 pi 内置的 `openrouter-images`），也没有 `b64_json`（不同于 OpenAI Images API）。**必须从 content 里解 Markdown data URI。**
+
+因此 `relayGenerateImages` 按路由分三条，全部实测：
+
+| 情况 | 路由 | 解析 |
+|---|---|---|
+| 有基准图，`IMAGE_EDIT_ROUTE=chat`（默认） | `/chat/completions` | Markdown data URI |
+| 有基准图，`IMAGE_EDIT_ROUTE=edits` | `/images/edits` | `b64_json` |
+| 无基准图 | `/images/generations` + 显式 `size` | `b64_json` |
+
+**`IMAGE_EDIT_ROUTE` 不是投机性抽象**：供应商已明确 `/images/edits` 后续会支持，届时改一个环境变量即可切到标准格式，无需改代码。两个解析器本来就都需要（generations 路径要 `b64_json`）。
 
 **Files:**
 - Create: `src/infrastructure/models/relay-images-provider.mjs`
