@@ -283,14 +283,13 @@ git commit -m "chore: add provider capability probe"
 
 - [ ] **Step 1: 装依赖**
 
-两个包必须**版本一致**，否则 presigner 与 client 的内部签名接口可能不兼容：
-
 ```bash
 npm install --save-exact @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
-node -e "const d=require('./package.json').dependencies;console.log(d['@aws-sdk/client-s3'], d['@aws-sdk/s3-request-presigner'])"
 ```
 
-预期：两行输出版本号相同且无 `^` 前缀。若不同，用 `npm install --save-exact @aws-sdk/s3-request-presigner@<client 的版本>` 对齐。
+**两个包的版本号会不同，这是正常的**——AWS SDK v3 的子包不同步发版，`s3-request-presigner` 通常滞后于 `client-s3` 若干个补丁版本，强行对齐会 404。presigner 依赖的是 `@smithy/*` 签名原语而非 client 的精确版本。
+
+真正的验证手段是 Step 3 的集成用例「签名 URL 在无凭证下能取到对象」——版本能不能配合，那条测试会直接告诉你。
 
 - [ ] **Step 2: compose 加 MinIO**
 
