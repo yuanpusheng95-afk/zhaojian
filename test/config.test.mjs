@@ -47,6 +47,24 @@ test('api config still requires object storage credentials for signed urls', () 
   assert.throws(() => loadApiConfig({ S3_ACCESS_KEY: 'ak' }), /S3_SECRET_KEY/);
 });
 
+test('image size defaults to an explicit value and never auto', () => {
+  const config = loadWorkerConfig(FULL_WORKER_ENV);
+  assert.equal(config.image.size, '1024x1024');
+  assert.notEqual(config.image.size, 'auto', 'auto makes the relay time out with 502');
+});
+
+test('image edit route defaults to chat and rejects unknown values', () => {
+  assert.equal(loadWorkerConfig(FULL_WORKER_ENV).image.editRoute, 'chat');
+  assert.equal(
+    loadWorkerConfig({ ...FULL_WORKER_ENV, IMAGE_EDIT_ROUTE: 'edits' }).image.editRoute,
+    'edits',
+  );
+  assert.throws(
+    () => loadWorkerConfig({ ...FULL_WORKER_ENV, IMAGE_EDIT_ROUTE: 'magic' }),
+    /IMAGE_EDIT_ROUTE/,
+  );
+});
+
 test('numeric guards reject non-numeric values instead of silently using NaN', () => {
   assert.throws(
     () => loadWorkerConfig({ ...FULL_WORKER_ENV, MAX_IMAGES_PER_TURN: 'many' }),

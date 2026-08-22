@@ -21,6 +21,14 @@ function integer(env, name, fallback) {
   return value;
 }
 
+function editRoute(env) {
+  const value = env.IMAGE_EDIT_ROUTE ?? 'chat';
+  if (value !== 'chat' && value !== 'edits') {
+    throw new Error(`IMAGE_EDIT_ROUTE must be "chat" or "edits", got: ${value}`);
+  }
+  return value;
+}
+
 const DEFAULT_DATABASE_URL =
   'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent';
 
@@ -46,6 +54,11 @@ export function loadWorkerConfig(env = process.env) {
       baseUrl: required(env, 'IMAGE_BASE_URL'),
       apiKey: required(env, 'IMAGE_API_KEY'),
       modelId: env.IMAGE_MODEL ?? 'gpt-image-2',
+      // 不可为 auto：中转站内部会因此超时，边缘返回 502（实测）
+      size: env.IMAGE_SIZE ?? '1024x1024',
+      // 中转站当前 /images/edits 恒 502，img2img 只能走 chat；
+      // 供应商支持后把这个变量改成 edits 即可切回标准格式
+      editRoute: editRoute(env),
     },
     s3: s3Config(env),
     guards: {
