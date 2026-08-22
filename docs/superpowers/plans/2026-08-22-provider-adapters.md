@@ -589,10 +589,10 @@ git commit -m "feat: add s3-compatible asset storage"
 | 端点 | 实测结果 |
 |---|---|
 | `GET /v1/models` | 只有 `gpt-image-2`，无对话模型 |
-| `POST /v1/images/generations` + **显式 `size`** | ✅ 返回 `data[].b64_json` |
+| `POST /v1/images/generations` + **显式 `size`** | ⚠️ **不稳定**：同样参数时通时不通，成功时返回 `data[].b64_json` |
 | `POST /v1/images/generations` 不传 `size` | ❌ 502（中转站内部填 `auto`，上游 30 秒超时） |
 | `POST /v1/images/edits` | ❌ **当前**恒 502，与 `size` 无关；**供应商表示后��会支持** |
-| `POST /v1/chat/completions` + `image_url` | ✅ 当前 img2img 唯一可用路径，29 秒 |
+| `POST /v1/chat/completions` + `image_url` | ✅ **唯一可靠路径**，多次调用全通，约 30–40 秒 |
 
 **img2img 当前的响应形状与任何标准格式都不同：**
 

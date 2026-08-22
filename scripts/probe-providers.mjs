@@ -73,22 +73,78 @@ async function probeChat() {
   return { status: response.status, body: await response.json() };
 }
 
-async function probeImages() {
-  const form = new FormData();
-  form.set('model', process.env.IMAGE_MODEL ?? 'gpt-image-2');
-  form.set('prompt', '把背景换成海边沙滩，保持主体不变');
-  form.set(
-    'image',
-    new Blob([Buffer.from(RED_PIXEL_PNG_BASE64, 'base64')], { type: 'image/png' }),
-    'base.png',
-  );
+async function probeImageRoute(route) {
+  const baseUrl = required('IMAGE_BASE_URL');
+  const apiKey = required('IMAGE_API_KEY');
+  const model = process.env.IMAGE_MODEL ?? 'gpt-image-2';
+  const size = process.env.IMAGE_SIZE ?? '1024x1024';
+  const prompt = '把背景换成海边沙滩，保持主体不变';
 
-  const response = await fetch(apiUrl(required('IMAGE_BASE_URL'), '/images/edits'), {
+  if (route === 'models') {
+    const response = await fetch(apiUrl(baseUrl, '/models'), {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    return { status: response.status, body: await response.json() };
+  }
+
+  if (route === 'generations') {
+    const response = await fetch(apiUrl(baseUrl, '/images/generations'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, prompt, n: 1, size }),
+    });
+    return { status: response.status, body: await readBody(response) };
+  }
+
+  if (route === 'edits') {
+    const form = new FormData();
+    form.set('model', model);
+    form.set('prompt', prompt);
+    form.set('size', size);
+    form.set(
+      'image',
+      new Blob([Buffer.from(RED_PIXEL_PNG_BASE64, 'base64')], { type: 'image/png' }),
+      'base.png',
+    );
+    const response = await fetch(apiUrl(baseUrl, '/images/edits'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+    });
+    return { status: response.status, body: await readBody(response) };
+  }
+
+  // chat：当前唯一可用的 img2img 路径
+  const response = await fetch(apiUrl(baseUrl, '/chat/completions'), {
     method: 'POST',
-    headers: { Authorization: `Bearer ${required('IMAGE_API_KEY')}` },
-    body: form,
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${RED_PIXEL_PNG_BASE64}` },
+            },
+          ],
+        },
+      ],
+    }),
   });
-  return { status: response.status, body: await response.json() };
+  return { status: response.status, body: await readBody(response) };
+}
+
+/** 边缘错误常回 text/plain，直接 .json() 会抛在解析上、淹没真正的状态码。 */
+async function readBody(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { __raw: text.slice(0, 200) };
+  }
 }
 
 /** 样本可能很大（b64 图片），截断后再存，只保留结构。 */
@@ -130,9 +186,20 @@ await run(
   },
 );
 
-await run('images', probeImages, (result) => {
-  const first = result.body?.data?.[0];
-  return `status=${result.status} keys=${first ? Object.keys(first).join(',') : 'NONE'}`;
-});
+for (const route of ['models', 'generations', 'edits', 'chat']) {
+  await run(`images-${route}`, () => probeImageRoute(route), (result) => {
+    const entry = result.body?.data?.[0];
+    const content = result.body?.choices?.[0]?.message?.content;
+    const hasDataUri = typeof content === 'string' && content.includes('base64,');
+    const shape = entry
+      ? `data[0] keys=${Object.keys(entry).join(',')}`
+      : hasDataUri
+        ? 'markdown data URI in message.content'
+        : result.body?.__raw
+          ? `raw=${result.body.__raw}`
+          : 'NONE';
+    return `status=${result.status} ${shape}`;
+  });
+}
 
 process.stdout.write('\nSamples written to .probe/ (git-ignored).\n');

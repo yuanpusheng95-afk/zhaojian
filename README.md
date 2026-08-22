@@ -153,7 +153,12 @@ test-integration/                   真实 PostgreSQL 与 HTTP 纵切测试
 - 只接 Mock ImageGenerationProvider，尚未接真实图像供应商。
 - 已实现内部 EditInterpreter 和 Mock LanguageModel，尚未接真实 LanguageModel，也未开放自然语言 HTTP 入口。
 - 图像供应商适配层已打通：基准图 + 指令可产出真实图片并落入 S3 兼容对象存储（`npm run smoke:image -- <图> "<指令>"`）。Agent 尚未接线（切片 2c）。
-- **中转站现状（实测）**：`/v1/images/edits` 恒 502，img2img 暂走 `/v1/chat/completions`（图片以 Markdown data URI 内嵌在 content 里）；`size` 不可为 `auto`，否则上游超时。供应商支持 edits 后把 `IMAGE_EDIT_ROUTE` 改为 `edits` 即可，无需改代码。
+- **中转站现状（实测，`node --env-file=.env scripts/probe-providers.mjs` 可复查）**：
+  - `/v1/chat/completions` + 图片 —— **唯一可靠的 img2img 路径**，图片以 Markdown data URI 内嵌在 `message.content` 里
+  - `/v1/images/edits` —— 恒 502
+  - `/v1/images/generations` —— **不稳定**，同样参数时通时不通（Cloudflare 502）
+  - `size` 不可为 `auto`，否则上游超时
+  - 供应商修好 edits 后把 `IMAGE_EDIT_ROUTE` 改为 `edits` 即可，无需改代码
 - Agent 会话轨迹已可持久化到 PostgreSQL：实现了 pi 的 `SessionStorage`（17 方法）与 `SessionRepo`（5 方法，含 fork），通过官方 `createSessionBackendConformance` 全部 30 个用例。Agent 本身尚未接线（切片 2）。
 - **assumption：真实入口接入前，同一消息不会并发重复解释；公开入口需要持久化 Message/EditRequest。**
 - 尚未实现对象存储上传、鉴权、SSE 和前端。
