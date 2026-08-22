@@ -67,11 +67,10 @@ npm run dev:up            # PostgreSQL + MinIO
 npm run db:migrate
 ```
 
-启动 API 和 Worker（两个终端）：
+启动 API：
 
 ```bash
 npm run start:api
-npm run start:worker
 ```
 
 默认地址：
@@ -81,23 +80,16 @@ API: http://127.0.0.1:3000
 PostgreSQL: postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent
 ```
 
-可通过 `DATABASE_URL`、`PORT`、`WORKER_POLL_INTERVAL_MS` 覆盖。
+可通过 `DATABASE_URL`、`PORT` 覆盖。
 
 ## 最小 API
 
 ```text
 POST /projects
 GET  /projects/:id
-POST /projects/:id/generations
 GET  /generations/:id
 POST /projects/:projectId/generations/:generationId/selections
 GET  /health
-```
-
-创建 Generation 时通过请求头传幂等键：
-
-```http
-Idempotency-Key: edit-1
 ```
 
 ## 验证

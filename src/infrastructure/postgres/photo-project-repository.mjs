@@ -1,37 +1,16 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import {
+  AssetNotFoundError,
   CandidateSelectionError,
   GenerationNotFoundError,
-  GenerationTransitionError,
-  IdempotencyConflictError,
   InvalidGenerationRequestError,
-  ProjectBusyError,
   ProjectNotFoundError,
   RevisionConflictError,
+  TurnNotFoundError,
 } from '../../domain/photo-project-service.mjs';
-import {
-  GENERATION_TRANSITIONS,
-  SELECTABLE_GENERATION_STATUSES,
-  TERMINAL_GENERATION_STATUSES,
-} from '../../domain/generation-lifecycle.mjs';
+import { SELECTABLE_GENERATION_STATUSES } from '../../domain/generation-lifecycle.mjs';
 import { applyPhotoStatePatch } from '../../domain/photo-state.mjs';
-
-export class GenerationLeaseLostError extends Error {
-  constructor(generationId) {
-    super(`Generation lease lost: ${generationId}`);
-    this.name = 'GenerationLeaseLostError';
-    this.code = 'GENERATION_LEASE_LOST';
-  }
-}
-
-export class ProviderJobConflictError extends Error {
-  constructor(generationId) {
-    super(`Generation already has a different provider job: ${generationId}`);
-    this.name = 'ProviderJobConflictError';
-    this.code = 'PROVIDER_JOB_CONFLICT';
-  }
-}
 
 export class PostgresPhotoProjectRepository {
   #pool;
@@ -48,7 +27,13 @@ export class PostgresPhotoProjectRepository {
     this.#now = now;
   }
 
-  async createProject({ projectId, name, initialState, anchorAssetId = null }) {
+  async createProject({
+    projectId,
+    name,
+    initialState,
+    anchorAsset = null,
+    ownerId = 'dev',
+  }) {
     const id = projectId ?? this.#idFactory('project');
     const revisionId = this.#idFactory('revision');
     const now = this.#now();
@@ -58,26 +43,27 @@ export class PostgresPhotoProjectRepository {
     });
 
     return this.#transaction(async (client) => {
-      if (anchorAssetId) {
-        await client.query(
-          `INSERT INTO assets (id, kind, created_at)
-           VALUES ($1, 'source', $2)
-           ON CONFLICT (id) DO NOTHING`,
-          [anchorAssetId, now],
-        );
+      if (anchorAsset) {
+        await this.#upsertAsset(client, {
+          id: anchorAsset.assetId,
+          kind: 'source',
+          uri: anchorAsset.uri,
+          metadata: anchorAsset.metadata ?? {},
+          createdAt: now,
+        });
       }
       await client.query(
         `INSERT INTO projects
-          (id, name, active_revision_id, running_generation_id, created_at, updated_at)
-         VALUES ($1, $2, NULL, NULL, $3, $3)`,
-        [id, name, now],
+          (id, name, active_revision_id, owner_id, created_at, updated_at)
+         VALUES ($1, $2, NULL, $3, $4, $4)`,
+        [id, name, ownerId, now],
       );
       await client.query(
         `INSERT INTO photo_revisions
           (id, project_id, parent_revision_id, state_json, anchor_asset_id,
            source_generation_id, created_at)
          VALUES ($1, $2, NULL, $3, $4, NULL, $5)`,
-        [revisionId, id, state, anchorAssetId, now],
+        [revisionId, id, state, anchorAsset?.assetId ?? null, now],
       );
       const result = await client.query(
         `UPDATE projects
@@ -90,46 +76,25 @@ export class PostgresPhotoProjectRepository {
     });
   }
 
-  async requestGeneration({
+  async recordGeneration({
     projectId,
+    turnId,
     baseRevisionId,
-    idempotencyKey,
+    inputAssetId,
     patch,
-    operation = 'edit',
+    renderPrompt = null,
+    outcome,
   }) {
-    if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
+    if (typeof turnId !== 'string' || turnId.trim() === '') {
       throw new InvalidGenerationRequestError(
-        'Generation request requires a non-empty idempotency key',
+        'Generation requires a non-empty turn id',
       );
     }
-
-    const fingerprint = requestFingerprint({
-      baseRevisionId,
-      operation,
-      patch,
-    });
 
     return this.#transaction(async (client) => {
       const project = await this.#requireProject(client, projectId, {
         forUpdate: true,
       });
-      const idempotency = await client.query(
-        `SELECT request_fingerprint, generation_id
-         FROM idempotency_requests
-         WHERE project_id = $1 AND idempotency_key = $2`,
-        [projectId, idempotencyKey],
-      );
-      if (idempotency.rowCount > 0) {
-        const existing = idempotency.rows[0];
-        if (existing.request_fingerprint !== fingerprint) {
-          throw new IdempotencyConflictError(projectId, idempotencyKey);
-        }
-        return this.#requireGeneration(client, existing.generation_id);
-      }
-
-      if (project.runningGenerationId) {
-        throw new ProjectBusyError(projectId, project.runningGenerationId);
-      }
       if (project.activeRevisionId !== baseRevisionId) {
         throw new RevisionConflictError({
           projectId,
@@ -138,199 +103,80 @@ export class PostgresPhotoProjectRepository {
         });
       }
 
+      const turn = await client.query(
+        `SELECT id FROM agent_turns
+         WHERE id = $1 AND project_id = $2`,
+        [turnId, projectId],
+      );
+      if (turn.rowCount === 0) {
+        throw new TurnNotFoundError(projectId, turnId);
+      }
+
+      const inputAsset = await client.query(
+        'SELECT id FROM assets WHERE id = $1',
+        [inputAssetId],
+      );
+      if (inputAsset.rowCount === 0) {
+        throw new AssetNotFoundError(inputAssetId);
+      }
+
       const revision = await this.#requireRevision(client, baseRevisionId);
       const proposedState = applyPhotoStatePatch(revision.state, patch);
       const generationId = this.#idFactory('generation');
       const now = this.#now();
+      const completed = outcome?.kind === 'completed';
+      const failed = outcome?.kind === 'failed';
+      if (!completed && !failed) {
+        throw new InvalidGenerationRequestError(
+          'Generation outcome must be completed or failed',
+        );
+      }
 
       await client.query(
-        `INSERT INTO generation_jobs
-          (id, project_id, input_revision_id, operation, idempotency_key,
-           patch_json, proposed_state_json, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $8)`,
+        `INSERT INTO generations
+          (id, project_id, input_revision_id, patch_json,
+           proposed_state_json, status, input_asset_id, turn_id,
+           metadata_json, last_error_json, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
         [
           generationId,
           projectId,
           baseRevisionId,
-          operation,
-          idempotencyKey,
           patch,
           proposedState,
+          completed ? 'completed' : 'failed',
+          inputAssetId,
+          turnId,
+          { renderPrompt },
+          failed ? outcome.error ?? null : null,
           now,
         ],
       );
-      await client.query(
-        `INSERT INTO idempotency_requests
-          (project_id, idempotency_key, request_fingerprint, generation_id, created_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [projectId, idempotencyKey, fingerprint, generationId, now],
-      );
-      await client.query(
-        `UPDATE projects
-         SET running_generation_id = $2, updated_at = $3
-         WHERE id = $1`,
-        [projectId, generationId, now],
-      );
 
-      return this.#requireGeneration(client, generationId);
-    });
-  }
-
-  async transitionGeneration({
-    generationId,
-    to,
-    error = null,
-    claimToken,
-  }) {
-    return this.#transaction(async (client) => {
-      const generation = await this.#requireGeneration(client, generationId, {
-        forUpdate: true,
-        includeLease: true,
-      });
-      const projectId = generation.projectId;
-      await this.#requireProject(client, projectId, { forUpdate: true });
-      requireLease(generation, claimToken);
-      const allowed = GENERATION_TRANSITIONS.get(generation.status);
-      if (!allowed?.has(to)) {
-        throw new GenerationTransitionError(
-          generationId,
-          generation.status,
-          to,
-        );
-      }
-      if (to === 'completed' && generation.candidates.length === 0) {
-        throw new GenerationTransitionError(
-          generationId,
-          generation.status,
-          to,
-        );
-      }
-
-      const now = this.#now();
-      await client.query(
-        `UPDATE generation_jobs
-         SET status = $2,
-             last_error_json = $3,
-             updated_at = $4,
-             claim_token = CASE WHEN $5 THEN NULL ELSE claim_token END,
-             claimed_at = CASE WHEN $5 THEN NULL ELSE claimed_at END,
-             lease_expires_at = CASE WHEN $5 THEN NULL ELSE lease_expires_at END
-         WHERE id = $1`,
-        [generationId, to, error, now, TERMINAL_GENERATION_STATUSES.has(to)],
-      );
-      if (TERMINAL_GENERATION_STATUSES.has(to)) {
+      if (completed) {
+        const candidateId = outcome.candidate.candidateId ?? this.#idFactory('candidate');
+        await this.#upsertAsset(client, {
+          id: outcome.candidate.assetId,
+          kind: 'generated',
+          uri: outcome.candidate.uri,
+          metadata: outcome.candidate.metadata ?? {},
+          createdAt: now,
+        });
         await client.query(
-          `UPDATE projects
-           SET running_generation_id = NULL, updated_at = $3
-           WHERE id = $1 AND running_generation_id = $2`,
-          [projectId, generationId, now],
-        );
-      }
-      return this.#requireGeneration(client, generationId);
-    });
-  }
-
-  async recordProviderJob({
-    generationId,
-    claimToken,
-    providerName,
-    providerModel,
-    providerJobId,
-  }) {
-    if (typeof providerModel !== 'string' || providerModel.trim() === '') {
-      throw new TypeError('Provider job requires a non-empty provider model');
-    }
-
-    return this.#transaction(async (client) => {
-      const generation = await this.#requireGeneration(client, generationId, {
-        forUpdate: true,
-        includeLease: true,
-        includeProvider: true,
-      });
-      requireLease(generation, claimToken);
-      if (generation.status !== 'submitted') {
-        throw new GenerationTransitionError(
-          generationId,
-          generation.status,
-          'record_provider_job',
-        );
-      }
-      if (generation.providerJobId) {
-        if (
-          generation.providerName === providerName &&
-          generation.providerModel === providerModel &&
-          generation.providerJobId === providerJobId
-        ) {
-          return providerJobFromGeneration(generation);
-        }
-        throw new ProviderJobConflictError(generationId);
-      }
-
-      const now = this.#now();
-      const result = await client.query(
-        `UPDATE generation_jobs
-         SET provider_name = $2,
-             provider_model = $3,
-             provider_job_id = $4,
-             provider_submitted_at = $5,
-             updated_at = $5
-         WHERE id = $1
-         RETURNING provider_name, provider_model,
-                   provider_job_id, provider_submitted_at`,
-        [generationId, providerName, providerModel, providerJobId, now],
-      );
-      return mapProviderJob(result.rows[0]);
-    });
-  }
-
-  async addCandidate({
-    generationId,
-    candidateId,
-    assetId,
-    verification = {},
-    claimToken,
-  }) {
-    return this.#transaction(async (client) => {
-      const generation = await this.#requireGeneration(client, generationId, {
-        forUpdate: true,
-        includeLease: true,
-      });
-      requireLease(generation, claimToken);
-      if (generation.status !== 'verifying') {
-        throw new GenerationTransitionError(
-          generationId,
-          generation.status,
-          'add_candidate',
-        );
-      }
-
-      const id = candidateId ?? this.#idFactory('candidate');
-      const now = this.#now();
-      await client.query(
-        `INSERT INTO assets (id, kind, created_at)
-         VALUES ($1, 'generated', $2)
-         ON CONFLICT (id) DO NOTHING`,
-        [assetId, now],
-      );
-      try {
-        const result = await client.query(
           `INSERT INTO generation_outputs
             (id, generation_id, asset_id, verification_json, created_at)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING *`,
-          [id, generationId, assetId, verification, now],
+           VALUES ($1, $2, $3, $4, $5)`,
+          [
+            candidateId,
+            generationId,
+            outcome.candidate.assetId,
+            outcome.candidate.verification ?? {},
+            now,
+          ],
         );
-        await client.query(
-          'UPDATE generation_jobs SET updated_at = $2 WHERE id = $1',
-          [generationId, now],
-        );
-        return mapCandidate(result.rows[0]);
-      } catch (error) {
-        if (error.code === '23505') {
-          throw new CandidateSelectionError(`Candidate already exists: ${id}`);
-        }
-        throw error;
       }
+
+      return this.#requireGeneration(client, generationId);
     });
   }
 
@@ -354,12 +200,6 @@ export class PostgresPhotoProjectRepository {
           );
         }
         return this.#requireRevision(client, generation.selectedRevisionId);
-      }
-      if (
-        project.runningGenerationId &&
-        project.runningGenerationId !== generationId
-      ) {
-        throw new ProjectBusyError(projectId, project.runningGenerationId);
       }
       if (!SELECTABLE_GENERATION_STATUSES.has(generation.status)) {
         throw new CandidateSelectionError(
@@ -405,7 +245,7 @@ export class PostgresPhotoProjectRepository {
         ],
       );
       await client.query(
-        `UPDATE generation_jobs
+        `UPDATE generations
          SET selected_candidate_id = $2, selected_revision_id = $3, updated_at = $4
          WHERE id = $1`,
         [generationId, candidateId, revisionId, now],
@@ -446,13 +286,27 @@ export class PostgresPhotoProjectRepository {
   async listGenerations(projectId) {
     await this.#requireProject(this.#pool, projectId);
     const result = await this.#pool.query(
-      `SELECT id FROM generation_jobs
+      `SELECT id FROM generations
        WHERE project_id = $1
        ORDER BY created_at, id`,
       [projectId],
     );
     return Promise.all(
       result.rows.map(({ id }) => this.#requireGeneration(this.#pool, id)),
+    );
+  }
+
+  async #upsertAsset(
+    client,
+    { id, kind, uri = null, metadata = {}, createdAt },
+  ) {
+    await client.query(
+      `INSERT INTO assets (id, kind, uri, metadata_json, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET
+         uri = EXCLUDED.uri,
+         metadata_json = EXCLUDED.metadata_json`,
+      [id, kind, uri, metadata, createdAt],
     );
   }
 
@@ -465,32 +319,19 @@ export class PostgresPhotoProjectRepository {
     return mapProject(result.rows[0]);
   }
 
-  async #requireGeneration(
-    database,
-    generationId,
-    {
-      forUpdate = false,
-      includeLease = false,
-      includeProvider = false,
-    } = {},
-  ) {
+  async #requireGeneration(database, generationId) {
     const result = await database.query(
-      `SELECT * FROM generation_jobs WHERE id = $1${forUpdate ? ' FOR UPDATE' : ''}`,
+      'SELECT * FROM generations WHERE id = $1',
       [generationId],
     );
-    if (result.rowCount === 0) {
-      throw new GenerationNotFoundError(generationId);
-    }
+    if (result.rowCount === 0) throw new GenerationNotFoundError(generationId);
     const candidates = await database.query(
       `SELECT * FROM generation_outputs
        WHERE generation_id = $1
        ORDER BY created_at, id`,
       [generationId],
     );
-    return mapGeneration(result.rows[0], candidates.rows, {
-      includeLease,
-      includeProvider,
-    });
+    return mapGeneration(result.rows[0], candidates.rows);
   }
 
   async #requireRevision(database, revisionId) {
@@ -527,7 +368,8 @@ function mapProject(row) {
     id: row.id,
     name: row.name,
     activeRevisionId: row.active_revision_id,
-    runningGenerationId: row.running_generation_id,
+    runningTurnId: row.running_turn_id,
+    ownerId: row.owner_id,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
   };
@@ -545,17 +387,13 @@ function mapRevision(row) {
   };
 }
 
-function mapGeneration(
-  row,
-  candidateRows,
-  { includeLease = false, includeProvider = false } = {},
-) {
-  const generation = {
+function mapGeneration(row, candidateRows) {
+  return {
     id: row.id,
     projectId: row.project_id,
+    turnId: row.turn_id,
     inputRevisionId: row.input_revision_id,
-    operation: row.operation,
-    idempotencyKey: row.idempotency_key,
+    inputAssetId: row.input_asset_id,
     patch: row.patch_json,
     proposedState: row.proposed_state_json,
     status: row.status,
@@ -563,46 +401,10 @@ function mapGeneration(
     selectedCandidateId: row.selected_candidate_id,
     selectedRevisionId: row.selected_revision_id,
     error: row.last_error_json,
+    renderPrompt: row.metadata_json?.renderPrompt ?? null,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
   };
-  if (includeLease) {
-    generation.leaseToken = row.claim_token;
-    generation.claimedAt = toIso(row.claimed_at);
-    generation.leaseExpiresAt = toIso(row.lease_expires_at);
-    generation.attemptCount = row.attempt_count;
-  }
-  if (includeProvider) {
-    generation.providerName = row.provider_name;
-    generation.providerModel = row.provider_model;
-    generation.providerJobId = row.provider_job_id;
-    generation.providerSubmittedAt = toIso(row.provider_submitted_at);
-  }
-  return generation;
-}
-
-function providerJobFromGeneration(generation) {
-  return {
-    providerName: generation.providerName,
-    providerModel: generation.providerModel,
-    providerJobId: generation.providerJobId,
-    providerSubmittedAt: generation.providerSubmittedAt,
-  };
-}
-
-function mapProviderJob(row) {
-  return {
-    providerName: row.provider_name,
-    providerModel: row.provider_model,
-    providerJobId: row.provider_job_id,
-    providerSubmittedAt: toIso(row.provider_submitted_at),
-  };
-}
-
-function requireLease(generation, claimToken) {
-  if (generation.leaseToken && generation.leaseToken !== claimToken) {
-    throw new GenerationLeaseLostError(generation.id);
-  }
 }
 
 function mapCandidate(row) {
@@ -616,20 +418,4 @@ function mapCandidate(row) {
 
 function toIso(value) {
   return value instanceof Date ? value.toISOString() : value;
-}
-
-function requestFingerprint(value) {
-  return createHash('sha256')
-    .update(JSON.stringify(sortObject(value)))
-    .digest('hex');
-}
-
-function sortObject(value) {
-  if (Array.isArray(value)) return value.map(sortObject);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, sortObject(value[key])]),
-  );
 }

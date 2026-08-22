@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
 import {
-  GENERATION_TRANSITIONS,
   SELECTABLE_GENERATION_STATUSES,
   TERMINAL_GENERATION_STATUSES,
 } from './generation-lifecycle.mjs';
@@ -41,43 +40,16 @@ export class RevisionConflictError extends DomainError {
   }
 }
 
+export class RevisionNotFoundError extends DomainError {
+  constructor(revisionId) {
+    super(`Revision not found: ${revisionId}`, 'REVISION_NOT_FOUND');
+    this.revisionId = revisionId;
+  }
+}
+
 export class InvalidGenerationRequestError extends DomainError {
   constructor(message) {
     super(message, 'INVALID_GENERATION_REQUEST');
-  }
-}
-
-export class IdempotencyConflictError extends DomainError {
-  constructor(projectId, idempotencyKey) {
-    super(
-      `Idempotency key ${idempotencyKey} was reused with a different request in project ${projectId}`,
-      'IDEMPOTENCY_CONFLICT',
-    );
-    this.projectId = projectId;
-    this.idempotencyKey = idempotencyKey;
-  }
-}
-
-export class ProjectBusyError extends DomainError {
-  constructor(projectId, generationId) {
-    super(
-      `Project ${projectId} already has an active generation: ${generationId}`,
-      'PROJECT_BUSY',
-    );
-    this.projectId = projectId;
-    this.generationId = generationId;
-  }
-}
-
-export class GenerationTransitionError extends DomainError {
-  constructor(generationId, from, to) {
-    super(
-      `Invalid generation transition for ${generationId}: ${from} -> ${to}`,
-      'INVALID_GENERATION_TRANSITION',
-    );
-    this.generationId = generationId;
-    this.from = from;
-    this.to = to;
   }
 }
 
@@ -87,11 +59,25 @@ export class CandidateSelectionError extends DomainError {
   }
 }
 
+export class TurnNotFoundError extends DomainError {
+  constructor(projectId, turnId) {
+    super(`Turn not found for project ${projectId}: ${turnId}`, 'TURN_NOT_FOUND');
+    this.projectId = projectId;
+    this.turnId = turnId;
+  }
+}
+
+export class AssetNotFoundError extends DomainError {
+  constructor(assetId) {
+    super(`Asset not found: ${assetId}`, 'ASSET_NOT_FOUND');
+    this.assetId = assetId;
+  }
+}
+
 export class PhotoProjectService {
   #projects = new Map();
   #revisions = new Map();
   #generations = new Map();
-  #idempotency = new Map();
   #idFactory;
   #now;
 
@@ -103,7 +89,7 @@ export class PhotoProjectService {
     this.#now = now;
   }
 
-  createProject({ projectId, name, initialState, anchorAssetId = null }) {
+  createProject({ projectId, name, initialState, anchorAsset = null }) {
     const id = projectId ?? this.#idFactory('project');
     if (this.#projects.has(id)) {
       throw new DomainError(`Project already exists: ${id}`, 'PROJECT_EXISTS');
@@ -119,7 +105,7 @@ export class PhotoProjectService {
       projectId: id,
       parentRevisionId: null,
       state: validatedInitialState,
-      anchorAssetId,
+      anchorAssetId: anchorAsset?.assetId ?? null,
       sourceGenerationId: null,
       createdAt,
     };
@@ -127,7 +113,8 @@ export class PhotoProjectService {
       id,
       name,
       activeRevisionId: revision.id,
-      runningGenerationId: null,
+      runningTurnId: null,
+      ownerId: 'dev',
       createdAt,
       updatedAt: createdAt,
     };
@@ -137,38 +124,30 @@ export class PhotoProjectService {
     return clone(project);
   }
 
-  requestGeneration({
+  recordGeneration({
     projectId,
+    turnId,
     baseRevisionId,
-    idempotencyKey,
+    inputAssetId,
     patch,
-    operation = 'edit',
+    renderPrompt = null,
+    outcome,
   }) {
-    if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
+    if (typeof turnId !== 'string' || turnId.trim() === '') {
       throw new InvalidGenerationRequestError(
-        'Generation request requires a non-empty idempotency key',
+        'Generation requires a non-empty turn id',
       );
     }
 
     const project = this.#requireProject(projectId);
-    const idempotencyId = `${projectId}:${idempotencyKey}`;
-    const requestFingerprint = canonicalStringify({
-      baseRevisionId,
-      operation,
-      patch,
-    });
-    const existingRequest = this.#idempotency.get(idempotencyId);
-    if (existingRequest) {
-      if (existingRequest.fingerprint !== requestFingerprint) {
-        throw new IdempotencyConflictError(projectId, idempotencyKey);
-      }
-      return this.getGeneration(existingRequest.generationId);
+    const baseRevision = this.#requireRevision(baseRevisionId);
+    if (baseRevision.projectId !== projectId) {
+      throw new RevisionConflictError({
+        projectId,
+        expectedRevisionId: baseRevisionId,
+        actualRevisionId: null,
+      });
     }
-
-    if (project.runningGenerationId) {
-      throw new ProjectBusyError(projectId, project.runningGenerationId);
-    }
-
     if (project.activeRevisionId !== baseRevisionId) {
       throw new RevisionConflictError({
         projectId,
@@ -177,87 +156,37 @@ export class PhotoProjectService {
       });
     }
 
-    const baseRevision = this.#revisions.get(baseRevisionId);
+    const proposedState = applyPhotoStatePatch(baseRevision.state, patch);
+    const completedCandidate = outcome?.kind === 'completed'
+      ? {
+          id: outcome.candidate.candidateId ?? this.#idFactory('candidate'),
+          assetId: outcome.candidate.assetId,
+          verification: {},
+          createdAt: this.#now(),
+        }
+      : null;
+
     const generation = {
       id: this.#idFactory('generation'),
       projectId,
+      turnId,
       inputRevisionId: baseRevisionId,
-      operation,
-      idempotencyKey,
+      inputAssetId,
       patch: structuredClone(patch),
-      proposedState: applyPhotoStatePatch(baseRevision.state, patch),
-      status: 'queued',
-      candidates: [],
+      proposedState,
+      status: completedCandidate ? 'completed' : 'failed',
+      candidates: completedCandidate ? [completedCandidate] : [],
+      error: outcome?.kind === 'failed' ? structuredClone(outcome.error) : null,
       selectedCandidateId: null,
       selectedRevisionId: null,
+      renderPrompt,
       createdAt: this.#now(),
       updatedAt: this.#now(),
     };
+    generation.updatedAt = generation.createdAt;
 
     this.#generations.set(generation.id, generation);
-    this.#idempotency.set(idempotencyId, {
-      generationId: generation.id,
-      fingerprint: requestFingerprint,
-    });
-    project.runningGenerationId = generation.id;
-    project.updatedAt = generation.updatedAt;
     return clone(generation);
-  }
-
-  transitionGeneration({ generationId, to }) {
-    const generation = this.#requireGeneration(generationId);
-    const allowed = GENERATION_TRANSITIONS.get(generation.status);
-    if (!allowed?.has(to)) {
-      throw new GenerationTransitionError(
-        generationId,
-        generation.status,
-        to,
-      );
-    }
-
-    if (to === 'completed' && generation.candidates.length === 0) {
-      throw new GenerationTransitionError(
-        generationId,
-        generation.status,
-        to,
-      );
-    }
-
-    generation.status = to;
-    generation.updatedAt = this.#now();
-
-    if (TERMINAL_GENERATION_STATUSES.has(to)) {
-      this.#releaseProjectGeneration(generation);
-    }
-
-    return clone(generation);
-  }
-
-  addCandidate({ generationId, candidateId, assetId, verification = {} }) {
-    const generation = this.#requireGeneration(generationId);
-    if (generation.status !== 'verifying') {
-      throw new GenerationTransitionError(
-        generationId,
-        generation.status,
-        'add_candidate',
-      );
-    }
-
-    if (generation.candidates.some(({ id }) => id === candidateId)) {
-      throw new CandidateSelectionError(
-        `Candidate already exists: ${candidateId}`,
-      );
-    }
-
-    const candidate = {
-      id: candidateId ?? this.#idFactory('candidate'),
-      assetId,
-      verification: structuredClone(verification),
-      createdAt: this.#now(),
-    };
-    generation.candidates.push(candidate);
-    generation.updatedAt = this.#now();
-    return clone(candidate);
   }
 
   selectCandidate({ projectId, generationId, candidateId }) {
@@ -267,13 +196,6 @@ export class PhotoProjectService {
 
     if (generation.selectedCandidateId) {
       return this.#handleRepeatedSelection(generation, candidateId);
-    }
-
-    if (
-      project.runningGenerationId &&
-      project.runningGenerationId !== generation.id
-    ) {
-      throw new ProjectBusyError(projectId, project.runningGenerationId);
     }
 
     if (!SELECTABLE_GENERATION_STATUSES.has(generation.status)) {
@@ -311,8 +233,8 @@ export class PhotoProjectService {
     generation.selectedCandidateId = candidateId;
     generation.selectedRevisionId = revision.id;
     generation.updatedAt = this.#now();
-    project.activeRevisionId = revision.id;
-    project.updatedAt = generation.updatedAt;
+    project.activeRevisionId = this.#revisions.get(revision.id).id;
+    project.updatedAt = this.#now();
     return clone(revision);
   }
 
@@ -325,10 +247,7 @@ export class PhotoProjectService {
   }
 
   getRevision(revisionId) {
-    const revision = this.#revisions.get(revisionId);
-    if (!revision) {
-      throw new DomainError(`Revision not found: ${revisionId}`, 'REVISION_NOT_FOUND');
-    }
+    const revision = this.#requireRevision(revisionId);
     return clone(revision);
   }
 
@@ -362,12 +281,12 @@ export class PhotoProjectService {
     return generation;
   }
 
-  #releaseProjectGeneration(generation) {
-    const project = this.#requireProject(generation.projectId);
-    if (project.runningGenerationId === generation.id) {
-      project.runningGenerationId = null;
-      project.updatedAt = generation.updatedAt;
+  #requireRevision(revisionId) {
+    const revision = this.#revisions.get(revisionId);
+    if (!revision) {
+      throw new RevisionNotFoundError(revisionId);
     }
+    return revision;
   }
 
   #assertGenerationBelongsToProject(generation, projectId) {
@@ -391,23 +310,4 @@ export class PhotoProjectService {
 
 function clone(value) {
   return structuredClone(value);
-}
-
-function canonicalStringify(value) {
-  return JSON.stringify(sortObject(value));
-}
-
-function sortObject(value) {
-  if (Array.isArray(value)) {
-    return value.map(sortObject);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, sortObject(value[key])]),
-  );
 }

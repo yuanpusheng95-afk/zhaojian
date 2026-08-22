@@ -32,21 +32,6 @@ async function routeRequest({ request, response, repository }) {
     return writeJson(response, 200, project);
   }
 
-  const generationRequestMatch = path.match(
-    /^\/projects\/([^/]+)\/generations$/,
-  );
-  if (request.method === 'POST' && generationRequestMatch) {
-    const body = await readJson(request);
-    const generation = await repository.requestGeneration({
-      projectId: decode(generationRequestMatch[1]),
-      baseRevisionId: body.baseRevisionId,
-      operation: body.operation,
-      patch: body.patch,
-      idempotencyKey: request.headers['idempotency-key'],
-    });
-    return writeJson(response, 202, generation);
-  }
-
   const generationMatch = path.match(/^\/generations\/([^/]+)$/);
   if (request.method === 'GET' && generationMatch) {
     const generation = await repository.getGeneration(
@@ -116,9 +101,13 @@ function mapError(error) {
   if (error instanceof HttpError) return error;
 
   if (
-    ['PROJECT_NOT_FOUND', 'GENERATION_NOT_FOUND', 'REVISION_NOT_FOUND'].includes(
-      error.code,
-    )
+    [
+      'PROJECT_NOT_FOUND',
+      'GENERATION_NOT_FOUND',
+      'REVISION_NOT_FOUND',
+      'TURN_NOT_FOUND',
+      'ASSET_NOT_FOUND',
+    ].includes(error.code)
   ) {
     return new HttpError(404, error.code, error.message);
   }
@@ -130,10 +119,7 @@ function mapError(error) {
   if (
     [
       'REVISION_CONFLICT',
-      'IDEMPOTENCY_CONFLICT',
-      'PROJECT_BUSY',
       'CANDIDATE_SELECTION_ERROR',
-      'INVALID_GENERATION_TRANSITION',
       'PROJECT_EXISTS',
     ].includes(error.code)
   ) {

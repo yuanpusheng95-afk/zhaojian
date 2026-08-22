@@ -235,6 +235,7 @@ git diff --stat src/domain/photo-state.mjs test/photo-state.test.mjs   # 必须�
 **Files:**
 - Create: `migrations/006_agent_turns.sql`、`007_generations.sql`、`008_projects_turns.sql`、`009_drop_legacy.sql`
 - Modify: `src/domain/generation-lifecycle.mjs`（Task 2 暂留的终态化在此落地）
+- Modify: `src/domain/photo-project-service.mjs`（新增 `TurnNotFoundError`；删除 Task 2 暂留的四个错误类——此刻最后一个 import 方随本任务消失）
 - Modify: `src/infrastructure/postgres/photo-project-repository.mjs`
 - Modify: `test-integration/postgres-repository.test.mjs`（22 例 → 新套件）
 
@@ -413,6 +414,23 @@ npm test && npm run test:integration && npm run check
 - **每个 Task 结束时 `npm test` 与 `npm run test:integration` 都必须绿**——本切片没有计划内的红灯窗口
 - 外键守护用例（Task 3 用例 15）断言的是「删除被拒绝」，不是级联删除——实测 projects 域 14 个外键均为 NO ACTION
 - 2a 的四个交付（探针、对象存储、ImagesProvider、telemetry）零改动、测试零回归
+
+## 实施后回填（review 结论）
+
+实现完成并通过评审，以下三处以**实现**为准，本计划的对应描述已过时：
+
+1. **约束清单漏了主键。** 「既有约束名清单」没列 `generation_jobs_pkey`，实现里补了 `RENAME CONSTRAINT ... TO generations_pkey`。实测最终 schema 零个带 `generation_jobs` 的对象残留。
+2. **`InvalidGenerationRequestError` 不删。** Task 2 的删除清单有它，但它在三处被真实使用（repository 的 `turnId` 校验与 `outcome` 校验、domain 的参数校验）。删了就得另造一个等价物。
+3. **candidate 的 content type 走 `metadata` 而非独立的 `contentType` 字段。** Task 3 的 Interfaces 写的是 `candidate: { assetId, uri, contentType }`，实现按 spec §6.2「content type 存入 `assets.metadata_json`」处理，更准。
+
+评审发现并已修复的一处：
+
+4. **错误建模不一致 → 已修。** `inputAssetId` 缺失原本抛的是裸 `Error` 挂 `code`，而同一函数里 turn 缺失抛的是类型化的 `TurnNotFoundError`。后果具体：`server.mjs` 的 `mapError` 按 `error.code` 分派，未登记的 code 会落到 **500**，而语义上是 404。已新增 `AssetNotFoundError extends DomainError`，并把 `TURN_NOT_FOUND`（同样未登记）与 `ASSET_NOT_FOUND` 一并加入 404 清单，配套集成用例断言错误类型而非仅断言抛错。
+
+未修复、仅记录的两处：
+
+5. **`inputAssetId` 只校验全局存在，不校验归属该 project**，而同一函数里 `turnId` 是连 `project_id` 一起查的。严格程度不对称——理论上可拿别的 project 的 asset 作基准图。MVP 阶段调用方是自己人，2c 的 tools 接线时应连带收紧。
+6. **校验顺序与本计划不同。** 计划写「turn → inputAsset → revision 一致性」，实现是「revision 一致性 → turn → inputAsset」。都不算错，但当 revision 过期**且** turn 不存在时返回的错误不同。
 
 ## 下一步
 

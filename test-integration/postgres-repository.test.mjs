@@ -4,24 +4,12 @@ import { after, beforeEach, test } from 'node:test';
 import pg from 'pg';
 
 import {
-  ProjectBusyError,
+  AssetNotFoundError,
   RevisionConflictError,
+  TurnNotFoundError,
 } from '../src/domain/photo-project-service.mjs';
-import {
-  EditInterpretationFailedError,
-  EditInterpreter,
-} from '../src/application/edit-interpreter.mjs';
-import { MockLanguageModel } from '../src/application/mock-language-model.mjs';
 import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
-import {
-  GenerationLeaseLostError,
-  PostgresPhotoProjectRepository,
-  ProviderJobConflictError,
-} from '../src/infrastructure/postgres/photo-project-repository.mjs';
-import { PostgresGenerationQueue } from '../src/infrastructure/postgres/generation-queue.mjs';
-import { GenerationWorker } from '../src/worker/generation-worker.mjs';
-import { MockImageProvider } from '../src/worker/mock-image-provider.mjs';
-import { createApiServer } from '../src/api/server.mjs';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -58,7 +46,7 @@ function createRepository() {
   return new PostgresPhotoProjectRepository({
     pool,
     idFactory: createIdFactory(),
-    now: () => '2026-08-19T06:40:00.000Z',
+    now: () => new Date('2026-08-19T06:40:00Z'),
   });
 }
 
@@ -91,1000 +79,420 @@ function editPatch(value = 'ivory coat') {
   };
 }
 
-async function createProject(repository) {
+async function createProject(repository, projectId = 'project_1') {
   return repository.createProject({
-    projectId: 'project_1',
+    projectId,
     name: 'Autumn portrait',
     initialState: initialState(),
-    anchorAssetId: 'asset_source',
+    anchorAsset: {
+      assetId: `asset_source_${projectId}`,
+      uri: `s3://photo-agent/source/${projectId}.jpg`,
+      metadata: { source: 'upload' },
+    },
   });
 }
 
-test('migration creates the persistence tables', async () => {
-  const result = await pool.query(`
+async function createTurn(projectId, turnId) {
+  await pool.query(
+    `INSERT INTO agent_turns
+      (id, project_id, user_message, idempotency_key, status, created_at, updated_at)
+     VALUES ($1, $2, 'make the coat ivory', $3, 'running', now(), now())`,
+    [turnId, projectId, `${turnId}-key`],
+  );
+}
+
+function completedOutcome(candidateId = 'candidate_1') {
+  return {
+    kind: 'completed',
+    candidate: {
+      candidateId,
+      assetId: `asset_${candidateId}`,
+      uri: `s3://photo-agent/generated/${candidateId}.jpg`,
+      metadata: { model: 'gpt-image-2' },
+      verification: { passed: true },
+    },
+  };
+}
+
+async function createCompletedGeneration(repository, {
+  projectId = 'project_1',
+  turnId = 'turn_1',
+  generationId = 'generation_1',
+  candidateId = 'candidate_1',
+} = {}) {
+  await createTurn(projectId, turnId);
+  const generation = await repository.recordGeneration({
+    projectId,
+    turnId,
+    baseRevisionId: 'revision_1',
+    inputAssetId: `asset_source_${projectId}`,
+    patch: editPatch(),
+    renderPrompt: 'ivory coat, same identity',
+    outcome: completedOutcome(candidateId),
+  });
+  assert.equal(generation.id, generationId);
+  return generation;
+}
+
+test('migration creates the turn schema and key constraints', async () => {
+  const tables = await pool.query(`
     SELECT table_name
     FROM information_schema.tables
     WHERE table_schema = 'public'
     ORDER BY table_name
   `);
+  assert.ok(tables.rows.map(({ table_name }) => table_name).includes('agent_turns'));
+  assert.ok(!tables.rows.map(({ table_name }) => table_name).includes('generation_jobs'));
+  assert.ok(!tables.rows.map(({ table_name }) => table_name).includes('idempotency_requests'));
 
-  assert.deepEqual(
-    result.rows.map((row) => row.table_name),
-    [
-      'agent_session_entries',
-      'agent_session_facts',
-      'agent_session_ids',
-      'agent_session_lane_moves',
-      'agent_session_lanes',
-      'agent_session_records',
-      'agent_session_sequences',
-      'agent_sessions',
-      'assets',
-      'generation_jobs',
-      'generation_outputs',
-      'idempotency_requests',
-      'photo_revisions',
-      'projects',
-      'schema_migrations',
-    ],
-  );
+  const turnUnique = await pool.query(`
+    SELECT 1 FROM pg_indexes
+    WHERE tablename = 'agent_turns'
+      AND indexdef LIKE 'CREATE UNIQUE INDEX%'
+      AND indexdef LIKE '%project_id%'
+      AND indexdef LIKE '%idempotency_key%'
+  `);
+  const statusCheck = await pool.query(`
+    SELECT pg_get_constraintdef(oid) AS constraint_definition
+    FROM pg_constraint
+    WHERE conrelid = 'generations'::regclass
+      AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%status%'
+  `);
+  const projectColumns = await pool.query(`
+    SELECT column_name, column_default FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'projects'
+  `);
+  const columns = new Map(projectColumns.rows.map(({ column_name, column_default }) => [column_name, column_default]));
+
+  assert.equal(turnUnique.rowCount, 1);
+  assert.match(statusCheck.rows[0].constraint_definition, /completed/);
+  assert.match(statusCheck.rows[0].constraint_definition, /failed/);
+  assert.equal(columns.get('owner_id'), "'dev'::text");
+  assert.ok(columns.has('running_turn_id'));
 });
 
-test('creates a project and its initial revision atomically', async () => {
+test('createProject writes owner and anchor asset uri and metadata', async () => {
   const repository = createRepository();
   const project = await createProject(repository);
   const revision = await repository.getRevision(project.activeRevisionId);
+  const asset = await pool.query('SELECT * FROM assets WHERE id = $1', [
+    'asset_source_project_1',
+  ]);
 
-  assert.equal(project.id, 'project_1');
-  assert.equal(project.runningGenerationId, null);
-  assert.equal(revision.projectId, project.id);
-  assert.equal(revision.parentRevisionId, null);
-  assert.equal(revision.anchorAssetId, 'asset_source');
-  assert.deepEqual(revision.state, initialState());
+  assert.equal(project.ownerId, 'dev');
+  assert.equal(project.runningTurnId, null);
+  assert.equal(revision.anchorAssetId, 'asset_source_project_1');
+  assert.equal(asset.rows[0].uri, 's3://photo-agent/source/project_1.jpg');
+  assert.deepEqual(asset.rows[0].metadata_json, { source: 'upload' });
 });
 
-test('persists idempotency, stale-revision checks, and the project generation lock', async () => {
+test('recordGeneration records a completed generation in one transaction', async () => {
   const repository = createRepository();
-  const project = await createProject(repository);
-  const request = {
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+
+  const generation = await repository.recordGeneration({
+    projectId: 'project_1',
+    turnId: 'turn_1',
+    baseRevisionId: 'revision_1',
+    inputAssetId: 'asset_source_project_1',
     patch: editPatch(),
+    renderPrompt: 'ivory coat, same identity',
+    outcome: completedOutcome(),
+  });
+  const output = await pool.query(
+    'SELECT * FROM generation_outputs WHERE generation_id = $1',
+    [generation.id],
+  );
+  const asset = await pool.query('SELECT * FROM assets WHERE id = $1', [
+    'asset_candidate_1',
+  ]);
+
+  assert.equal(generation.status, 'completed');
+  assert.equal(generation.turnId, 'turn_1');
+  assert.equal(generation.inputAssetId, 'asset_source_project_1');
+  assert.equal(generation.renderPrompt, 'ivory coat, same identity');
+  assert.equal(output.rowCount, 1);
+  assert.equal(asset.rows[0].uri, 's3://photo-agent/generated/candidate_1.jpg');
+  assert.deepEqual(asset.rows[0].metadata_json, { model: 'gpt-image-2' });
+});
+
+test('recordGeneration records a failed generation with error json', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+
+  const generation = await repository.recordGeneration({
+    projectId: 'project_1',
+    turnId: 'turn_1',
+    baseRevisionId: 'revision_1',
+    inputAssetId: 'asset_source_project_1',
+    patch: editPatch(),
+    outcome: { kind: 'failed', error: { message: 'provider failed' } },
+  });
+
+  assert.equal(generation.status, 'failed');
+  assert.deepEqual(generation.error, { message: 'provider failed' });
+  assert.equal(generation.candidates.length, 0);
+});
+
+test('recordGeneration rejects a stale base revision', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+
+  await assert.rejects(
+    repository.recordGeneration({
+      projectId: 'project_1',
+      turnId: 'turn_1',
+      baseRevisionId: 'revision_stale',
+      inputAssetId: 'asset_source_project_1',
+      patch: editPatch(),
+      outcome: completedOutcome(),
+    }),
+    RevisionConflictError,
+  );
+});
+
+test('recordGeneration rejects a missing or foreign turn', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createProject(repository, 'project_2');
+  await createTurn('project_2', 'foreign_turn');
+
+  await assert.rejects(
+    repository.recordGeneration({
+      projectId: 'project_1',
+      turnId: 'missing_turn',
+      baseRevisionId: 'revision_1',
+      inputAssetId: 'asset_source_project_1',
+      patch: editPatch(),
+      outcome: completedOutcome(),
+    }),
+    TurnNotFoundError,
+  );
+  await assert.rejects(
+    repository.recordGeneration({
+      projectId: 'project_1',
+      turnId: 'foreign_turn',
+      baseRevisionId: 'revision_1',
+      inputAssetId: 'asset_source_project_1',
+      patch: editPatch(),
+      outcome: completedOutcome(),
+    }),
+    TurnNotFoundError,
+  );
+});
+
+test('recordGeneration rejects an unknown input asset with a typed domain error', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+
+  await assert.rejects(
+    () =>
+      repository.recordGeneration({
+        projectId: 'project_1',
+        turnId: 'turn_1',
+        baseRevisionId: 'revision_1',
+        inputAssetId: 'asset_does_not_exist',
+        patch: editPatch(),
+        outcome: completedOutcome(),
+      }),
+    (error) => {
+      // 必须是类型化领域错误，不是裸 Error 挂 code——后者会在 API 层落到 500
+      assert.equal(error.name, 'AssetNotFoundError');
+      assert.equal(error.code, 'ASSET_NOT_FOUND');
+      return true;
+    },
+  );
+});
+
+test('recordGeneration rejects an invalid patch', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+
+  await assert.rejects(
+    repository.recordGeneration({
+      projectId: 'project_1',
+      turnId: 'turn_1',
+      baseRevisionId: 'revision_1',
+      inputAssetId: 'asset_source_project_1',
+      patch: { modify: [{ path: 'not.allowed', operation: 'replace', value: 1 }], preserve: [] },
+      outcome: completedOutcome(),
+    }),
+    (error) => ['INVALID_STATE_PATCH', 'UNSAFE_STATE_PATH'].includes(error.code),
+  );
+});
+
+test('recordGeneration allows identical patches twice in one turn', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+  const request = {
+    projectId: 'project_1',
+    turnId: 'turn_1',
+    baseRevisionId: 'revision_1',
+    inputAssetId: 'asset_source_project_1',
+    patch: editPatch(),
+    outcome: completedOutcome(),
   };
 
-  const first = await repository.requestGeneration(request);
-  const repeated = await repository.requestGeneration(request);
-
-  assert.equal(repeated.id, first.id);
-  assert.equal(first.status, 'queued');
-  assert.equal(first.proposedState.appearance.outfit, 'ivory coat');
-
-  await assert.rejects(
-    repository.requestGeneration({
-      ...request,
-      idempotencyKey: 'edit-2',
-    }),
-    ProjectBusyError,
-  );
-
-  await repository.transitionGeneration({
-    generationId: first.id,
-    to: 'failed',
+  const first = await repository.recordGeneration({
+    ...request,
+    outcome: completedOutcome('candidate_1'),
+  });
+  const second = await repository.recordGeneration({
+    ...request,
+    outcome: completedOutcome('candidate_2'),
   });
 
-  await assert.rejects(
-    repository.requestGeneration({
-      ...request,
-      baseRevisionId: 'revision_stale',
-      idempotencyKey: 'edit-3',
-    }),
-    RevisionConflictError,
-  );
+  assert.notEqual(second.id, first.id);
+  assert.equal(first.status, 'completed');
+  assert.equal(second.status, 'completed');
 });
 
-test('serializes concurrent generation requests for one project', async () => {
+test('selectCandidate switches the active revision atomically', async () => {
   const repository = createRepository();
-  const project = await createProject(repository);
-
-  const results = await Promise.allSettled([
-    repository.requestGeneration({
-      projectId: project.id,
-      baseRevisionId: project.activeRevisionId,
-      idempotencyKey: 'edit-a',
-      patch: editPatch('ivory coat'),
-    }),
-    repository.requestGeneration({
-      projectId: project.id,
-      baseRevisionId: project.activeRevisionId,
-      idempotencyKey: 'edit-b',
-      patch: editPatch('red coat'),
-    }),
-  ]);
-
-  assert.equal(
-    results.filter((result) => result.status === 'fulfilled').length,
-    1,
-  );
-  const rejected = results.find((result) => result.status === 'rejected');
-  assert.ok(rejected.reason instanceof ProjectBusyError);
-});
-
-test('creates and activates a revision only when a completed candidate is selected', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  });
-
-  for (const status of [
-    'preparing',
-    'submitted',
-    'provider_processing',
-    'verifying',
-  ]) {
-    await repository.transitionGeneration({
-      generationId: generation.id,
-      to: status,
-    });
-  }
-  await repository.addCandidate({
-    generationId: generation.id,
-    candidateId: 'candidate_1',
-    assetId: 'asset_generated_1',
-    verification: { identity: { status: 'pass', score: 0.93 } },
-  });
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'completed',
-  });
-
-  assert.equal((await repository.listRevisions(project.id)).length, 1);
+  await createProject(repository);
+  const generation = await createCompletedGeneration(repository);
 
   const revision = await repository.selectCandidate({
-    projectId: project.id,
+    projectId: 'project_1',
     generationId: generation.id,
     candidateId: 'candidate_1',
   });
-  const updatedProject = await repository.getProject(project.id);
+  const project = await repository.getProject('project_1');
 
-  assert.equal(revision.parentRevisionId, project.activeRevisionId);
-  assert.equal(revision.anchorAssetId, 'asset_generated_1');
-  assert.equal(revision.state.appearance.outfit, 'ivory coat');
-  assert.equal(updatedProject.activeRevisionId, revision.id);
-  assert.equal((await repository.listRevisions(project.id)).length, 2);
+  assert.equal(revision.sourceGenerationId, generation.id);
+  assert.equal(revision.anchorAssetId, 'asset_candidate_1');
+  assert.equal(project.activeRevisionId, revision.id);
+});
 
-  const repeated = await repository.selectCandidate({
-    projectId: project.id,
+test('selectCandidate is idempotent for the same candidate', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  const generation = await createCompletedGeneration(repository);
+
+  const first = await repository.selectCandidate({
+    projectId: 'project_1',
     generationId: generation.id,
     candidateId: 'candidate_1',
   });
-  assert.equal(repeated.id, revision.id);
-});
-
-
-test('claims queued generations exactly once with SKIP LOCKED semantics', async () => {
-  const repository = createRepository();
-  const firstProject = await repository.createProject({
-    projectId: 'project_queue_1',
-    name: 'First queue project',
-    initialState: initialState(),
-  });
-  const secondProject = await repository.createProject({
-    projectId: 'project_queue_2',
-    name: 'Second queue project',
-    initialState: initialState(),
-  });
-  await repository.requestGeneration({
-    projectId: firstProject.id,
-    baseRevisionId: firstProject.activeRevisionId,
-    idempotencyKey: 'queue-1',
-    patch: editPatch(),
-  });
-  await repository.requestGeneration({
-    projectId: secondProject.id,
-    baseRevisionId: secondProject.activeRevisionId,
-    idempotencyKey: 'queue-2',
-    patch: editPatch(),
-  });
-
-  const queue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:41:00.000Z',
-  });
-  const [first, second] = await Promise.all([
-    queue.claimNext(),
-    queue.claimNext(),
-  ]);
-
-  assert.notEqual(first.id, second.id);
-  assert.equal(first.status, 'preparing');
-  assert.equal(second.status, 'preparing');
-  assert.equal(await queue.claimNext(), null);
-});
-
-test('mock worker completes a generation but leaves revision creation to the user', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'worker-1',
-    patch: editPatch(),
-  });
-  const queue = new PostgresGenerationQueue({ pool, repository });
-  const worker = new GenerationWorker({
-    queue,
-    repository,
-    provider: new MockImageProvider(),
-  });
-
-  const completed = await worker.runOnce();
-  const updatedProject = await repository.getProject(project.id);
-
-  assert.equal(completed.id, generation.id);
-  assert.equal(completed.status, 'completed');
-  assert.equal(completed.candidates.length, 1);
-  assert.equal(completed.candidates[0].assetId, `asset_${generation.id}`);
-  assert.equal(updatedProject.runningGenerationId, null);
-  assert.equal(updatedProject.activeRevisionId, project.activeRevisionId);
-  assert.equal((await repository.listRevisions(project.id)).length, 1);
-});
-
-test('worker marks a provider failure and releases the project generation lock', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'worker-failure',
-    patch: editPatch(),
-  });
-  const queue = new PostgresGenerationQueue({ pool, repository });
-  const worker = new GenerationWorker({
-    queue,
-    repository,
-    provider: {
-      capability: 'image_generation',
-      providerName: 'failing',
-      modelName: 'failing-image-v1',
-      async submit() {
-        return { jobId: 'failing_job_1' };
-      },
-      async waitForResult() {
-        throw new Error('provider unavailable');
-      },
-    },
-  });
-
-  const failed = await worker.runOnce();
-  const updatedProject = await repository.getProject(project.id);
-
-  assert.equal(failed.id, generation.id);
-  assert.equal(failed.status, 'failed');
-  assert.deepEqual(failed.error, { message: 'provider unavailable' });
-  assert.equal(updatedProject.runningGenerationId, null);
-});
-
-
-test('HTTP API exposes the persisted generation and selection vertical slice', async (t) => {
-  const repository = createRepository();
-  const server = createApiServer({ repository });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-  const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-
-  let response = await fetch(`${baseUrl}/projects`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      projectId: 'project_api',
-      name: 'API portrait',
-      initialState: initialState(),
-      anchorAssetId: 'asset_api_source',
-    }),
-  });
-  assert.equal(response.status, 201);
-  const project = await response.json();
-
-  response = await fetch(`${baseUrl}/projects/${project.id}/generations`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'idempotency-key': 'api-edit-1',
-    },
-    body: JSON.stringify({
-      baseRevisionId: project.activeRevisionId,
-      patch: editPatch(),
-    }),
-  });
-  assert.equal(response.status, 202);
-  const generation = await response.json();
-  assert.equal(generation.status, 'queued');
-
-  const worker = new GenerationWorker({
-    queue: new PostgresGenerationQueue({ pool, repository }),
-    repository,
-    provider: new MockImageProvider(),
-  });
-  await worker.runOnce();
-
-  response = await fetch(`${baseUrl}/generations/${generation.id}`);
-  assert.equal(response.status, 200);
-  const completed = await response.json();
-  assert.equal(completed.status, 'completed');
-  assert.equal(completed.candidates.length, 1);
-
-  response = await fetch(
-    `${baseUrl}/projects/${project.id}/generations/${generation.id}/selections`,
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ candidateId: completed.candidates[0].id }),
-    },
-  );
-  assert.equal(response.status, 201);
-  const revision = await response.json();
-
-  response = await fetch(`${baseUrl}/projects/${project.id}`);
-  assert.equal(response.status, 200);
-  const updatedProject = await response.json();
-  assert.equal(updatedProject.activeRevisionId, revision.id);
-});
-
-test('HTTP API maps domain conflicts and invalid JSON without leaking internals', async (t) => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const server = createApiServer({ repository });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-  const address = server.address();
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-
-  let response = await fetch(`${baseUrl}/projects/${project.id}/generations`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'idempotency-key': 'api-stale',
-    },
-    body: JSON.stringify({
-      baseRevisionId: 'revision_stale',
-      patch: editPatch(),
-    }),
-  });
-  assert.equal(response.status, 409);
-  assert.deepEqual(await response.json(), {
-    error: {
-      code: 'REVISION_CONFLICT',
-      message:
-        'Revision conflict for project project_1: expected revision_stale, active revision_1',
-    },
-  });
-
-  response = await fetch(`${baseUrl}/projects`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: '{broken',
-  });
-  assert.equal(response.status, 400);
-  assert.deepEqual(await response.json(), {
-    error: { code: 'INVALID_JSON', message: 'Request body is not valid JSON' },
-  });
-
-  response = await fetch(`${baseUrl}/projects`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      projectId: project.id,
-      name: 'Duplicate project',
-      initialState: initialState(),
-    }),
-  });
-  assert.equal(response.status, 409);
-  assert.deepEqual(await response.json(), {
-    error: {
-      code: 'RESOURCE_CONFLICT',
-      message: 'Resource already exists',
-    },
-  });
-});
-
-
-test('migration adds generation lease fields', async () => {
-  const result = await pool.query(`
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'generation_jobs'
-      AND column_name IN (
-        'claim_token',
-        'claimed_at',
-        'lease_expires_at',
-        'attempt_count'
-      )
-    ORDER BY column_name
-  `);
-
-  assert.deepEqual(
-    result.rows.map((row) => row.column_name),
-    ['attempt_count', 'claim_token', 'claimed_at', 'lease_expires_at'],
-  );
-});
-
-test('reclaims an expired generation and rejects writes from the stale worker', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'lease-reclaim',
-    patch: editPatch(),
-  });
-  const firstQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:00.000Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_old',
-  });
-  const firstClaim = await firstQueue.claimNext();
-
-  await repository.transitionGeneration({
+  const second = await repository.selectCandidate({
+    projectId: 'project_1',
     generationId: generation.id,
-    to: 'submitted',
-    claimToken: firstClaim.leaseToken,
-  });
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'provider_processing',
-    claimToken: firstClaim.leaseToken,
-  });
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'verifying',
-    claimToken: firstClaim.leaseToken,
-  });
-  await repository.addCandidate({
-    generationId: generation.id,
-    candidateId: 'candidate_abandoned',
-    assetId: 'asset_abandoned',
-    claimToken: firstClaim.leaseToken,
+    candidateId: 'candidate_1',
   });
 
-  const recoveryQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:02.000Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_new',
-  });
-  const recovered = await recoveryQueue.claimNext();
+  assert.equal(second.id, first.id);
+});
 
-  assert.equal(recovered.id, generation.id);
-  assert.equal(recovered.status, 'preparing');
-  assert.equal(recovered.leaseToken, 'lease_new');
-  assert.equal(recovered.attemptCount, 2);
-  assert.equal(recovered.candidates.length, 0);
+test('selectCandidate rejects a different candidate after selection', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  const generation = await createCompletedGeneration(repository);
+  await repository.selectCandidate({
+    projectId: 'project_1',
+    generationId: generation.id,
+    candidateId: 'candidate_1',
+  });
 
   await assert.rejects(
-    repository.transitionGeneration({
+    repository.selectCandidate({
+      projectId: 'project_1',
       generationId: generation.id,
-      to: 'submitted',
-      claimToken: firstClaim.leaseToken,
+      candidateId: 'candidate_2',
     }),
-    GenerationLeaseLostError,
+    (error) => error.code === 'CANDIDATE_SELECTION_ERROR',
   );
+});
+
+test('selectCandidate rejects a stale input revision', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_2');
+  const first = await createCompletedGeneration(repository, {
+    turnId: 'turn_1',
+    generationId: 'generation_1',
+    candidateId: 'candidate_1',
+  });
+  const second = await repository.recordGeneration({
+    projectId: 'project_1',
+    turnId: 'turn_2',
+    baseRevisionId: 'revision_1',
+    inputAssetId: 'asset_source_project_1',
+    patch: editPatch('wool coat'),
+    outcome: completedOutcome('candidate_2'),
+  });
+  await repository.selectCandidate({
+    projectId: 'project_1',
+    generationId: first.id,
+    candidateId: 'candidate_1',
+  });
   await assert.rejects(
-    repository.addCandidate({
-      generationId: generation.id,
-      candidateId: 'candidate_stale',
-      assetId: 'asset_stale',
-      claimToken: firstClaim.leaseToken,
-    }),
-    GenerationLeaseLostError,
-  );
-  assert.equal('leaseToken' in (await repository.getGeneration(generation.id)), false);
-
-  const submitted = await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'submitted',
-    claimToken: recovered.leaseToken,
-  });
-  assert.equal(submitted.status, 'submitted');
-});
-
-test('renews a lease so another worker cannot reclaim it early', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'lease-renew',
-    patch: editPatch(),
-  });
-  let now = '2026-08-19T06:40:00.000Z';
-  const queue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => now,
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_renewed',
-  });
-  const claimed = await queue.claimNext();
-
-  now = '2026-08-19T06:40:00.500Z';
-  const renewed = await queue.renewLease({
-    generationId: generation.id,
-    claimToken: claimed.leaseToken,
-  });
-  assert.equal(renewed.leaseExpiresAt, '2026-08-19T06:40:01.500Z');
-
-  const earlyQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:01.200Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_too_early',
-  });
-  assert.equal(await earlyQueue.claimNext(), null);
-
-  const lateQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:01.600Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_after_expiry',
-  });
-  const reclaimed = await lateQueue.claimNext();
-  assert.equal(reclaimed.leaseToken, 'lease_after_expiry');
-  assert.equal(reclaimed.attemptCount, 2);
-});
-
-test('fails an expired generation after max attempts and releases the project lock', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'lease-exhausted',
-    patch: editPatch(),
-  });
-
-  const firstQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:00.000Z',
-    leaseDurationMs: 1_000,
-    maxAttempts: 2,
-    tokenFactory: () => 'lease_attempt_1',
-  });
-  await firstQueue.claimNext();
-
-  const secondQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:02.000Z',
-    leaseDurationMs: 1_000,
-    maxAttempts: 2,
-    tokenFactory: () => 'lease_attempt_2',
-  });
-  await secondQueue.claimNext();
-
-  const exhaustedQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:04.000Z',
-    leaseDurationMs: 1_000,
-    maxAttempts: 2,
-    tokenFactory: () => 'lease_attempt_3',
-  });
-  assert.equal(await exhaustedQueue.claimNext(), null);
-
-  const failed = await repository.getGeneration(generation.id);
-  const updatedProject = await repository.getProject(project.id);
-  assert.equal(failed.status, 'failed');
-  assert.deepEqual(failed.error, {
-    message: 'Generation lease exhausted after 2 attempts',
-  });
-  assert.equal(updatedProject.runningGenerationId, null);
-});
-
-test('migration adds persisted provider job fields', async () => {
-  const result = await pool.query(`
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'generation_jobs'
-      AND column_name IN (
-        'provider_name',
-        'provider_job_id',
-        'provider_submitted_at'
-      )
-    ORDER BY column_name
-  `);
-
-  assert.deepEqual(
-    result.rows.map((row) => row.column_name),
-    ['provider_job_id', 'provider_name', 'provider_submitted_at'],
-  );
-});
-
-test('migration adds persisted provider model identity', async () => {
-  const result = await pool.query(`
-    SELECT column_name, is_nullable
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'generation_jobs'
-      AND column_name = 'provider_model'
-  `);
-
-  assert.deepEqual(result.rows, [
-    { column_name: 'provider_model', is_nullable: 'YES' },
-  ]);
-});
-
-test('provider job binding is idempotent and cannot be replaced', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'provider-binding',
-    patch: editPatch(),
-  });
-  const queue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    tokenFactory: () => 'lease_provider_binding',
-  });
-  const claimed = await queue.claimNext();
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'submitted',
-    claimToken: claimed.leaseToken,
-  });
-
-  const first = await repository.recordProviderJob({
-    generationId: generation.id,
-    claimToken: claimed.leaseToken,
-    providerName: 'mock',
-    providerModel: 'mock-image-v1',
-    providerJobId: 'provider_job_fixed',
-  });
-  const repeated = await repository.recordProviderJob({
-    generationId: generation.id,
-    claimToken: claimed.leaseToken,
-    providerName: 'mock',
-    providerModel: 'mock-image-v1',
-    providerJobId: 'provider_job_fixed',
-  });
-
-  assert.equal(first.providerModel, 'mock-image-v1');
-  assert.deepEqual(repeated, first);
-  await assert.rejects(
-    repository.recordProviderJob({
-      generationId: generation.id,
-      claimToken: claimed.leaseToken,
-      providerName: 'mock',
-      providerModel: 'mock-image-v1',
-      providerJobId: 'provider_job_replacement',
-    }),
-    ProviderJobConflictError,
-  );
-  await assert.rejects(
-    repository.recordProviderJob({
-      generationId: generation.id,
-      claimToken: claimed.leaseToken,
-      providerName: 'mock',
-      providerModel: 'mock-image-v2',
-      providerJobId: 'provider_job_fixed',
-    }),
-    ProviderJobConflictError,
-  );
-  await assert.rejects(
-    repository.recordProviderJob({
-      generationId: generation.id,
-      claimToken: claimed.leaseToken,
-      providerName: 'mock',
-      providerModel: '',
-      providerJobId: 'provider_job_missing_model',
-    }),
-    /requires a non-empty provider model/,
-  );
-});
-
-test('reclaimed worker resumes the persisted provider job without duplicate submission', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'provider-resume',
-    patch: editPatch(),
-  });
-  const firstQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:00.000Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_provider_old',
-  });
-  const firstClaim = await firstQueue.claimNext();
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'submitted',
-    claimToken: firstClaim.leaseToken,
-  });
-  await repository.recordProviderJob({
-    generationId: generation.id,
-    claimToken: firstClaim.leaseToken,
-    providerName: 'mock',
-    providerModel: 'mock-image-v1',
-    providerJobId: 'provider_job_existing',
-  });
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'provider_processing',
-    claimToken: firstClaim.leaseToken,
-  });
-
-  const providerCalls = [];
-  const recoveryQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:02.000Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_provider_new',
-  });
-  const worker = new GenerationWorker({
-    queue: {
-      async claimNext() {
-        const reclaimed = await recoveryQueue.claimNext();
-        assert.equal(reclaimed.providerModel, 'mock-image-v1');
-        return reclaimed;
-      },
-    },
-    repository,
-    provider: {
-      capability: 'image_generation',
-      providerName: 'mock',
-      modelName: 'mock-image-v1',
-      async submit() {
-        providerCalls.push('submit');
-        throw new Error('must not submit an existing provider job');
-      },
-      async waitForResult({ jobId }) {
-        providerCalls.push(['waitForResult', jobId]);
-        return [
-          {
-            candidateId: 'candidate_provider_resumed',
-            assetId: 'asset_provider_resumed',
-          },
-        ];
-      },
-    },
-    heartbeatIntervalMs: 0,
-  });
-
-  const completed = await worker.runOnce();
-  const publicGeneration = await repository.getGeneration(generation.id);
-
-  assert.equal(completed.status, 'completed');
-  assert.deepEqual(providerCalls, [
-    ['waitForResult', 'provider_job_existing'],
-  ]);
-  assert.equal('providerJobId' in publicGeneration, false);
-  assert.equal('providerModel' in publicGeneration, false);
-});
-
-test('reclaimed worker resumes a legacy provider job without model identity', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const generation = await repository.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'legacy-provider-resume',
-    patch: editPatch(),
-  });
-  const firstQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:00.000Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_legacy_provider_old',
-  });
-  const firstClaim = await firstQueue.claimNext();
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'submitted',
-    claimToken: firstClaim.leaseToken,
-  });
-  await pool.query(
-    `UPDATE generation_jobs
-     SET provider_name = 'mock',
-         provider_job_id = 'legacy_provider_job',
-         provider_submitted_at = $2
-     WHERE id = $1`,
-    [generation.id, '2026-08-19T06:40:00.000Z'],
-  );
-  await repository.transitionGeneration({
-    generationId: generation.id,
-    to: 'provider_processing',
-    claimToken: firstClaim.leaseToken,
-  });
-
-  let submitCalls = 0;
-  const waitCalls = [];
-  const recoveryQueue = new PostgresGenerationQueue({
-    pool,
-    repository,
-    now: () => '2026-08-19T06:40:02.000Z',
-    leaseDurationMs: 1_000,
-    tokenFactory: () => 'lease_legacy_provider_new',
-  });
-  const worker = new GenerationWorker({
-    queue: {
-      async claimNext() {
-        const reclaimed = await recoveryQueue.claimNext();
-        assert.equal(reclaimed.providerModel, null);
-        return reclaimed;
-      },
-    },
-    repository,
-    provider: {
-      capability: 'image_generation',
-      providerName: 'mock',
-      modelName: 'mock-image-v1',
-      async submit() {
-        submitCalls += 1;
-        throw new Error('must not submit a legacy provider job');
-      },
-      async waitForResult({ jobId }) {
-        waitCalls.push(jobId);
-        return [
-          {
-            candidateId: 'candidate_legacy_provider_resumed',
-            assetId: 'asset_legacy_provider_resumed',
-          },
-        ];
-      },
-    },
-    heartbeatIntervalMs: 0,
-  });
-
-  const completed = await worker.runOnce();
-
-  assert.equal(completed.status, 'completed');
-  assert.equal(submitCalls, 0);
-  assert.deepEqual(waitCalls, ['legacy_provider_job']);
-});
-
-test('edit interpreter creates a persisted generation from a language model patch', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  let modelInput;
-  const interpreter = new EditInterpreter({
-    repository,
-    languageModel: new MockLanguageModel({
-      planner: async (input) => {
-        modelInput = input;
-        return editPatch('white linen coat');
-      },
-    }),
-  });
-
-  const generation = await interpreter.interpretAndRequestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'language-edit-1',
-    message: '换成白色亚麻外套，保持人物和背景',
-  });
-  const persisted = await repository.getGeneration(generation.id);
-
-  assert.equal(generation.status, 'queued');
-  assert.equal(modelInput.message, '换成白色亚麻外套，保持人物和背景');
-  assert.deepEqual(modelInput.photoState, initialState());
-  assert.deepEqual(persisted.patch, editPatch('white linen coat'));
-  assert.equal(persisted.proposedState.appearance.outfit, 'white linen coat');
-  assert.deepEqual(persisted.proposedState.constraints, [
-    { path: 'subject.identity', strength: 'hard', source: 'user' },
-    { path: 'scene.background', strength: 'hard', source: 'user' },
-  ]);
-});
-
-test('edit interpreter does not persist or lock a generation for an invalid model patch', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const interpreter = new EditInterpreter({
-    repository,
-    languageModel: new MockLanguageModel({
-      planner: async () => ({
-        modify: [
-          {
-            path: 'account.balance',
-            operation: 'replace',
-            value: 0,
-          },
-        ],
-        preserve: [],
-      }),
-    }),
-  });
-
-  await assert.rejects(
-    interpreter.interpretAndRequestGeneration({
-      projectId: project.id,
-      baseRevisionId: project.activeRevisionId,
-      idempotencyKey: 'language-edit-invalid',
-      message: '执行非法修改',
-    }),
-    EditInterpretationFailedError,
-  );
-
-  const generationCount = await pool.query(
-    'SELECT count(*)::int AS count FROM generation_jobs',
-  );
-  const persistedProject = await repository.getProject(project.id);
-  assert.equal(generationCount.rows[0].count, 0);
-  assert.equal(persistedProject.runningGenerationId, null);
-});
-
-test('edit interpreter preserves revision conflict when state changes during planning', async () => {
-  const repository = createRepository();
-  const project = await createProject(repository);
-  const interpreter = new EditInterpreter({
-    repository,
-    languageModel: new MockLanguageModel({
-      planner: async () => {
-        await pool.query(
-          `INSERT INTO photo_revisions
-            (id, project_id, parent_revision_id, state_json, anchor_asset_id,
-             source_generation_id, created_at)
-           VALUES ($1, $2, $3, $4, $5, NULL, $6)`,
-          [
-            'revision_concurrent',
-            project.id,
-            project.activeRevisionId,
-            {
-              ...initialState(),
-              appearance: { outfit: 'concurrent coat' },
-            },
-            'asset_source',
-            '2026-08-19T06:41:00.000Z',
-          ],
-        );
-        await pool.query(
-          `UPDATE projects
-           SET active_revision_id = $2, updated_at = $3
-           WHERE id = $1`,
-          [
-            project.id,
-            'revision_concurrent',
-            '2026-08-19T06:41:00.000Z',
-          ],
-        );
-        return editPatch('planned coat');
-      },
-    }),
-  });
-
-  await assert.rejects(
-    interpreter.interpretAndRequestGeneration({
-      projectId: project.id,
-      baseRevisionId: project.activeRevisionId,
-      idempotencyKey: 'language-edit-stale',
-      message: '换一件新外套',
+    repository.selectCandidate({
+      projectId: 'project_1',
+      generationId: second.id,
+      candidateId: 'candidate_2',
     }),
     RevisionConflictError,
   );
+});
 
-  const generationCount = await pool.query(
-    'SELECT count(*)::int AS count FROM generation_jobs',
+test('selectCandidate rejects cross-project generation', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createProject(repository, 'project_2');
+  const generation = await createCompletedGeneration(repository);
+
+  await assert.rejects(
+    repository.selectCandidate({
+      projectId: 'project_2',
+      generationId: generation.id,
+      candidateId: 'candidate_1',
+    }),
+    (error) => error.code === 'CANDIDATE_SELECTION_ERROR',
   );
-  assert.equal(generationCount.rows[0].count, 0);
+});
+
+test('foreign keys reject deleting a project that still has turns', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createCompletedGeneration(repository);
+
+  await assert.rejects(
+    pool.query('DELETE FROM projects WHERE id = $1', ['project_1']),
+    (error) => error.code === '23503',
+  );
+});
+
+test('read projections expose turn fields and omit legacy fields', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  const generation = await createCompletedGeneration(repository);
+  const revision = await repository.selectCandidate({
+    projectId: 'project_1',
+    generationId: generation.id,
+    candidateId: 'candidate_1',
+  });
+  const [readProject, readGeneration, revisions, generations] = await Promise.all([
+    repository.getProject('project_1'),
+    repository.getGeneration(generation.id),
+    repository.listRevisions('project_1'),
+    repository.listGenerations('project_1'),
+  ]);
+
+  assert.equal(readProject.ownerId, 'dev');
+  assert.equal(readProject.runningTurnId, null);
+  assert.equal(readGeneration.turnId, 'turn_1');
+  assert.equal(readGeneration.inputAssetId, 'asset_source_project_1');
+  assert.equal(readGeneration.renderPrompt, 'ivory coat, same identity');
+  assert.equal(readGeneration.operation, undefined);
+  assert.equal(readGeneration.idempotencyKey, undefined);
+  assert.equal(readGeneration.leaseToken, undefined);
+  assert.equal(readGeneration.providerName, undefined);
+  assert.equal(revisions.at(-1).id, revision.id);
+  assert.equal(generations.at(-1).id, generation.id);
 });

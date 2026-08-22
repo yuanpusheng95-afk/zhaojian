@@ -14,7 +14,6 @@
     "dev:down": "docker compose down",
     "db:migrate": "node src/infrastructure/postgres/migrate.mjs",
     "start:api": "node src/api/main.mjs",
-    "start:worker": "node src/worker/main.mjs",
     "smoke:image": "node --env-file=.env scripts/smoke-image.mjs"
   },
   "engines": {
