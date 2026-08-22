@@ -177,11 +177,16 @@ GET /projects/p1/turns/{turnId} → §13 的返回体（候选图带签名 URL�
 ## 4. 模型接线
 
 
-两条独立管道，均指向同一个 OpenAI 兼容中转站。
+**两条管道指向两个不同的供应商**（此前假设共用一个中转站，已按实际接入修正）：
+
+| 管道 | 供应商 | 模型 |
+|---|---|---|
+| 文本（Agent 大脑） | DeepSeek 官方 API | `deepseek-v4-flash-vision-exp` |
+| 图像 | OpenAI 兼容中转站 | `gpt-image-2` |
 
 ### 4.1 文本（Agent 的大脑）
 
-模板照搬 pi 内置的 OpenAI 兼容供应商（`src/providers/deepseek.ts`，14 行）：
+模板照搬 pi 内置的 OpenAI 兼容供应商（`src/providers/deepseek.ts`，14 行）。**不能直接用 `deepseekProvider()`**——pi 的模型目录是构建时从供应商拉取生成的，`-exp` 这类新模型不在快照里，`getModel()` 会返回 undefined。手写 Model 字面量：
 
 ```js
 import { createProvider, createModels, envApiKeyAuth } from '@earendil-works/pi-ai';
@@ -189,20 +194,33 @@ import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completio
 
 const models = createModels();
 models.setProvider(createProvider({
-  id: 'relay',
-  name: 'Relay',
-  baseUrl: process.env.RELAY_BASE_URL,
-  auth: { apiKey: envApiKeyAuth('Relay API key', ['RELAY_API_KEY']) },
-  models: [ /* Model：api:'openai-completions', baseUrl, input:['text','image'], cost, ... */ ],
+  id: 'deepseek',
+  name: 'DeepSeek',
+  baseUrl: process.env.LLM_BASE_URL,
+  auth: { apiKey: envApiKeyAuth('DeepSeek API key', ['LLM_API_KEY']) },
+  models: [{
+    id: process.env.LLM_MODEL,
+    name: 'DeepSeek Vision',
+    api: 'openai-completions',
+    provider: 'deepseek',
+    baseUrl: process.env.LLM_BASE_URL,
+    input: ['text', 'image'],        // ← 自评看图的前提
+    reasoning: false,
+    contextWindow: 128000,
+    maxTokens: 8192,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  }],
   api: openAICompletionsApi(),
 }));
 ```
 
-模型必须 `input` 含 `'image'`——Agent 需要看见生成的图做自评（§5.4）。
+模型必须同时满足两个条件：**`input` 含 `'image'`**（Agent 要看见生成的图做自评，§5.4）与**支持 function calling**（否则整个 agent 循环不成立）。
+
+**assumption：`deepseek-v4-flash-vision-exp` 同时具备这两项能力，由使用者确认，未经本设计实测。** 该模型带 `-exp` 后缀，属实验版本，存在下线或行为变更风险；届时只需改 `LLM_MODEL` 与 `input` 声明，Tools 与 Worker 侧不受影响。
 
 ### 4.2 图像
 
-中转站走 OpenAI 官方 Images API（`/v1/images/generations`、`/v1/images/edits`），pi 内置的 `openrouter-images` 走的是 `chat.completions` + `modalities`，格式不匹配，因此**必须写自定义 provider**。
+图像中转站走 OpenAI 官方 Images API（`/v1/images/generations`、`/v1/images/edits`），pi 内置的 `openrouter-images` 走的是 `chat.completions` + `modalities`，格式不匹配，因此**必须写自定义 provider**。
 
 `ImagesApi` 的类型是 `KnownImagesApi | (string & {})`——开放字符串，允许自定义 api id：
 
@@ -212,13 +230,13 @@ import { createImagesModels, createImagesProvider } from '@earendil-works/pi-ai'
 const imagesModels = createImagesModels();
 imagesModels.setProvider(createImagesProvider({
   id: 'relay',
-  auth: { apiKey: envApiKeyAuth('Relay API key', ['RELAY_API_KEY']) },
+  auth: { apiKey: envApiKeyAuth('Image relay API key', ['IMAGE_API_KEY']) },
   models: [{
     id: 'gpt-image-2',
     name: 'GPT Image 2',
     api: 'relay-openai-images',
     provider: 'relay',
-    baseUrl: process.env.RELAY_BASE_URL,
+    baseUrl: process.env.IMAGE_BASE_URL,
     input: ['text', 'image'],
     output: ['image'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -1048,10 +1066,12 @@ if (error.code === '23505') return new HttpError(409, 'RESOURCE_CONFLICT', ...)
 
 | 变量 | 默认值 | 用途 | 缺失时行为 |
 |---|---|---|---|
-| `RELAY_BASE_URL` | 无 | 中转站 base URL，文本与图像共用 | Worker 启动失败 |
-| `RELAY_API_KEY` | 无 | 中转站 API key | Worker 启动失败 |
-| `RELAY_TEXT_MODEL` | **无** | Agent 大脑模型 id | 启动失败 |
-| `RELAY_IMAGE_MODEL` | `gpt-image-2` | 图像模型 id | 用默认值 |
+| `LLM_BASE_URL` | `https://api.deepseek.com` | 文本模型 base URL | 用默认值 |
+| `LLM_API_KEY` | 无 | 文本模型 API key | Worker 启动失败 |
+| `LLM_MODEL` | `deepseek-v4-flash-vision-exp` | Agent 大脑模型 id，必须支持 function calling + 图片输入 | 用默认值 |
+| `IMAGE_BASE_URL` | 无 | 图像中转站 base URL | Worker 启动失败 |
+| `IMAGE_API_KEY` | 无 | 图像中转站 API key | Worker 启动失败 |
+| `IMAGE_MODEL` | `gpt-image-2` | 图像模型 id | 用默认值 |
 | `S3_ENDPOINT` | `http://127.0.0.1:9000` | 对象存储 endpoint（MinIO / OSS / COS） | 用默认值 |
 | `S3_BUCKET` | `photo-agent` | bucket 名 | 用默认值 |
 | `S3_ACCESS_KEY` | 无 | 对象存储 access key | Worker 启动失败 |
@@ -1068,10 +1088,9 @@ if (error.code === '23505') return new HttpError(409, 'RESOURCE_CONFLICT', ...)
 
 规则：
 
-- **`RELAY_TEXT_MODEL` 无默认值，必须显式配置。** 本设计不假定中转站提供哪些文本模型——猜一个默认值等于把未经验证的假设伪装成决策。启动时校验存在性；模型 id 由使用者按中转站实际清单填写。
-- **凭证与端点类变量缺失时进程启动即失败**，不允许延迟到第一次调用才报错——那会让一轮白白进入 running 状态再失败。Worker 需要 `RELAY_BASE_URL`、`RELAY_API_KEY`、`RELAY_TEXT_MODEL`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`；**API 需要 `S3_ACCESS_KEY`、`S3_SECRET_KEY`**（生成候选图签名 URL 用），缺失时 API 同样启动失败。
+- **凭证与端点类变量缺失时进程启动即失败**，不允许延迟到第一次调用才报错——那会让一轮白白进入 running 状态再失败。Worker 需要 `LLM_API_KEY`、`IMAGE_BASE_URL`、`IMAGE_API_KEY`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`；**API 需要 `S3_ACCESS_KEY`、`S3_SECRET_KEY`**（生成候选图签名 URL 用），缺失时 API 同样启动失败。
 - 其余变量有默认值，本地开箱可跑。
-- API 进程**不需要中转站凭证**（`RELAY_*`）——API 不加载 pi Agent（§3.1）。
+- API 进程**不需要模型凭证**（`LLM_*` / `IMAGE_*`）——API 不加载 pi Agent（§3.1）。
 
 `.env.example` 随实现一并提供。
 
@@ -1196,13 +1215,14 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 
 ## 17. Risks And Assumptions
 
-- **assumption：中转站的 `/v1/chat/completions` 支持稳定的 function calling。** 若工具调用不稳定，整个 agent 循环不成立。这是切片 2 必须最先验证的一点。
+- **切片 2 的第一件事仍是实跑验证 function calling 与图片输入的透传**：即使模型本身支持，供应商的流式实现也可能把 `tool_calls` 的增量拼错、或在转发时丢掉 `image_url`。
 - **assumption：中转站的 `/v1/images/edits` 接受原图 + prompt 并返回可解析的 b64 或 URL。** 实际响应格式在实现 `relayGenerateImages` 时以真实响应为准。
 - **assumption：中转站返回的图片 URL 若有时效，必须在轮次内立即下载并转存对象存储。** 不直接把中转站 URL 存入 `assets.uri`。
 - 模型输出只能当作不可信输入，必须经过 Domain 校验；结构化输出不等于合法业务操作。
 - 切片 2 的 Worker 崩溃时轨迹已入 PostgreSQL 可查，但「只尝试一次」使该轮本身不可恢复，用户需重发消息。这是明确的取舍（§8.2）。
 - PostgreSQL SessionStorage 是本次最大单块工作量（800–1000 行）。若 conformance 套件暴露出 pi 契约中未文档化的语义（分支、lane 移动、seq 单调性边界），切片 1 可能超出预估。这是把它排在最前的另一个理由：早暴露。
-- **open：`RELAY_TEXT_MODEL` 的具体值待定。** 该模型必须同时满足两个条件：支持 function calling（否则 agent 循环不成立），且 `input` 含 `'image'`（否则 §5.4 的自评看不到图）。选定前无法跑通切片 2，需在实施前从中转站模型清单确认。
+- **assumption：`deepseek-v4-flash-vision-exp` 同时支持 function calling 与图片输入。** 由使用者确认，本设计未实测。这是切片 2 的头号前提：function calling 不成立则 agent 循环不成立，图片输入不成立则 §5.4 的自评链路失效（届时应显式删除该节，而不是留一个跑不通的设计）。该模型为 `-exp` 实验版，存在下线风险。
+- **文本与图像是两个独立供应商**，各自的 base URL 与 key 分开配置（§12.3）。这正是 §2.2 拒绝万能 `ModelProvider` 的价值兑现处——换 LLM 不影响图像侧。
 - pi 版本 0.84.2 处于 0.x，API 可能变化。锁定精确版本，升级作为独立任务处理。
 - 生图耗时受中转站影响，10 分钟整轮上限可能需要按实测调整。
 - **System prompt 的效果无法在设计阶段验证。** §5.8 列的是必须覆盖的要点，不是最终文案；实际行为需要真实模型上迭代。切片 2 的验收只要求链路走通（§15），prompt 调优是随后的独立工作。
