@@ -31,6 +31,7 @@ import {
   findRecords,
 } from '../src/infrastructure/postgres/session/records.mjs';
 import { nextSeq } from '../src/infrastructure/postgres/session/sequences.mjs';
+import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.mjs';
 import { createPostgresSessionStorage } from '../src/infrastructure/postgres/session/storage.mjs';
 import {
   insertSession,
@@ -460,4 +461,96 @@ test('every mutation runs in its own transaction and shares the sequence', async
   assert.equal(root.seq, 1, 'default lane is free, so the first entry takes seq 1');
   assert.equal(await storage.getName(), 'Example');
   assert.equal((await storage.getEntry('root')).id, 'root');
+});
+
+async function withRepo(fn) {
+  await resetDatabase();
+  return fn(createPostgresSessionRepo({ pool }));
+}
+
+test('create returns a Session and list reports it', async () => {
+  await withRepo(async (repo) => {
+    const session = await repo.create({ id: 'session-1' });
+    assert.equal(typeof session.appendEntry, 'function');
+    const listed = await repo.list();
+    assert.deepEqual(listed.map((m) => m.id), ['session-1']);
+  });
+});
+
+test('create rejects a duplicate id with already_exists', async () => {
+  await withRepo(async (repo) => {
+    await repo.create({ id: 'dup' });
+    await assert.rejects(
+      () => repo.create({ id: 'dup' }),
+      (error) => error.code === 'already_exists',
+    );
+  });
+});
+
+test('open rejects an unknown session with not_found', async () => {
+  await withRepo(async (repo) => {
+    await assert.rejects(
+      () => repo.open({ id: 'missing' }),
+      (error) => error.code === 'not_found',
+    );
+  });
+});
+
+test('fork copies the branch entries and leaves the source untouched', async () => {
+  await withRepo(async (repo) => {
+    const source = await repo.create({ id: 'src' });
+    const a = await source.appendEntry(
+      { type: 'message', id: 'a', message: { role: 'user', content: [], timestamp: 1 } },
+      'main',
+    );
+    await source.appendEntry(
+      { type: 'message', id: 'b', message: { role: 'user', content: [], timestamp: 1 } },
+      'main',
+    );
+
+    const forked = await repo.fork({ id: 'src' }, { id: 'fork', at: a.id });
+
+    assert.deepEqual(
+      (await forked.findEntries()).map((e) => e.id),
+      ['a'],
+      'fork carries only the branch up to the fork point',
+    );
+    assert.deepEqual(
+      (await source.findEntries()).map((e) => e.id),
+      ['a', 'b'],
+      'source must be unchanged',
+    );
+  });
+});
+
+test('fork does not copy records', async () => {
+  await withRepo(async (repo) => {
+    const source = await repo.create({ id: 'src' });
+    const a = await source.appendEntry(
+      { type: 'message', id: 'a', message: { role: 'user', content: [], timestamp: 1 } },
+      'main',
+    );
+    await source.appendRecord({
+      type: 'operation_started',
+      id: 'run-1',
+      lane: 'main',
+      sourceLeafId: null,
+      intent: { kind: 'run', originalPrompt: [], initialMessages: [] },
+    });
+
+    const forked = await repo.fork({ id: 'src' }, { id: 'fork', at: a.id });
+    assert.deepEqual(await forked.findRecords(), []);
+  });
+});
+
+test('delete removes the session and cascades its rows', async () => {
+  await withRepo(async (repo) => {
+    const session = await repo.create({ id: 'gone' });
+    await session.appendEntry(
+      { type: 'message', id: 'a', message: { role: 'user', content: [], timestamp: 1 } },
+      'main',
+    );
+    await repo.delete({ id: 'gone' });
+    assert.deepEqual(await repo.list(), []);
+  });
 });
