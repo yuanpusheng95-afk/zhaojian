@@ -9,6 +9,11 @@ import {
   readEntry,
 } from '../src/infrastructure/postgres/session/entries.mjs';
 import {
+  computeStats,
+  getFact,
+  setFact,
+} from '../src/infrastructure/postgres/session/facts.mjs';
+import {
   createLane,
   insertLane,
   moveLane,
@@ -265,5 +270,71 @@ test('findOpenOperations returns newest first and excludes finished runs', async
 
     const open = await findOpenOperations(client, s, 'main', { limit: 2 });
     assert.deepEqual(open.map((r) => r.id), ['run-2']);
+  });
+});
+
+test('facts are latest-wins per kind and key', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await setFact(client, s, 'name', null, 'First');
+    await setFact(client, s, 'name', null, 'Second');
+    assert.equal(await getFact(client, s, 'name', null), 'Second');
+  });
+});
+
+test('labels are keyed independently', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await setFact(client, s, 'label', 'e1', 'checkpoint');
+    await setFact(client, s, 'label', 'e2', 'other');
+    assert.equal(await getFact(client, s, 'label', 'e1'), 'checkpoint');
+    assert.equal(await getFact(client, s, 'label', 'e2'), 'other');
+  });
+});
+
+test('clearing a fact stores null and reads back undefined', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await setFact(client, s, 'name', null, 'Named');
+    await setFact(client, s, 'name', null, undefined);
+    assert.equal(await getFact(client, s, 'name', null), undefined);
+  });
+});
+
+test('computeStats counts messages and sums assistant usage', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendEntry(client, s, messageEntry('u1', 'hi'), 'main');
+    await appendEntry(
+      client,
+      s,
+      {
+        type: 'message',
+        id: 'a1',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          api: 'anthropic-messages',
+          provider: 'anthropic',
+          model: 'claude-sonnet-4-5',
+          usage: {
+            input: 10,
+            output: 5,
+            cacheRead: 2,
+            cacheWrite: 1,
+            totalTokens: 18,
+            cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+          },
+          stopReason: 'stop',
+          timestamp: 1,
+        },
+      },
+      'main',
+    );
+
+    const stats = await computeStats(client, s);
+    assert.equal(stats.messageCount, 2);
+    assert.equal(stats.totalTokens, 18);
+    assert.equal(stats.costTotal, 0.3);
   });
 });
