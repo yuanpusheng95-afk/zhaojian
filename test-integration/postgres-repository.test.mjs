@@ -9,6 +9,10 @@ import {
   TurnNotFoundError,
 } from '../src/domain/photo-project-service.mjs';
 import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
+import {
+  buildAssetKey,
+  buildAssetUri,
+} from '../src/infrastructure/storage/asset-storage.mjs';
 import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
 
 const { Pool } = pg;
@@ -79,15 +83,26 @@ function editPatch(value = 'ivory coat') {
   };
 }
 
+/** 夹具走真实的 key/uri 工厂——它是下一个人复制粘贴的样板，手写字面量会把错误格式扩散出去。 */
+const TEST_BUCKET = 'photo-agent';
+
+function assetUri({ projectId, assetId, contentType = 'image/jpeg' }) {
+  return buildAssetUri(
+    TEST_BUCKET,
+    buildAssetKey({ ownerId: 'dev', projectId, assetId, contentType }),
+  );
+}
+
 async function createProject(repository, projectId = 'project_1') {
+  const assetId = `asset_source_${projectId}`;
   return repository.createProject({
     projectId,
     name: 'Autumn portrait',
     initialState: initialState(),
     anchorAsset: {
-      assetId: `asset_source_${projectId}`,
-      uri: `s3://photo-agent/source/${projectId}.jpg`,
-      metadata: { source: 'upload' },
+      assetId,
+      uri: assetUri({ projectId, assetId }),
+      metadata: { source: 'upload', contentType: 'image/jpeg' },
     },
   });
 }
@@ -101,14 +116,15 @@ async function createTurn(projectId, turnId) {
   );
 }
 
-function completedOutcome(candidateId = 'candidate_1') {
+function completedOutcome(candidateId = 'candidate_1', projectId = 'project_1') {
+  const assetId = `asset_${candidateId}`;
   return {
     kind: 'completed',
     candidate: {
       candidateId,
-      assetId: `asset_${candidateId}`,
-      uri: `s3://photo-agent/generated/${candidateId}.jpg`,
-      metadata: { model: 'gpt-image-2' },
+      assetId,
+      uri: assetUri({ projectId, assetId, contentType: 'image/png' }),
+      metadata: { model: 'gpt-image-2', contentType: 'image/png' },
       verification: { passed: true },
     },
   };
@@ -182,8 +198,14 @@ test('createProject writes owner and anchor asset uri and metadata', async () =>
   assert.equal(project.ownerId, 'dev');
   assert.equal(project.runningTurnId, null);
   assert.equal(revision.anchorAssetId, 'asset_source_project_1');
-  assert.equal(asset.rows[0].uri, 's3://photo-agent/source/project_1.jpg');
-  assert.deepEqual(asset.rows[0].metadata_json, { source: 'upload' });
+  assert.equal(
+    asset.rows[0].uri,
+    's3://photo-agent/users/dev/projects/project_1/asset_source_project_1.jpg',
+  );
+  assert.deepEqual(asset.rows[0].metadata_json, {
+    source: 'upload',
+    contentType: 'image/jpeg',
+  });
 });
 
 test('recordGeneration records a completed generation in one transaction', async () => {
@@ -213,8 +235,14 @@ test('recordGeneration records a completed generation in one transaction', async
   assert.equal(generation.inputAssetId, 'asset_source_project_1');
   assert.equal(generation.renderPrompt, 'ivory coat, same identity');
   assert.equal(output.rowCount, 1);
-  assert.equal(asset.rows[0].uri, 's3://photo-agent/generated/candidate_1.jpg');
-  assert.deepEqual(asset.rows[0].metadata_json, { model: 'gpt-image-2' });
+  assert.equal(
+    asset.rows[0].uri,
+    's3://photo-agent/users/dev/projects/project_1/asset_candidate_1.png',
+  );
+  assert.deepEqual(asset.rows[0].metadata_json, {
+    model: 'gpt-image-2',
+    contentType: 'image/png',
+  });
 });
 
 test('recordGeneration records a failed generation with error json', async () => {
