@@ -15,6 +15,11 @@ import {
   readLaneLeaf,
   readLanes,
 } from '../src/infrastructure/postgres/session/lanes.mjs';
+import {
+  appendRecord,
+  findOpenOperations,
+  findRecords,
+} from '../src/infrastructure/postgres/session/records.mjs';
 import { nextSeq } from '../src/infrastructure/postgres/session/sequences.mjs';
 import {
   insertSession,
@@ -207,5 +212,58 @@ test('readLanes reports every lane with its leaf', async () => {
         { lane: 'thread', leafId: 'root' },
       ],
     );
+  });
+});
+
+function startedRecord(id, lane) {
+  return {
+    type: 'operation_started',
+    id,
+    lane,
+    sourceLeafId: null,
+    intent: { kind: 'run', originalPrompt: [], initialMessages: [] },
+  };
+}
+
+function finishedRecord(id, lane, runId) {
+  return { type: 'operation_finished', id, lane, runId, outcome: 'completed' };
+}
+
+test('appendRecord assigns seq from the shared sequence', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendEntry(client, s, messageEntry('root', 'a'), 'main');
+    const record = await appendRecord(client, s, startedRecord('run-1', 'main'));
+    assert.equal(record.seq, 2, 'entry took seq 1');
+    assert.equal(record.lane, 'main');
+    assert.equal(typeof record.timestamp, 'number');
+  });
+});
+
+test('findRecords filters by type and lane', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await createLane(client, s, 'side', null);
+    await appendRecord(client, s, startedRecord('a', 'main'));
+    await appendRecord(client, s, startedRecord('b', 'side'));
+    await appendRecord(client, s, finishedRecord('c', 'main', 'a'));
+
+    const started = await findRecords(client, s, { type: 'operation_started' });
+    assert.deepEqual(started.map((r) => r.id), ['a', 'b']);
+
+    const mainOnly = await findRecords(client, s, { lane: 'main' });
+    assert.deepEqual(mainOnly.map((r) => r.id), ['a', 'c']);
+  });
+});
+
+test('findOpenOperations returns newest first and excludes finished runs', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendRecord(client, s, startedRecord('run-1', 'main'));
+    await appendRecord(client, s, startedRecord('run-2', 'main'));
+    await appendRecord(client, s, finishedRecord('fin-1', 'main', 'run-1'));
+
+    const open = await findOpenOperations(client, s, 'main', { limit: 2 });
+    assert.deepEqual(open.map((r) => r.id), ['run-2']);
   });
 });
