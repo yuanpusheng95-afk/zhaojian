@@ -19,7 +19,7 @@ export async function readLaneLeaf(client, sessionId, lane) {
   return result.rows[0] ? result.rows[0].leaf_id : undefined;
 }
 
-async function recordLaneMove(client, sessionId, lane, leafId) {
+export async function recordLaneMove(client, sessionId, lane, leafId) {
   const seq = await nextSeq(client, sessionId);
   await client.query(
     `INSERT INTO ${SESSION_TABLES.laneMoves} (session_id, seq, lane, leaf_id)

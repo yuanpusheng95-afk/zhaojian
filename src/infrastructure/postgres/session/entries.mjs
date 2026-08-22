@@ -1,5 +1,5 @@
 import { advanceLaneLeaf, readLaneLeaf } from './lanes.mjs';
-import { assertJsonSerializable, SESSION_TABLES } from './schema.mjs';
+import { assertJsonSerializable, claimId, SESSION_TABLES } from './schema.mjs';
 import { nextSeq } from './sequences.mjs';
 
 export const ENTRY_COLUMNS =
@@ -26,6 +26,8 @@ export async function appendEntry(client, sessionId, provisioned, lane) {
   if (leafId === undefined) {
     throw new Error(`Unknown lane ${lane}`);
   }
+
+  await claimId(client, sessionId, id, 'entry');
 
   const seq = await nextSeq(client, sessionId);
   const timestamp = Date.now();

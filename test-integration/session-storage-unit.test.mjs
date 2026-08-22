@@ -397,7 +397,7 @@ test('getLog merges entries records and lane moves in one sequence', async () =>
 
     const log = await getLog(client, s, {});
     assert.deepEqual(log.map((item) => item.seq), [1, 2, 3]);
-    assert.deepEqual(log.map((item) => item.kind), ['entry', 'record', 'lane_move']);
+    assert.deepEqual(log.map((item) => item.kind), ['entry', 'record', 'lane']);
   });
 });
 

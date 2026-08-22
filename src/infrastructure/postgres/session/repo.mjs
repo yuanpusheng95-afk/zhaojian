@@ -1,9 +1,11 @@
-import { Session } from '@earendil-works/pi-agent-core';
+import { Session, uuidv7 } from '@earendil-works/pi-agent-core';
 
 import { isUniqueViolation, sessionError } from './errors.mjs';
-import { insertLane } from './lanes.mjs';
-import { findEntriesOnBranch } from './queries.mjs';
-import { SESSION_TABLES } from './schema.mjs';
+import { readEntry } from './entries.mjs';
+import { getFact, setFact } from './facts.mjs';
+import { insertLane, readLaneLeaf, readLanes, recordLaneMove } from './lanes.mjs';
+import { findEntries, findEntriesOnBranch } from './queries.mjs';
+import { SESSION_TABLES, claimId } from './schema.mjs';
 import {
   deleteSession,
   insertSession,
@@ -91,37 +93,68 @@ export function createPostgresSessionRepo({ pool }) {
     },
 
     /**
-     * 复制源分支上的 entries 到新会话，records 不复制。
-     * 源会话完全只读——所有写入都发生在新 session_id 下。
+     * 复制源会话的 entries 到新会话，records 不复制、facts 选择性复制。
+     * 语义对齐 pi 的 SessionState.createForkMutations：
+     *   scope=tree   → 全部 entries + 全部 lanes
+     *   scope=branch → 目标点所在分支 + 单个 main lane
+     *   position 默认：未给 entryId 时为 'at'，给了则为 'before'
+     * 复制的 entry 保留原 id / parentId / timestamp，但 seq 从 1 重新编号；
+     * lane 与 fact 同样各消耗一个 seq。
      */
-    async fork(source, options) {
-      const targetId = options?.id;
-      if (!targetId) throw sessionError('invalid_payload', 'fork requires a target id');
-      const at = options.at ?? null;
+    async fork(source, options = {}) {
+      const targetId = options.id ?? uuidv7();
 
       await inTransaction(async (client) => {
         await requireSession(client, source.id);
 
-        const branch = at
-          ? await findEntriesOnBranch(client, source.id, { start: at })
-          : [];
-        if (at && branch.length === 0) {
-          throw sessionError('invalid_fork_target', `Unknown fork target ${at}`);
+        let copiedEntries;
+        let forkLanes;
+
+        if (options.scope === 'tree') {
+          copiedEntries = await findEntries(client, source.id, {});
+          forkLanes = await readLanes(client, source.id);
+        } else {
+          const mainLeaf = await readLaneLeaf(client, source.id, 'main');
+          if (mainLeaf === undefined) {
+            throw sessionError('not_found', 'Session has no main lane');
+          }
+          const selectedEntryId = options.entryId ?? mainLeaf;
+
+          let branchTarget = null;
+          if (selectedEntryId !== null) {
+            const entry = await readEntry(client, source.id, selectedEntryId);
+            if (!entry || entry.type !== 'message') {
+              throw sessionError(
+                'invalid_fork_target',
+                `Fork target is not a message entry: ${selectedEntryId}`,
+              );
+            }
+            const position =
+              options.position ?? (options.entryId === undefined ? 'at' : 'before');
+            branchTarget = position === 'at' ? entry.id : entry.parentId;
+          }
+
+          copiedEntries =
+            branchTarget === null
+              ? []
+              : await findEntriesOnBranch(client, source.id, { start: branchTarget });
+          forkLanes = [{ lane: 'main', leafId: branchTarget }];
         }
+
+        const sourceName = await getFact(client, source.id, 'name', null);
 
         await insertSession(client, {
           id: targetId,
           createdAt: Date.now(),
-          parentSessionId: source.id,
+          parentSessionId: options.parentSessionId ?? source.id,
           metadata: options.metadata ?? {},
         });
 
-        let parentId = null;
-        for (const entry of branch) {
+        for (const entry of copiedEntries) {
+          await claimId(client, targetId, entry.id, 'entry');
           const seq = await nextSeq(client, targetId);
-          const { type, id, timestamp, ...payload } = entry;
+          const { type, id, timestamp, parentId, ...payload } = entry;
           delete payload.seq;
-          delete payload.parentId;
           await client.query(
             `INSERT INTO ${SESSION_TABLES.entries}
                (session_id, id, seq, parent_id, type, custom_type, timestamp_ms, payload_json)
@@ -137,10 +170,23 @@ export function createPostgresSessionRepo({ pool }) {
               JSON.stringify(payload),
             ],
           );
-          parentId = id;
         }
 
-        await insertLane(client, targetId, DEFAULT_LANE, parentId);
+        for (const pointer of forkLanes) {
+          await insertLane(client, targetId, pointer.lane, pointer.leafId);
+          await recordLaneMove(client, targetId, pointer.lane, pointer.leafId);
+        }
+
+        if (sourceName !== undefined) {
+          await setFact(client, targetId, 'name', null, sourceName);
+        }
+
+        for (const entry of copiedEntries) {
+          const label = await getFact(client, source.id, 'label', entry.id);
+          if (label !== undefined) {
+            await setFact(client, targetId, 'label', entry.id, label);
+          }
+        }
       });
 
       return openSession(targetId);

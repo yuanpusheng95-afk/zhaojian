@@ -1,10 +1,10 @@
-import { assertJsonSerializable, SESSION_TABLES } from './schema.mjs';
+import { assertJsonSerializable, claimId, SESSION_TABLES } from './schema.mjs';
 import { nextSeq } from './sequences.mjs';
 
-const RECORD_COLUMNS =
+export const RECORD_COLUMNS =
   'id, seq, lane, run_id, type, op_kind, timestamp_ms, payload_json';
 
-function rowToRecord(row) {
+export function rowToRecord(row) {
   return {
     ...row.payload_json,
     type: row.type,
@@ -19,6 +19,8 @@ export async function appendRecord(client, sessionId, newRecord) {
   const { type, id, lane, ...rest } = newRecord;
   // 必须先于任何写入与任何 seq 分配
   const payload = assertJsonSerializable(rest, `record ${id}`);
+
+  await claimId(client, sessionId, id, 'record');
 
   const seq = await nextSeq(client, sessionId);
   const timestamp = Date.now();

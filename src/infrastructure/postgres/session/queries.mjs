@@ -1,5 +1,22 @@
 import { ENTRY_COLUMNS, rowToEntry } from './entries.mjs';
+import { sessionError } from './errors.mjs';
+import { RECORD_COLUMNS, rowToRecord } from './records.mjs';
 import { SESSION_TABLES } from './schema.mjs';
+
+function assertValidLimit(limit) {
+  if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
+    throw sessionError('invalid_query', 'limit must be a positive integer');
+  }
+}
+
+function assertValidCursor(afterSeq) {
+  if (afterSeq !== undefined && (!Number.isInteger(afterSeq) || afterSeq < 0)) {
+    throw sessionError(
+      'invalid_query',
+      'cursor sequence must be a non-negative integer',
+    );
+  }
+}
 
 /** `id, seq, ...` → `e.id, e.seq, ...`，供递归 CTE 的递归项使用。 */
 const ENTRY_COLUMNS_QUALIFIED = ENTRY_COLUMNS.split(', ')
@@ -77,39 +94,78 @@ export async function findEntriesOnBranch(client, sessionId, query = {}) {
 /**
  * 会话的统一变更流水，按共享 seq 排序。afterSeq 是增量游标——
  * 将来的 SSE 端点（设计文档切片 3）直接建在它上面。
+ *
+ * LogItem 是判别联合，每种 kind 带自己的载荷键，因此分表查询后在 JS 里
+ * 归并，而不是用 SQL UNION 拼裸行。
  */
 export async function getLog(client, sessionId, options = {}) {
-  const params = [sessionId];
+  assertValidCursor(options.afterSeq);
+  assertValidLimit(options.limit);
+
+  const cursorParams = [sessionId];
   let cursor = '';
   if (options.afterSeq !== undefined) {
-    params.push(options.afterSeq);
-    cursor = `AND seq > $${params.length}`;
+    cursorParams.push(options.afterSeq);
+    cursor = 'AND seq > $2';
   }
 
-  let sql = `
-    SELECT seq, 'entry' AS kind, to_jsonb(e) AS item
-      FROM (SELECT ${ENTRY_COLUMNS} FROM ${SESSION_TABLES.entries}
-             WHERE session_id = $1 ${cursor}) e
-    UNION ALL
-    SELECT seq, 'record' AS kind, to_jsonb(r) AS item
-      FROM (SELECT id, seq, lane, run_id, type, timestamp_ms, payload_json
-              FROM ${SESSION_TABLES.records}
-             WHERE session_id = $1 ${cursor}) r
-    UNION ALL
-    SELECT seq, 'lane_move' AS kind, to_jsonb(m) AS item
-      FROM (SELECT seq, lane, leaf_id FROM ${SESSION_TABLES.laneMoves}
-             WHERE session_id = $1 ${cursor}) m
-    ORDER BY seq ASC`;
+  const [entries, records, facts, laneMoves] = await Promise.all([
+    client.query(
+      `SELECT ${ENTRY_COLUMNS} FROM ${SESSION_TABLES.entries}
+        WHERE session_id = $1 ${cursor}`,
+      cursorParams,
+    ),
+    client.query(
+      `SELECT ${RECORD_COLUMNS} FROM ${SESSION_TABLES.records}
+        WHERE session_id = $1 ${cursor}`,
+      cursorParams,
+    ),
+    client.query(
+      `SELECT seq, kind, key, value FROM ${SESSION_TABLES.facts}
+        WHERE session_id = $1 ${cursor}`,
+      cursorParams,
+    ),
+    client.query(
+      `SELECT seq, lane, leaf_id FROM ${SESSION_TABLES.laneMoves}
+        WHERE session_id = $1 ${cursor}`,
+      cursorParams,
+    ),
+  ]);
 
-  if (options.limit !== undefined) {
-    params.push(options.limit);
-    sql += ` LIMIT $${params.length}`;
-  }
+  const items = [
+    ...entries.rows.map((row) => ({
+      kind: 'entry',
+      seq: Number(row.seq),
+      entry: rowToEntry(row),
+    })),
+    ...records.rows.map((row) => ({
+      kind: 'record',
+      seq: Number(row.seq),
+      record: rowToRecord(row),
+    })),
+    ...facts.rows.map((row) =>
+      row.kind === 'name'
+        ? {
+            kind: 'fact',
+            seq: Number(row.seq),
+            fact: 'name',
+            name: row.value ?? undefined,
+          }
+        : {
+            kind: 'fact',
+            seq: Number(row.seq),
+            fact: 'label',
+            targetId: row.key,
+            label: row.value ?? undefined,
+          },
+    ),
+    ...laneMoves.rows.map((row) => ({
+      kind: 'lane',
+      seq: Number(row.seq),
+      lane: row.lane,
+      leafId: row.leaf_id,
+    })),
+  ].sort((a, b) => a.seq - b.seq);
 
-  const result = await client.query(sql, params);
-  return result.rows.map((row) => ({
-    seq: Number(row.seq),
-    kind: row.kind,
-    item: row.item,
-  }));
+  return options.limit === undefined ? items : items.slice(0, options.limit);
 }

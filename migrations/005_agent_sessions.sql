@@ -12,6 +12,15 @@ CREATE TABLE agent_session_sequences (
   next_seq bigint NOT NULL DEFAULT 1
 );
 
+-- entries 与 records 共享同一个 id 命名空间：同一会话内 id 全局唯一。
+-- PostgreSQL 无法跨表建唯一索引，因此用一张注册表承载该约束。
+CREATE TABLE agent_session_ids (
+  session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  id text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('entry', 'record')),
+  PRIMARY KEY (session_id, id)
+);
+
 CREATE TABLE agent_session_entries (
   session_id text NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
   id text NOT NULL,
