@@ -19,7 +19,7 @@
 
 - Node.js `>=22`，不引入构建步骤，源码为 `.mjs`
 - pi 锁定 0.84.2；发现 API 缺口时**优先组合已有原语，不 fork、不自研 LLM 循环**
-- **本切片不修改** `src/domain/**`（2b 刚定稿，工具是它的薄适配层）、`migrations/**`、`src/api/**`（API 重写是 2d）、session 后端（`src/infrastructure/postgres/session/**`）
+- **本切片不修改** `src/domain/**`（2b 刚定稿，工具是它的薄适配层）、`migrations/**`、`src/api/**`（API 重写是 2d）、session 后端（`src/infrastructure/postgres/session/**`）。`photo-project-repository.mjs` 只允许新增只读查询，不改既有 SQL、投影与契约。
 - 集成测试串行（`--test-concurrency=1` 惯例）；真实模型调用**只出现在手动脚本，不进 CI**
 - 每个任务结束 `npm test` 与 `npm run test:integration` 必须全绿（新增测试文件串行排队即可）
 - Worker 的 stdout 只输出结构化 telemetry（§12.3），人类可读日志走 stderr
@@ -42,7 +42,7 @@ Worker 主循环（进程内最多 WORKER_CONCURRENCY 个在途轮）
  1. claimNextTurn()   FOR UPDATE SKIP LOCKED 领 queued → running + lease_token
  2. 心跳启动（TURN_HEARTBEAT_MS 间隔 renewTurnLease，覆盖整轮）
  3. AbortController（TURN_TIMEOUT_MS 整轮上限）
- 4. 打开 Session（per project：repo.openOrCreate(project:projectId)）
+ 4. 打开 Session（per project：先 open，not_found 时 create）
     session.appendMessage(userMessage)          ← 用户消息先落轨迹
  5. buildSessionContext(分支 entries) → messages / activeToolNames
  6. new Agent({ streamFn, initialState: { messages }, tools 三件套, ... })
@@ -150,14 +150,22 @@ docs/superpowers/specs/probe-samples/      探针样本归档（2a 惯例）
 
 **Files:**
 - Create: `src/agent/turn-context.mjs`、`src/agent/tools/{read-photo-state,generate-image,select-candidate}.mjs`
+- Modify: `src/infrastructure/postgres/photo-project-repository.mjs`
 - Create: `test/agent-tools.test.mjs`
+- Create: `test-integration/photo-project-repository-assets.test.mjs`
 
 **Interfaces（Produces）:**
 - `createTurnContext({ projectId, initialBaseAssetId })` → `{ currentBaseAssetId, origin, imageCount, fatal, noteImage() , advanceBase(assetId), setFatal(code, message) }`——纯内存对象，Worker 每轮新建
 - `createReadPhotoStateTool({ repository, turnContext })` → `AgentTool`（typebox：无参数）→ `{ revisionId, state, baseImage: { assetId, origin } }`。origin ∈ `revision_anchor | turn_candidate`（§5.2：返回指针当前值，不是锚定图）
+- `repository.getAsset(assetId)` → `{ id, kind, uri, metadata }`；不存在抛 `ASSET_NOT_FOUND`。这是 Task 3 新增的唯一 repository 能力：只读、无事务副作用、不改任何既有方法。集成测试必须覆盖 source 与 generated 两类 asset 的 roundtrip。
+- **`assets.uri` 的格式是 `s3://<bucket>/<key>`，写侧与读侧成对定义**（已实现于 `src/infrastructure/storage/asset-storage.mjs`，2c 直接用）：
+  - `buildAssetUri(bucket, key)` → `s3://<bucket>/<key>`——**所有写入 `assets.uri` 的地方都必须经它**：`generate_image` 落候选（`recordGeneration` 的 `candidate.uri`）、`createProject` 的 `anchorAsset.uri`、冒烟脚本建项目
+  - `resolveAssetStorageKey(uri, bucket)` → `<key>`；非 `s3://` 前缀、缺 bucket/key、bucket 不匹配一律抛 `InvalidAssetUriError`（`INVALID_ASSET_URI`），**不猜、不兜底**
+  - `assetStorage.bucket` 已由 `createS3AssetStorage` 暴露（`assertAssetStorage` 强制校验），调用方从 storage 取，不从 config 另取一份
+  - **只规定读侧会再次断链。** 这个断链的成因正是不对称：2a 的 storage 用裸 key，2b 的落库写 `s3://` URI，两套约定从未同时跑过——fake storage 用字符串当键，传什么都能取到，掩盖了它
 - `createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config })` → `AgentTool`，参数 `{ patch, renderPrompt }`：
   - patch schema 用 **enum 编码两张白名单**（§5.3：让模型在生成阶段就受约束，省一轮自纠往返）
-  - 执行序：`imageCount` 护栏（≥ 上限抛 `MAX_IMAGES_REACHED`）→ `getRevision` + `applyPhotoStatePatch` 校验（先于花钱）→ `assetStorage.get(currentBaseAssetId 的 uri)` 取基准图字节 → `imagesModels.generateImages(...)`（`IMAGE_TIMEOUT_MS`）→ 字节 `PUT` S3（扩展名按 content type）→ `repository.recordGeneration({ ..., outcome: completed, candidate })` → `turnContext.advanceBase(candidate.assetId)` → 返回 `{ generationId, candidateId, assetId }` + `ImageContent`（模型看图自评）
+  - 执行序：`imageCount` 护栏（≥ 上限抛 `MAX_IMAGES_REACHED`）→ `getRevision` + `applyPhotoStatePatch` 校验（先于花钱）→ `getAsset(currentBaseAssetId)` 读 `{ uri, metadata.contentType? }` → `resolveAssetStorageKey(uri, assetStorage.bucket)` → `assetStorage.get(storageKey)` 取基准图字节 → `imagesModels.generateImages(...)`（`IMAGE_TIMEOUT_MS`）→ 字节 `PUT` S3（key 由 `buildAssetKey` 按 content type 定扩展名）→ `recordGeneration({ ..., candidate: { ..., uri: buildAssetUri(assetStorage.bucket, key) } })` → `turnContext.advanceBase(candidate.assetId)` → 返回 `{ generationId, candidateId, assetId }` + `ImageContent`（模型看图自评）。若 asset metadata 没有 content type，以生成结果 mimeType 兜底并在 PUT 时显式指定。
   - Provider 401/余额/持续 429、存储不可达 → `terminate: true` + `setFatal(...)`（§9.1 不可纠正类）；其余一律抛
 - `createSelectCandidateTool({ repository, turnContext })` → `AgentTool`，参数 `{ generationId, candidateId }` → `selectCandidate` → `{ revisionId }` + **`terminate: true`**
 
@@ -171,6 +179,8 @@ generate_image：非法 patch → 抛（不生图、不落库、不花钱）
 generate_image：第三次调用（上限 2 的配置）→ MAX_IMAGES_REACHED 抛错
 generate_image：Provider 401 → terminate + fatal 置位
 generate_image：基准图取自 turn_candidate（第二次调用的输入图是第一次产出）
+generate_image：真实形状的 repository.getAsset 返回 s3:// URI → 只取解析后的 storage key
+generate_image：asset URI 非法或 bucket 不匹配 → terminate + INVALID_ASSET_URI
 select_candidate：成功 → terminate:true；revision 切换
 select_candidate：错误 candidateId → 抛（可纠正类）
 ```
@@ -223,6 +233,7 @@ type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted
 
 **没有 `'end'`**：本轮有工具调用用 `'toolUse'`，正常收尾用 `'stop'`。fake 写错值不会报错——`Agent` 只会静默走错分支，测试断言莫名其妙地不成立
 - [ ] **Step 3: 多轮可见性验证**（内存 repo 即可）：同一 session 第二次 run，`buildSessionContext` 返回的 messages 包含第一轮的用户消息与 assistant 回复（§18 验收：多轮对话可用）
+- [ ] **Step 4: 首轮 Session 竞争验证**：两个 runner 同时打开同一 project session；一方 create 成功，另一方 create 撞 `already_exists` 后重新 open。断言双方都能继续写入，且用户消息不会因定位竞争重复追加。
 
 ---
 
@@ -270,6 +281,7 @@ fatal 剧本（generate 401）→ finishTurn failed + error_json 含 fatal code
 - `npm test` / `npm run test:integration` 全绿；新增 fake-StreamFn 单测覆盖编排全部分支
 - **Task 1 探针结论已归档**：function calling 稳定性与图片输入是事实而非假设（或降级决策已记录并与用户确认）
 - 冒烟脚本跑通真实链路：消息 → 工具调用 → 真实出图落 MinIO → 新 Revision → `select_candidate` 终止
+- 冒烟链路证明 `generate_image` 能通过真实 `repository.getAsset()` + S3 存储，把 `assets.uri` 解析成 storage key 并取回基准图字节；不存在“fake repo 通过但真实 URI 断链”的验收盲区。
 - Agent 轨迹在 PostgreSQL 可回放；第二轮消息能看到第一轮历史
 - 同轮两次 `generate_image`（同 patch）产生两条 generation（2b 验收的延续，真链路复验）
 - 超 `MAX_IMAGES_PER_TURN` 后模型转向选图；fatal 错误中止整轮不空转

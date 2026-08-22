@@ -522,7 +522,11 @@ INSERT INTO assets (id, kind, created_at)
 
 **`uri` 与 `metadata_json` 从来没被写过。** 不改的话 `uri` 恒为 NULL，§5.7 数据流里「按 `assetId` 查 `assets.uri` 取基准图字节」会取空——这是整条 img2img 链路上的断点。
 
-两处都要补写 `uri`（对象键）与 `metadata_json`（至少含 content type，供签名 URL 设头与扩展名推导）。
+两处都要补写 `uri` 与 `metadata_json`（至少含 content type，供签名 URL 设头与扩展名推导）。
+
+**`uri` 存完整的 `s3://<bucket>/<key>`，不是裸对象键**（本节此前写的是「对象键」，实施时按 URI 形态定稿）。理由：`AssetStorage.get()` 收的是裸 key，而 `assets.uri` 需要自描述——记录里带上 bucket，将来换桶/换端点时旧记录仍可追溯来源。
+
+**写侧与读侧必须成对定义**：`buildAssetUri(bucket, key)` 与 `resolveAssetStorageKey(uri, bucket)`（`src/infrastructure/storage/asset-storage.mjs`）。只定义一边必然断链——切片 2a 的 storage 用裸 key、2b 的落库写 `s3://` URI，两套约定从未同时跑过，而 fake storage 用字符串当键传什么都能取到，把它掩盖到了 2c 才暴露。
 
 `compose.yaml` 新增 MinIO 服务，与 postgres 并列；`npm run db:up` 改名 `npm run dev:up`。
 
@@ -1269,7 +1273,7 @@ SSE 端点，基于 `getLog({ afterSeq })` 增量推送 Agent 进展。
 - `npm run smoke:e2e` 的 stdout 中可见 `pi.harness.run`、`pi.harness.tool`、`pi.ai.request`（`operation=generate_images`）三类 span，且带耗时（§11.4）
 - `src/domain/photo-state.mjs` 未修改；`photo-project-service.mjs` 的改动**仅限项目锁**（§10.3），patch 校验、Revision 冲突、候选选择逻辑不动
 - 一轮内可连续调用 `generate_image` 至上限而不触发 `ProjectBusyError`（验证 §10.3 的锁迁移确已完成）
-- `assets.uri` 非空：生图后该行能查到对象键，且据此能从 MinIO 取回字节（验证 §6.3 的写入代码确已改）
+- `assets.uri` 形如 `s3://<bucket>/<key>`：生图后该行能查到，经 `resolveAssetStorageKey` 解析后能从 MinIO 取回字节（验证 §6.3 的写入代码确已改，且读写两侧对称）
 - 幂等三态正确：同 key 同消息返回 `200 { replayed: true }`，同 key 不同消息返回 `409 IDEMPOTENCY_CONFLICT`，新 key 返回 `202`（验证 §7.5 的指纹语义未丢失）
 - 两个不同项目的轮次可并行推进，互不阻塞（验证 §10.4 的进程内并发）
 - `smoke:e2e` 的 stdout 可直接 `| jq` 逐行解析，无自由文本混入（§12.3）

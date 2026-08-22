@@ -45,6 +45,8 @@ export function createS3AssetStorage({
   }
 
   return assertAssetStorage({
+    bucket,
+
     async put(key, bytes, contentType) {
       await ensureBucket();
       await client.send(
