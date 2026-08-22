@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 
 import {
   CandidateSelectionError,
-  GenerationTransitionError,
   PhotoProjectService,
-  ProjectBusyError,
   RevisionConflictError,
+  RevisionNotFoundError,
 } from '../src/domain/photo-project-service.mjs';
 
 function createIdFactory() {
@@ -38,23 +37,19 @@ function createService() {
   });
 }
 
-function createProject(service) {
+function createProject(service, projectId = 'project_1') {
   return service.createProject({
-    projectId: 'project_1',
+    projectId,
     name: 'Autumn portrait',
     initialState: initialState(),
-    anchorAssetId: 'asset_source',
+    anchorAsset: { assetId: 'asset_source' },
   });
 }
 
-function editPatch() {
+function editPatch(value = 'ivory coat') {
   return {
     modify: [
-      {
-        path: 'appearance.outfit',
-        operation: 'replace',
-        value: 'ivory coat',
-      },
+      { path: 'appearance.outfit', operation: 'replace', value },
     ],
     preserve: [
       { path: 'subject.identity', strength: 'hard' },
@@ -63,47 +58,39 @@ function editPatch() {
   };
 }
 
-function advanceToCompleted(service, generationId) {
-  for (const status of [
-    'preparing',
-    'submitted',
-    'provider_processing',
-    'verifying',
-  ]) {
-    service.transitionGeneration({ generationId, to: status });
-  }
-  service.addCandidate({
-    generationId,
-    candidateId: 'candidate_1',
-    assetId: 'asset_generated_1',
-    verification: {
-      identity: { status: 'pass', score: 0.93 },
-      backgroundPreserved: { status: 'pass' },
+function recordGeneration(service, project, patch = editPatch(), options = {}) {
+  const baseRevisionId =
+    options.baseRevisionId ?? service.getProject(project.id).activeRevisionId;
+  return service.recordGeneration({
+    projectId: project.id,
+    turnId: options.turnId ?? 'turn_1',
+    baseRevisionId,
+    inputAssetId: 'asset_source',
+    patch,
+    outcome: {
+      kind: 'completed',
+      candidate: { assetId: 'asset_generated_1' },
     },
   });
-  service.transitionGeneration({ generationId, to: 'completed' });
 }
 
 test('creates a revision only after the user selects a generated candidate', () => {
   const service = createService();
   const project = createProject(service);
 
-  const generation = service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  });
+  const generation = recordGeneration(service, project);
 
-  assert.equal(generation.status, 'queued');
+  assert.equal(generation.status, 'completed');
   assert.equal(generation.inputRevisionId, project.activeRevisionId);
   assert.equal(generation.proposedState.appearance.outfit, 'ivory coat');
   assert.equal(service.getProject(project.id).activeRevisionId, 'revision_1');
   assert.equal(service.listRevisions(project.id).length, 1);
-
-  advanceToCompleted(service, generation.id);
-
-  assert.equal(service.listRevisions(project.id).length, 1);
+  assert.deepEqual(generation.candidates, [{
+    id: 'candidate_1',
+    assetId: 'asset_generated_1',
+    verification: {},
+    createdAt: generation.createdAt,
+  }]);
 
   const revision = service.selectCandidate({
     projectId: project.id,
@@ -118,113 +105,64 @@ test('creates a revision only after the user selects a generated candidate', () 
   assert.equal(service.listRevisions(project.id).length, 2);
 });
 
-test('returns the original generation for the same idempotency key', () => {
+test('allows a second generation with an identical patch in the same turn', () => {
   const service = createService();
   const project = createProject(service);
-  const input = {
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  };
+  const request = { patch: editPatch() };
 
-  const first = service.requestGeneration(input);
-  const second = service.requestGeneration(input);
+  const first = recordGeneration(service, project, request.patch);
+  const second = recordGeneration(service, project, request.patch);
 
-  assert.equal(second.id, first.id);
-  assert.equal(service.listGenerations(project.id).length, 1);
-});
-
-test('rejects a new generation while another project generation is active', () => {
-  const service = createService();
-  const project = createProject(service);
-
-  service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  });
-
-  assert.throws(
-    () =>
-      service.requestGeneration({
-        projectId: project.id,
-        baseRevisionId: project.activeRevisionId,
-        idempotencyKey: 'edit-2',
-        patch: editPatch(),
-      }),
-    ProjectBusyError,
+  assert.notEqual(second.id, first.id);
+  assert.deepEqual(
+    service.listGenerations(project.id).map(({ id }) => id),
+    [first.id, second.id],
   );
 });
 
-test('rejects an edit based on a stale revision', () => {
+test('rejects an edit based on a missing revision', () => {
   const service = createService();
   const project = createProject(service);
 
   assert.throws(
     () =>
-      service.requestGeneration({
+      service.recordGeneration({
         projectId: project.id,
+        turnId: 'turn_1',
         baseRevisionId: 'revision_stale',
-        idempotencyKey: 'edit-1',
+        inputAssetId: 'asset_source',
         patch: editPatch(),
+        outcome: {
+          kind: 'completed',
+          candidate: { assetId: 'asset_generated_1' },
+        },
       }),
-    RevisionConflictError,
+    RevisionNotFoundError,
   );
 });
 
-test('rejects generation status jumps that bypass required states', () => {
+test('records a failed generation without candidates', () => {
   const service = createService();
   const project = createProject(service);
-  const generation = service.requestGeneration({
+
+  const generation = service.recordGeneration({
     projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
+    turnId: 'turn_1',
+    baseRevisionId: service.getProject(project.id).activeRevisionId,
+    inputAssetId: 'asset_source',
     patch: editPatch(),
+    outcome: { kind: 'failed', error: { message: 'provider unavailable' } },
   });
 
-  assert.throws(
-    () =>
-      service.transitionGeneration({
-        generationId: generation.id,
-        to: 'completed',
-      }),
-    GenerationTransitionError,
-  );
+  assert.equal(generation.status, 'failed');
+  assert.deepEqual(generation.candidates, []);
+  assert.deepEqual(generation.error, { message: 'provider unavailable' });
 });
 
-test('selecting the same candidate is idempotent but selecting another is rejected', () => {
+test('selecting the same candidate is idempotent but another is rejected', () => {
   const service = createService();
   const project = createProject(service);
-  const generation = service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  });
-
-  for (const status of [
-    'preparing',
-    'submitted',
-    'provider_processing',
-    'verifying',
-  ]) {
-    service.transitionGeneration({ generationId: generation.id, to: status });
-  }
-  service.addCandidate({
-    generationId: generation.id,
-    candidateId: 'candidate_1',
-    assetId: 'asset_generated_1',
-    verification: {},
-  });
-  service.addCandidate({
-    generationId: generation.id,
-    candidateId: 'candidate_2',
-    assetId: 'asset_generated_2',
-    verification: {},
-  });
-  service.transitionGeneration({ generationId: generation.id, to: 'completed' });
+  const generation = recordGeneration(service, project);
 
   const first = service.selectCandidate({
     projectId: project.id,
@@ -243,102 +181,89 @@ test('selecting the same candidate is idempotent but selecting another is reject
       service.selectCandidate({
         projectId: project.id,
         generationId: generation.id,
-        candidateId: 'candidate_2',
+        candidateId: 'candidate_missing',
       }),
     CandidateSelectionError,
   );
 });
 
-test('rejects reusing an idempotency key for a different request', () => {
+test('rejects selecting a completed generation after the active revision advanced', () => {
   const service = createService();
   const project = createProject(service);
 
-  service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
+  const first = recordGeneration(service, project, editPatch('ivory coat'), {
+    turnId: 'turn_1',
+  });
+  const second = recordGeneration(service, project, editPatch('wool coat'), {
+    turnId: 'turn_2',
   });
 
-  const differentPatch = editPatch();
-  differentPatch.modify[0].value = 'red coat';
-
-  assert.throws(
-    () =>
-      service.requestGeneration({
-        projectId: project.id,
-        baseRevisionId: project.activeRevisionId,
-        idempotencyKey: 'edit-1',
-        patch: differentPatch,
-      }),
-    { code: 'IDEMPOTENCY_CONFLICT' },
-  );
-});
-
-test('releases the project lock when a generation fails', () => {
-  const service = createService();
-  const project = createProject(service);
-  const failed = service.requestGeneration({
+  service.selectCandidate({
     projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  });
-
-  service.transitionGeneration({ generationId: failed.id, to: 'failed' });
-
-  const retry = service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-2',
-    patch: editPatch(),
-  });
-
-  assert.equal(retry.status, 'queued');
-  assert.notEqual(retry.id, failed.id);
-});
-
-test('does not allow an older completed generation to change the active revision while another generation runs', () => {
-  const service = createService();
-  const project = createProject(service);
-  const first = service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-1',
-    patch: editPatch(),
-  });
-  advanceToCompleted(service, first.id);
-
-  service.requestGeneration({
-    projectId: project.id,
-    baseRevisionId: project.activeRevisionId,
-    idempotencyKey: 'edit-2',
-    patch: editPatch(),
+    generationId: first.id,
+    candidateId: 'candidate_1',
   });
 
   assert.throws(
     () =>
       service.selectCandidate({
         projectId: project.id,
-        generationId: first.id,
-        candidateId: 'candidate_1',
+        generationId: second.id,
+        candidateId: 'candidate_2',
       }),
-    ProjectBusyError,
+    RevisionConflictError,
   );
 });
 
-test('requires an idempotency key for every generation request', () => {
+test('rejects invalid patches before recording a generation', () => {
   const service = createService();
   const project = createProject(service);
 
   assert.throws(
     () =>
-      service.requestGeneration({
+      service.recordGeneration({
         projectId: project.id,
+        turnId: 'turn_1',
         baseRevisionId: project.activeRevisionId,
-        patch: editPatch(),
+        inputAssetId: 'asset_source',
+        patch: {
+          modify: [{ path: 'account.balance', operation: 'replace', value: 0 }],
+          preserve: [],
+        },
+        outcome: {
+          kind: 'completed',
+          candidate: { assetId: 'asset_generated_1' },
+        },
       }),
-    { code: 'INVALID_GENERATION_REQUEST' },
+    { code: 'UNSAFE_STATE_PATH' },
+  );
+});
+
+test('reports a missing revision as not found', () => {
+  const service = createService();
+
+  const project = createProject(service);
+  service.selectCandidate({
+    projectId: project.id,
+    generationId: recordGeneration(service, project).id,
+    candidateId: 'candidate_1',
+  });
+
+  assert.throws(
+    () => service.getRevision('revision_missing'),
+    (error) => error.code === 'REVISION_NOT_FOUND',
+  );
+  assert.throws(
+    () =>
+      service.recordGeneration({
+        projectId: project.id,
+        turnId: 'turn_1',
+        baseRevisionId: 'revision_stale',
+        inputAssetId: 'asset_source',
+        patch: editPatch(),
+        outcome: { kind: 'completed', candidate: { assetId: 'asset_generated_1' } },
+      }),
+    RevisionNotFoundError,
   );
 });
 
