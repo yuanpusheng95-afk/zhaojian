@@ -21,6 +21,11 @@ import {
   readLanes,
 } from '../src/infrastructure/postgres/session/lanes.mjs';
 import {
+  findEntries,
+  findEntriesOnBranch,
+  getLog,
+} from '../src/infrastructure/postgres/session/queries.mjs';
+import {
   appendRecord,
   findOpenOperations,
   findRecords,
@@ -336,5 +341,70 @@ test('computeStats counts messages and sums assistant usage', async () => {
     assert.equal(stats.messageCount, 2);
     assert.equal(stats.totalTokens, 18);
     assert.equal(stats.costTotal, 0.3);
+  });
+});
+
+test('findEntries returns every entry in sequence order', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendEntry(client, s, messageEntry('a', '1'), 'main');
+    await appendEntry(client, s, messageEntry('b', '2'), 'main');
+    const entries = await findEntries(client, s, {});
+    assert.deepEqual(entries.map((e) => e.id), ['a', 'b']);
+  });
+});
+
+test('findEntriesOnBranch walks parent links from the start entry to the root', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    const a = await appendEntry(client, s, messageEntry('a', '1'), 'main');
+    await appendEntry(client, s, messageEntry('b', '2'), 'main');
+    await createLane(client, s, 'side', a.id);
+    await appendEntry(client, s, messageEntry('c', '3'), 'side');
+
+    const branch = await findEntriesOnBranch(client, s, { start: 'c' });
+    assert.deepEqual(
+      branch.map((e) => e.id),
+      ['a', 'c'],
+      'b is on a different branch and must be excluded',
+    );
+  });
+});
+
+test('findEntriesOnBranch filters by type', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendEntry(client, s, messageEntry('a', '1'), 'main');
+    await appendEntry(
+      client,
+      s,
+      { type: 'custom', id: 'n1', customType: 'note', data: { value: 1 } },
+      'main',
+    );
+    const notes = await findEntriesOnBranch(client, s, { start: 'n1', type: 'custom' });
+    assert.deepEqual(notes.map((e) => e.id), ['n1']);
+  });
+});
+
+test('getLog merges entries records and lane moves in one sequence', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendEntry(client, s, messageEntry('a', '1'), 'main');
+    await appendRecord(client, s, startedRecord('run-1', 'main'));
+    await moveLane(client, s, 'main', 'a');
+
+    const log = await getLog(client, s, {});
+    assert.deepEqual(log.map((item) => item.seq), [1, 2, 3]);
+    assert.deepEqual(log.map((item) => item.kind), ['entry', 'record', 'lane_move']);
+  });
+});
+
+test('getLog honours the afterSeq cursor', async () => {
+  await withClient(async (client) => {
+    const s = await seedSession(client);
+    await appendEntry(client, s, messageEntry('a', '1'), 'main');
+    await appendEntry(client, s, messageEntry('b', '2'), 'main');
+    const tail = await getLog(client, s, { afterSeq: 1 });
+    assert.deepEqual(tail.map((item) => item.seq), [2]);
   });
 });
