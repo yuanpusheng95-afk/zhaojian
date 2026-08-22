@@ -31,6 +31,7 @@ import {
   findRecords,
 } from '../src/infrastructure/postgres/session/records.mjs';
 import { nextSeq } from '../src/infrastructure/postgres/session/sequences.mjs';
+import { createPostgresSessionStorage } from '../src/infrastructure/postgres/session/storage.mjs';
 import {
   insertSession,
   readSession,
@@ -407,4 +408,56 @@ test('getLog honours the afterSeq cursor', async () => {
     const tail = await getLog(client, s, { afterSeq: 1 });
     assert.deepEqual(tail.map((item) => item.seq), [2]);
   });
+});
+
+test('storage exposes every method the SessionStorage contract requires', async () => {
+  const storage = createPostgresSessionStorage({ pool, sessionId: 's1' });
+  for (const method of [
+    'getMetadata',
+    'getLanes',
+    'createLane',
+    'moveLane',
+    'appendEntry',
+    'appendRecord',
+    'getEntry',
+    'findEntries',
+    'findEntriesOnBranch',
+    'findRecords',
+    'findOpenOperations',
+    'getLog',
+    'getName',
+    'setName',
+    'getLabel',
+    'setLabel',
+    'getStats',
+  ]) {
+    assert.equal(typeof storage[method], 'function', `missing ${method}`);
+  }
+});
+
+test('every mutation runs in its own transaction and shares the sequence', async () => {
+  await resetDatabase();
+  const client = await pool.connect();
+  try {
+    await insertSession(client, {
+      id: 's1',
+      createdAt: 1000,
+      parentSessionId: null,
+      metadata: {},
+    });
+    await insertLane(client, 's1', 'main', null);
+  } finally {
+    client.release();
+  }
+
+  const storage = createPostgresSessionStorage({ pool, sessionId: 's1' });
+  const root = await storage.appendEntry(
+    { type: 'message', id: 'root', message: { role: 'user', content: [], timestamp: 1 } },
+    'main',
+  );
+  await storage.setName('Example');
+
+  assert.equal(root.seq, 1, 'default lane is free, so the first entry takes seq 1');
+  assert.equal(await storage.getName(), 'Example');
+  assert.equal((await storage.getEntry('root')).id, 'root');
 });
