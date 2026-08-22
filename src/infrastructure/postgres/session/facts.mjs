@@ -23,27 +23,37 @@ export async function getFact(client, sessionId, kind, key) {
   return value === null || value === undefined ? undefined : value;
 }
 
-/** 现算，不维护 session_stats 表——会话规模有限，省一处会不同步的派生状态。 */
+/**
+ * 现算，不维护 session_stats 表。
+ *
+ * 口径按 pi 的 SessionState：messageCount 来自 message 类型的 entries，
+ * token 与成本来自 **`usage` 类型的 records**——不是 message entry 里的 usage 字段。
+ * uncachedTokens = input + cacheWrite。
+ */
 export async function computeStats(client, sessionId) {
-  const result = await client.query(
-    `SELECT
-       count(*) FILTER (WHERE type = 'message') AS message_count,
-       coalesce(sum((payload_json -> 'message' -> 'usage' ->> 'cacheRead')::numeric), 0)
-         AS cached_tokens,
-       coalesce(sum((payload_json -> 'message' -> 'usage' ->> 'input')::numeric), 0)
-         + coalesce(sum((payload_json -> 'message' -> 'usage' ->> 'output')::numeric), 0)
-         AS uncached_tokens,
-       coalesce(sum((payload_json -> 'message' -> 'usage' ->> 'totalTokens')::numeric), 0)
-         AS total_tokens,
-       coalesce(sum((payload_json -> 'message' -> 'usage' -> 'cost' ->> 'total')::numeric), 0)
-         AS cost_total
-     FROM ${SESSION_TABLES.entries}
-     WHERE session_id = $1`,
-    [sessionId],
-  );
-  const row = result.rows[0];
+  const [messages, usage] = await Promise.all([
+    client.query(
+      `SELECT count(*) AS message_count FROM ${SESSION_TABLES.entries}
+        WHERE session_id = $1 AND type = 'message'`,
+      [sessionId],
+    ),
+    client.query(
+      `SELECT
+         coalesce(sum((payload_json -> 'usage' ->> 'cacheRead')::numeric), 0) AS cached_tokens,
+         coalesce(sum((payload_json -> 'usage' ->> 'input')::numeric), 0)
+           + coalesce(sum((payload_json -> 'usage' ->> 'cacheWrite')::numeric), 0)
+           AS uncached_tokens,
+         coalesce(sum((payload_json -> 'usage' ->> 'totalTokens')::numeric), 0) AS total_tokens,
+         coalesce(sum((payload_json -> 'usage' -> 'cost' ->> 'total')::numeric), 0) AS cost_total
+       FROM ${SESSION_TABLES.records}
+       WHERE session_id = $1 AND type = 'usage'`,
+      [sessionId],
+    ),
+  ]);
+
+  const row = usage.rows[0];
   return {
-    messageCount: Number(row.message_count),
+    messageCount: Number(messages.rows[0].message_count),
     cachedTokens: Number(row.cached_tokens),
     uncachedTokens: Number(row.uncached_tokens),
     totalTokens: Number(row.total_tokens),

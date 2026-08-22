@@ -1,4 +1,4 @@
-import { advanceLaneLeaf, readLaneLeaf } from './lanes.mjs';
+import { advanceLaneLeaf, requireLane } from './lanes.mjs';
 import { assertJsonSerializable, claimId, SESSION_TABLES } from './schema.mjs';
 import { nextSeq } from './sequences.mjs';
 
@@ -22,10 +22,7 @@ export async function appendEntry(client, sessionId, provisioned, lane) {
   // 必须先于任何写入与任何 seq 分配：非法 payload 不得消耗序列号
   const payload = assertJsonSerializable(rest, `entry ${id}`);
 
-  const leafId = await readLaneLeaf(client, sessionId, lane);
-  if (leafId === undefined) {
-    throw new Error(`Unknown lane ${lane}`);
-  }
+  const leafId = await requireLane(client, sessionId, lane);
 
   await claimId(client, sessionId, id, 'entry');
 

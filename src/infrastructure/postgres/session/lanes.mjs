@@ -1,5 +1,35 @@
+import { sessionError } from './errors.mjs';
 import { SESSION_TABLES } from './schema.mjs';
 import { nextSeq } from './sequences.mjs';
+
+/** lane 必须存在，否则 invalid_lane。返回其 leaf（可能是 null）。 */
+export async function requireLane(client, sessionId, lane) {
+  const leafId = await readLaneLeaf(client, sessionId, lane);
+  if (leafId === undefined) {
+    throw sessionError('invalid_lane', `Lane not found: ${lane}`);
+  }
+  return leafId;
+}
+
+/** lane 不得已存在，否则 already_exists。 */
+export async function validateNewLane(client, sessionId, lane) {
+  const existing = await readLaneLeaf(client, sessionId, lane);
+  if (existing !== undefined) {
+    throw sessionError('already_exists', `Lane already exists: ${lane}`);
+  }
+}
+
+/** lane 的目标点必须是已存在的 entry（null 表示空 lane，合法）。 */
+export async function validateTarget(client, sessionId, targetId) {
+  if (targetId === null || targetId === undefined) return;
+  const result = await client.query(
+    `SELECT 1 FROM ${SESSION_TABLES.entries} WHERE session_id = $1 AND id = $2`,
+    [sessionId, targetId],
+  );
+  if (result.rowCount === 0) {
+    throw sessionError('not_found', `Entry not found: ${targetId}`);
+  }
+}
 
 export async function readLanes(client, sessionId) {
   const result = await client.query(
@@ -44,11 +74,15 @@ export async function insertLane(client, sessionId, lane, at) {
 
 /** 显式建 lane：插入行并消耗一个 seq——conformance 第一个用例依赖这一点。 */
 export async function createLane(client, sessionId, lane, at) {
+  await validateNewLane(client, sessionId, lane);
+  await validateTarget(client, sessionId, at);
   await insertLane(client, sessionId, lane, at);
   await recordLaneMove(client, sessionId, lane, at);
 }
 
 export async function moveLane(client, sessionId, lane, to) {
+  await requireLane(client, sessionId, lane);
+  await validateTarget(client, sessionId, to);
   await client.query(
     `UPDATE ${SESSION_TABLES.lanes} SET leaf_id = $3
       WHERE session_id = $1 AND lane = $2`,

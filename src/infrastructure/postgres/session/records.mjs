@@ -1,3 +1,5 @@
+import { sessionError } from './errors.mjs';
+import { requireLane } from './lanes.mjs';
 import { assertJsonSerializable, claimId, SESSION_TABLES } from './schema.mjs';
 import { nextSeq } from './sequences.mjs';
 
@@ -20,6 +22,7 @@ export async function appendRecord(client, sessionId, newRecord) {
   // 必须先于任何写入与任何 seq 分配
   const payload = assertJsonSerializable(rest, `record ${id}`);
 
+  await requireLane(client, sessionId, lane);
   await claimId(client, sessionId, id, 'record');
 
   const seq = await nextSeq(client, sessionId);
@@ -46,13 +49,25 @@ export async function appendRecord(client, sessionId, newRecord) {
 }
 
 export async function findRecords(client, sessionId, query = {}) {
+  if (query.limit !== undefined && (!Number.isInteger(query.limit) || query.limit <= 0)) {
+    throw sessionError('invalid_query', 'limit must be a positive integer');
+  }
+  if (
+    query.afterSeq !== undefined &&
+    (!Number.isInteger(query.afterSeq) || query.afterSeq < 0)
+  ) {
+    throw sessionError(
+      'invalid_query',
+      'cursor sequence must be a non-negative integer',
+    );
+  }
+
   const conditions = ['session_id = $1'];
   const params = [sessionId];
 
   for (const [column, value] of [
     ['type', query.type],
     ['lane', query.lane],
-    ['run_id', query.runId],
   ]) {
     if (value !== undefined) {
       params.push(value);
@@ -60,9 +75,33 @@ export async function findRecords(client, sessionId, query = {}) {
     }
   }
 
+  // runId 同时匹配 operation_started 自身的 id 与其他记录的 runId 属性；
+  // 没有操作身份的记录一律不匹配。
+  if (query.runId !== undefined) {
+    params.push(query.runId);
+    const p = `$${params.length}`;
+    conditions.push(
+      `((type = 'operation_started' AND id = ${p}) OR (type <> 'operation_started' AND run_id = ${p}))`,
+    );
+  }
+
+  // operationKind 仅对 operation_started 有意义
+  if (query.operationKind !== undefined) {
+    params.push(query.operationKind);
+    conditions.push(
+      `(type = 'operation_started' AND op_kind = $${params.length})`,
+    );
+  }
+
+  if (query.afterSeq !== undefined) {
+    params.push(query.afterSeq);
+    conditions.push(`seq > $${params.length}`);
+  }
+
+  // pi 的默认顺序是 newestFirst
   let sql = `SELECT ${RECORD_COLUMNS} FROM ${SESSION_TABLES.records}
               WHERE ${conditions.join(' AND ')}
-              ORDER BY seq ${query.order === 'desc' ? 'DESC' : 'ASC'}`;
+              ORDER BY seq ${query.order === 'oldestFirst' ? 'ASC' : 'DESC'}`;
 
   if (query.limit !== undefined) {
     params.push(query.limit);

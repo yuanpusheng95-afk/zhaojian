@@ -23,6 +23,11 @@ const ENTRY_COLUMNS_QUALIFIED = ENTRY_COLUMNS.split(', ')
   .map((column) => `e.${column}`)
   .join(', ');
 
+/** pi 的默认顺序是 newestFirst；只有显式 oldestFirst 才升序。 */
+function orderClause(order) {
+  return order === 'oldestFirst' ? 'ASC' : 'DESC';
+}
+
 function applyEntryFilters(query, conditions, params, prefix = '') {
   for (const [column, value] of [
     ['type', query.type],
@@ -33,16 +38,23 @@ function applyEntryFilters(query, conditions, params, prefix = '') {
       conditions.push(`${prefix}${column} = $${params.length}`);
     }
   }
+  if (query.cursor?.afterSeq !== undefined) {
+    params.push(query.cursor.afterSeq);
+    conditions.push(`${prefix}seq > $${params.length}`);
+  }
 }
 
 export async function findEntries(client, sessionId, query = {}) {
+  assertValidLimit(query.limit);
+  assertValidCursor(query.cursor?.afterSeq);
+
   const conditions = ['session_id = $1'];
   const params = [sessionId];
   applyEntryFilters(query, conditions, params);
 
   let sql = `SELECT ${ENTRY_COLUMNS} FROM ${SESSION_TABLES.entries}
               WHERE ${conditions.join(' AND ')}
-              ORDER BY seq ${query.order === 'desc' ? 'DESC' : 'ASC'}`;
+              ORDER BY seq ${orderClause(query.order)}`;
 
   if (query.limit !== undefined) {
     params.push(query.limit);
@@ -57,17 +69,18 @@ export async function findEntries(client, sessionId, query = {}) {
  * 沿 parent_id 从 start 回溯到根，得到该分支的全部 entry。
  * sqlite 后端为此维护 branch_entries 派生缓存；PostgreSQL 用递归 CTE 现算，
  * 少一张需要维护一致性的表。
+ *
+ * stopAtId / stopAtType 是包含式边界：扫描在第一个命中之后结束。
  */
 export async function findEntriesOnBranch(client, sessionId, query = {}) {
   if (!query.start) {
     throw new Error('findEntriesOnBranch requires a start entry id');
   }
+  assertValidLimit(query.limit);
+  assertValidCursor(query.cursor?.afterSeq);
 
-  const conditions = [];
   const params = [sessionId, query.start];
-  applyEntryFilters(query, conditions, params, 'b.');
-
-  let sql = `
+  const sql = `
     WITH RECURSIVE branch AS (
       SELECT ${ENTRY_COLUMNS}
         FROM ${SESSION_TABLES.entries}
@@ -78,17 +91,26 @@ export async function findEntriesOnBranch(client, sessionId, query = {}) {
         JOIN branch ON e.id = branch.parent_id
        WHERE e.session_id = $1
     )
-    SELECT ${ENTRY_COLUMNS} FROM branch b
-    ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
-    ORDER BY seq ${query.order === 'desc' ? 'DESC' : 'ASC'}`;
-
-  if (query.limit !== undefined) {
-    params.push(query.limit);
-    sql += ` LIMIT $${params.length}`;
-  }
+    SELECT ${ENTRY_COLUMNS} FROM branch ORDER BY seq DESC`;
 
   const result = await client.query(sql, params);
-  return result.rows.map(rowToEntry);
+  // 从 leaf 向 root 的顺序（seq 降序）应用包含式边界，与 walkToRoot 一致
+  const walked = [];
+  for (const row of result.rows) {
+    const entry = rowToEntry(row);
+    walked.push(entry);
+    if (entry.id === query.stopAtId || entry.type === query.stopAtType) break;
+  }
+
+  const ordered = query.order === 'oldestFirst' ? walked.reverse() : walked;
+  const filtered = ordered.filter(
+    (entry) =>
+      (query.type === undefined || entry.type === query.type) &&
+      (query.customType === undefined || entry.customType === query.customType) &&
+      (query.cursor?.afterSeq === undefined || entry.seq > query.cursor.afterSeq),
+  );
+
+  return query.limit === undefined ? filtered : filtered.slice(0, query.limit);
 }
 
 /**

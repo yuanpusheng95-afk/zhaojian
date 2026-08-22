@@ -86,10 +86,8 @@ export function createPostgresSessionRepo({ pool }) {
     },
 
     async delete(metadata) {
-      await inTransaction(async (client) => {
-        await requireSession(client, metadata.id);
-        await deleteSession(client, metadata.id);
-      });
+      // 幂等：删除不存在的会话不报错
+      await inTransaction((client) => deleteSession(client, metadata.id));
     },
 
     /**
