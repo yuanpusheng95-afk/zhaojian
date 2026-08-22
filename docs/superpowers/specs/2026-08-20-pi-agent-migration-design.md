@@ -813,6 +813,20 @@ session_facts      name / label 等 kv
 
 `seq` 的单调分配在事务内完成，对应参考实现的 `session-sequences.ts`。
 
+### 11.2.1 实施修正（切片 1 完成后回填）
+
+以下五条以实现为准，推翻本节此前的部分描述：
+
+1. **验收契约是 `SessionRepo` + `SessionStorage`，不只是后者。** `SessionBackendFixture` 要求 `readonly repository: SessionRepo`，因此 `create` / `open` / `list` / `delete` / **`fork`** 都在范围内。把 sqlite 的 `repo.ts` 判为「不是核心」是错的——conformance 有独立的 "repository and forks" 组，`fork` 需要实现 branch/tree 两种 scope、before/at 两种位置，并选择性复制 name/label facts。
+
+2. **实际建 8 张表，不是 5 张。** 除 sessions / entries / records / lanes / facts 外，还需要 `agent_session_sequences`、`agent_session_lane_moves`，以及 **`agent_session_ids`**——entries 与 records 共享同一个 id 命名空间，PostgreSQL 无法跨表建唯一索引，只能用一张注册表承载。sqlite 的 `branch_entries` / `branch_tips` 是派生缓存，用 `WITH RECURSIVE` 现算即可省掉；`writer_leases` 解决的是多进程抢 SQLite 文件，PostgreSQL 有真事务，同样不需要。
+
+3. **`seq` 是全会话共享的单调序列，每一次 mutation 消耗一个**��—包括 `createLane`、`moveLane`、`setName`、`setLabel`。但**由 `repo.create()` 建的默认 `main` lane 不消耗**，否则第一条 entry 拿不到 seq 1。失败的 mutation 必须不留空洞，因此 seq 必须用**事务内的表计数器**而非 `CREATE SEQUENCE`（原生序列不随回滚撤销）。
+
+4. **`getStats` 的 token 与成本来自 `usage` 类型的 records，不是 message entry 里的 usage 字段。** `uncachedTokens = input + cacheWrite`。`messageCount` 才来自 entries。
+
+5. **`SessionState`（`state.ts`，344 行���是真正的行为规范，但未导出。** 查询默认顺序是 `newestFirst`、cursor 方向随 order 反转、分支边界包含式且在排序之后应用、每 lane 只允许一个未闭合 operation、`delete` 必须幂等——这些都只写在那里。**实施前应先通读它，而不是从接口签名反推。** 本切片因此返工了一轮。
+
 ### 11.3 三层可观测性
 
 pi 提供三种互不重叠的观测手段，不可混为一谈。
@@ -893,11 +907,11 @@ src/infrastructure/postgres/session/records.mjs
 src/infrastructure/postgres/session/lanes.mjs
 src/infrastructure/postgres/session/facts.mjs
 src/infrastructure/postgres/session/sequences.mjs
-migrations/005_agent_turns.sql          创建 agent_turns
-migrations/006_generations_slim.sql     generation_jobs → generations；逐列清算（§7.2 表）：删 idempotency_key 及其唯一约束、删 operation 与 lease 列、删队列索引、加 input_asset_id 与 turn_id、状态机砍到 2 态、重建并改名外键约束
-migrations/007_projects_owner.sql       删 running_generation_id 及其 FK，新增 running_turn_id → agent_turns；新增 owner_id
-migrations/008_drop_legacy.sql          删除 provider_jobs 与 idempotency_requests（§7.3、§7.5）
-migrations/009_agent_sessions.sql       session_sessions / _entries / _records / _lanes / _facts
+migrations/006_agent_turns.sql          创建 agent_turns
+migrations/007_generations_slim.sql     generation_jobs → generations；逐列清算（§7.2 表）：删 idempotency_key 及其唯一约束、删 operation 与 lease 列、删队列索引、加 input_asset_id 与 turn_id、状态机砍到 2 态、重建并改名外键约束
+migrations/008_projects_owner.sql       删 running_generation_id 及其 FK，新增 running_turn_id → agent_turns；新增 owner_id
+migrations/009_drop_legacy.sql          删除 provider_jobs 与 idempotency_requests（§7.3、§7.5）
+（切片 1 已占用 005_agent_sessions.sql，故切片 2 的迁移号顺延）
 test/agent-tools.test.mjs
 test/agent-turn-worker.test.mjs
 test/relay-images-provider.test.mjs
@@ -1009,7 +1023,9 @@ if (error.code === '23505') return new HttpError(409, 'RESOURCE_CONFLICT', ...)
 3. 构造依赖并启动
 ```
 
-**不在启动时跑迁移。** 现有 `api/main.mjs` 与 `worker/main.mjs` **各自**都有 `await runMigrations(pool)`——同时启动就是并发跑同一批迁移。切片 1 要新增 5 张 session 表和 5 个迁移文件，竞态窗口只会变宽；将来多开 Worker 进程更是 N 个进程抢迁移。`package.json` 本就有独立的 `npm run db:migrate`，**迁移交给部署流程显式执行**，两处 `runMigrations` 调用一并删除。
+**不在启动时跑迁移。** 现有 `api/main.mjs` 与 `worker/main.mjs` **各自**都有 `await runMigrations(pool)`。
+
+修正一处此前的夸大：`runMigrations` 已用 `pg_advisory_xact_lock(735701)` 串行化，**并发跑迁移不是数据竞态**。真正的问题是职责不清与启动时的串行等待——每个进程启动都要抢锁并等前一个跑完。`package.json` 本就有独立的 `npm run db:migrate`，**迁移交给部署流程显式执行**，两处 `runMigrations` 调用一并删除。
 
 配置校验必须排在最前：若放在构造阶段，会在跑完连接和其他初始化之后才失败，白白浪费启动时间并可能留下半初始化状态。
 
@@ -1136,9 +1152,11 @@ GET  /generations/:id                             删除
 | Worker 轮次单测 | 编排正确性：自评重生、同条件重 roll、超限后停、`select_candidate` 终止轮次、fatal 中止、**并发上限与优雅关闭（§10.4）** | fake StreamFn + fake provider |
 | 集成测试 | 全链路 | 真实 PostgreSQL + 真实 MinIO + fake StreamFn + fake provider |
 | 端到端冒烟 | 真实中转站真出图 | `npm run smoke:e2e`，手动执行，**不进 CI** |
-| PostgreSQL SessionStorage | 17 个方法的契约一致性 | pi 官方 `createSessionBackendConformance` + 真实 PostgreSQL |
+| PostgreSQL 会话后端 | `SessionStorage` 17 方法 + `SessionRepo` 5 方法的契约一致性 | pi 官方 `createSessionBackendConformance`（30 用例）+ 真实 PostgreSQL |
 
 **集成测试用真基础设施 + 假模型**：基础设施是 bug 藏身处，模型是花钱的地方。
+
+**集成测试必须串行执行**：`node --test` 默认为每个文件开一个并行进程，而各文件共享同一个测试库并在 `beforeEach` 里 `DROP SCHEMA public CASCADE`，并行会互相清库。`npm run test:integration` 已加 `--test-concurrency=1`。
 
 测试框架不变，继续用 `node:test`，不引入 vitest。pi 发布 ESM dist，`.mjs` 直接 import。
 
@@ -1146,7 +1164,7 @@ GET  /generations/:id                             删除
 
 ### 切片 1：PostgreSQL SessionStorage
 
-实现 `SessionStorage` 的 17 个方法，对照 sqlite 参考实现移植（§11.2）。
+实现 `SessionStorage`（17 方法）与 `SessionRepo`（5 方法，含 fork），对照 `state.ts` 的行为规范移植（§11.2.1）。
 
 **独立可验收：pi 的 `createSessionBackendConformance` 套件全绿。** 不依赖真实模型、不依赖中转站、不依赖对象存储，因此可以先于所有 Agent 接线完成，风险最低、验收标准最确定。
 

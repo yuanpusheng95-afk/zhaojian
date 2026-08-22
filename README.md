@@ -116,6 +116,14 @@ npm run test:integration
 
 测试脚本默认创建并重置独立的 `photo_agent_test` 数据库；如果数据库名不以 `_test` 结尾，会拒绝执行破坏性重置。
 
+集成测试**必须串行**（`--test-concurrency=1`）：各测试文件共享同一个测试库并在 `beforeEach` 里 `DROP SCHEMA public CASCADE`，`node --test` 默认的多文件并行会让它们互相清库。
+
+只跑会话后端的一致性测试：
+
+```bash
+npm run test:session
+```
+
 语法检查：
 
 ```bash
@@ -129,6 +137,7 @@ migrations/                         PostgreSQL migration
 src/application/                    EditInterpreter 与 Mock LanguageModel
 src/domain/                         Photo State 与领域状态机
 src/infrastructure/postgres/        Migration、事务 Repository、SQL Queue
+src/infrastructure/postgres/session/  pi Agent 会话的 PostgreSQL 后端（SessionStorage + SessionRepo）
 src/worker/                         Generation Worker 与 Mock Provider
 src/api/                            原生 Node HTTP API
 test/                               纯领域单元测试
@@ -139,6 +148,7 @@ test-integration/                   真实 PostgreSQL 与 HTTP 纵切测试
 
 - 只接 Mock ImageGenerationProvider，尚未接真实图像供应商。
 - 已实现内部 EditInterpreter 和 Mock LanguageModel，尚未接真实 LanguageModel，也未开放自然语言 HTTP 入口。
+- Agent 会话轨迹已可持久化到 PostgreSQL：实现了 pi 的 `SessionStorage`（17 方法）与 `SessionRepo`（5 方法，含 fork），通过官方 `createSessionBackendConformance` 全部 30 个用例。Agent 本身尚未接线（切片 2）。
 - **assumption：真实入口接入前，同一消息不会并发重复解释；公开入口需要持久化 Message/EditRequest。**
 - 尚未实现对象存储上传、鉴权、SSE 和前端。
 - 租约只能阻止 stale worker 写数据库，不能撤销已经发给真实 Provider 的外部调用。
