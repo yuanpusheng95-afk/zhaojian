@@ -5,7 +5,8 @@
   "description": "照见 Photo Agent V1 modular monolith and generation worker",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "test:integration": "node scripts/prepare-test-database.mjs && node --test test-integration/*.test.mjs",
+    "test:integration": "node scripts/prepare-test-database.mjs && node --test --test-concurrency=1 test-integration/*.test.mjs",
+    "test:session": "node scripts/prepare-test-database.mjs && node --test --test-concurrency=1 test-integration/session-storage-*.test.mjs",
     "check": "node scripts/check-syntax.mjs",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",

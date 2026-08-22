@@ -260,10 +260,17 @@ test('findRecords filters by type and lane', async () => {
     await appendRecord(client, s, startedRecord('b', 'side'));
     await appendRecord(client, s, finishedRecord('c', 'main', 'a'));
 
+    // pi 的默认顺序是 newestFirst
     const started = await findRecords(client, s, { type: 'operation_started' });
-    assert.deepEqual(started.map((r) => r.id), ['a', 'b']);
+    assert.deepEqual(started.map((r) => r.id), ['b', 'a']);
 
-    const mainOnly = await findRecords(client, s, { lane: 'main' });
+    const oldestFirst = await findRecords(client, s, {
+      type: 'operation_started',
+      order: 'oldestFirst',
+    });
+    assert.deepEqual(oldestFirst.map((r) => r.id), ['a', 'b']);
+
+    const mainOnly = await findRecords(client, s, { lane: 'main', order: 'oldestFirst' });
     assert.deepEqual(mainOnly.map((r) => r.id), ['a', 'c']);
   });
 });
@@ -272,11 +279,17 @@ test('findOpenOperations returns newest first and excludes finished runs', async
   await withClient(async (client) => {
     const s = await seedSession(client);
     await appendRecord(client, s, startedRecord('run-1', 'main'));
-    await appendRecord(client, s, startedRecord('run-2', 'main'));
     await appendRecord(client, s, finishedRecord('fin-1', 'main', 'run-1'));
+    await appendRecord(client, s, startedRecord('run-2', 'main'));
 
     const open = await findOpenOperations(client, s, 'main', { limit: 2 });
-    assert.deepEqual(open.map((r) => r.id), ['run-2']);
+    assert.deepEqual(open.map((r) => r.id), ['run-2'], 'run-1 已闭合');
+
+    await assert.rejects(
+      () => appendRecord(client, s, startedRecord('run-3', 'main')),
+      (error) => error.code === 'storage',
+      '同一 lane 不允许第二个未闭合操作',
+    );
   });
 });
 
@@ -308,39 +321,30 @@ test('clearing a fact stores null and reads back undefined', async () => {
   });
 });
 
-test('computeStats counts messages and sums assistant usage', async () => {
+test('computeStats counts message entries and sums usage records', async () => {
   await withClient(async (client) => {
     const s = await seedSession(client);
     await appendEntry(client, s, messageEntry('u1', 'hi'), 'main');
-    await appendEntry(
-      client,
-      s,
-      {
-        type: 'message',
-        id: 'a1',
-        message: {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'yo' }],
-          api: 'anthropic-messages',
-          provider: 'anthropic',
-          model: 'claude-sonnet-4-5',
-          usage: {
-            input: 10,
-            output: 5,
-            cacheRead: 2,
-            cacheWrite: 1,
-            totalTokens: 18,
-            cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
-          },
-          stopReason: 'stop',
-          timestamp: 1,
-        },
+    await appendEntry(client, s, messageEntry('a1', 'yo'), 'main');
+    // token 与成本只来自 usage 类型的 record
+    await appendRecord(client, s, {
+      type: 'usage',
+      id: 'usage-1',
+      lane: 'main',
+      usage: {
+        input: 10,
+        output: 5,
+        cacheRead: 2,
+        cacheWrite: 1,
+        totalTokens: 18,
+        cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
       },
-      'main',
-    );
+    });
 
     const stats = await computeStats(client, s);
     assert.equal(stats.messageCount, 2);
+    assert.equal(stats.cachedTokens, 2);
+    assert.equal(stats.uncachedTokens, 11, 'input + cacheWrite');
     assert.equal(stats.totalTokens, 18);
     assert.equal(stats.costTotal, 0.3);
   });
@@ -351,8 +355,15 @@ test('findEntries returns every entry in sequence order', async () => {
     const s = await seedSession(client);
     await appendEntry(client, s, messageEntry('a', '1'), 'main');
     await appendEntry(client, s, messageEntry('b', '2'), 'main');
-    const entries = await findEntries(client, s, {});
-    assert.deepEqual(entries.map((e) => e.id), ['a', 'b']);
+    assert.deepEqual(
+      (await findEntries(client, s, {})).map((e) => e.id),
+      ['b', 'a'],
+      'default order is newestFirst',
+    );
+    assert.deepEqual(
+      (await findEntries(client, s, { order: 'oldestFirst' })).map((e) => e.id),
+      ['a', 'b'],
+    );
   });
 });
 
@@ -364,7 +375,10 @@ test('findEntriesOnBranch walks parent links from the start entry to the root', 
     await createLane(client, s, 'side', a.id);
     await appendEntry(client, s, messageEntry('c', '3'), 'side');
 
-    const branch = await findEntriesOnBranch(client, s, { start: 'c' });
+    const branch = await findEntriesOnBranch(client, s, {
+      start: 'c',
+      order: 'oldestFirst',
+    });
     assert.deepEqual(
       branch.map((e) => e.id),
       ['a', 'c'],
@@ -508,7 +522,7 @@ test('fork copies the branch entries and leaves the source untouched', async () 
       'main',
     );
 
-    const forked = await repo.fork({ id: 'src' }, { id: 'fork', at: a.id });
+    const forked = await repo.fork({ id: 'src' }, { id: 'fork', entryId: a.id, position: 'at' });
 
     assert.deepEqual(
       (await forked.findEntries()).map((e) => e.id),
@@ -516,7 +530,7 @@ test('fork copies the branch entries and leaves the source untouched', async () 
       'fork carries only the branch up to the fork point',
     );
     assert.deepEqual(
-      (await source.findEntries()).map((e) => e.id),
+      (await source.findEntries({ order: 'oldestFirst' })).map((e) => e.id),
       ['a', 'b'],
       'source must be unchanged',
     );
@@ -538,7 +552,7 @@ test('fork does not copy records', async () => {
       intent: { kind: 'run', originalPrompt: [], initialMessages: [] },
     });
 
-    const forked = await repo.fork({ id: 'src' }, { id: 'fork', at: a.id });
+    const forked = await repo.fork({ id: 'src' }, { id: 'fork', entryId: a.id, position: 'at' });
     assert.deepEqual(await forked.findRecords(), []);
   });
 });

@@ -1,7 +1,7 @@
 import { appendEntry, readEntry } from './entries.mjs';
 import { isUniqueViolation, sessionError } from './errors.mjs';
 import { computeStats, getFact, setFact } from './facts.mjs';
-import { createLane, moveLane, readLanes } from './lanes.mjs';
+import { createLane, moveLane, readLanes, validateTarget } from './lanes.mjs';
 import { findEntries, findEntriesOnBranch, getLog } from './queries.mjs';
 import { appendRecord, findOpenOperations, findRecords } from './records.mjs';
 import { readSession } from './sessions.mjs';
@@ -54,7 +54,12 @@ export function createPostgresSessionStorage({ pool, sessionId }) {
     async getMetadata() {
       const row = await withClient((client) => readSession(client, sessionId));
       if (!row) throw sessionError('not_found', `Session ${sessionId} not found`);
-      return { id: row.id, createdAt: row.createdAt, ...row.metadata };
+      return {
+        id: row.id,
+        createdAt: row.createdAt,
+        parentSessionId: row.parentSessionId ?? undefined,
+        ...row.metadata,
+      };
     },
 
     getLanes: () => withClient((client) => readLanes(client, sessionId)),
@@ -84,7 +89,11 @@ export function createPostgresSessionStorage({ pool, sessionId }) {
       inTransaction((client) => setFact(client, sessionId, 'name', null, name)),
     getLabel: (id) => withClient((client) => getFact(client, sessionId, 'label', id)),
     setLabel: (id, label) =>
-      inTransaction((client) => setFact(client, sessionId, 'label', id, label)),
+      inTransaction(async (client) => {
+        // label 的目标必须是已存在的 entry
+        await validateTarget(client, sessionId, id);
+        await setFact(client, sessionId, 'label', id, label);
+      }),
 
     getStats: () => withClient((client) => computeStats(client, sessionId)),
   };

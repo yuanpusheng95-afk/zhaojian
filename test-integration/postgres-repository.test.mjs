@@ -111,6 +111,14 @@ test('migration creates the persistence tables', async () => {
   assert.deepEqual(
     result.rows.map((row) => row.table_name),
     [
+      'agent_session_entries',
+      'agent_session_facts',
+      'agent_session_ids',
+      'agent_session_lane_moves',
+      'agent_session_lanes',
+      'agent_session_records',
+      'agent_session_sequences',
+      'agent_sessions',
       'assets',
       'generation_jobs',
       'generation_outputs',

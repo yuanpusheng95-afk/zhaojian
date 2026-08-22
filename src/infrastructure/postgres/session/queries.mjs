@@ -44,73 +44,96 @@ function applyEntryFilters(query, conditions, params, prefix = '') {
   }
 }
 
+/** 与 pi 的 matchesEntryQuery 一致：cursor 的方向随 order 变。 */
+function matchesEntryQuery(entry, query) {
+  if (query.type !== undefined && entry.type !== query.type) return false;
+  if (
+    query.customType !== undefined &&
+    !(entry.type === 'custom' && entry.customType === query.customType)
+  ) {
+    return false;
+  }
+  if (query.cursor !== undefined) {
+    return query.order === 'oldestFirst'
+      ? entry.seq > query.cursor.afterSeq
+      : entry.seq < query.cursor.afterSeq;
+  }
+  return true;
+}
+
 export async function findEntries(client, sessionId, query = {}) {
   assertValidLimit(query.limit);
   assertValidCursor(query.cursor?.afterSeq);
 
-  const conditions = ['session_id = $1'];
-  const params = [sessionId];
-  applyEntryFilters(query, conditions, params);
+  const result = await client.query(
+    `SELECT ${ENTRY_COLUMNS} FROM ${SESSION_TABLES.entries}
+      WHERE session_id = $1
+      ORDER BY seq ${orderClause(query.order)}`,
+    [sessionId],
+  );
 
-  let sql = `SELECT ${ENTRY_COLUMNS} FROM ${SESSION_TABLES.entries}
-              WHERE ${conditions.join(' AND ')}
-              ORDER BY seq ${orderClause(query.order)}`;
-
-  if (query.limit !== undefined) {
-    params.push(query.limit);
-    sql += ` LIMIT $${params.length}`;
+  const results = [];
+  for (const row of result.rows) {
+    const entry = rowToEntry(row);
+    if (!matchesEntryQuery(entry, query)) continue;
+    results.push(entry);
+    if (results.length === query.limit) break;
   }
-
-  const result = await client.query(sql, params);
-  return result.rows.map(rowToEntry);
+  return results;
 }
 
 /**
- * 沿 parent_id 从 start 回溯到根，得到该分支的全部 entry。
- * sqlite 后端为此维护 branch_entries 派生缓存；PostgreSQL 用递归 CTE 现算，
- * 少一张需要维护一致性的表。
+ * 沿 parent_id 从 start 回溯到根。sqlite 后端为此维护 branch_entries 派生缓存；
+ * PostgreSQL 用递归 CTE 现算，少一张需要维护一致性的表。
  *
- * stopAtId / stopAtType 是包含式边界：扫描在第一个命中之后结束。
+ * 边界（stopAtId / stopAtType）是包含式的，且**在排序之后**应用：
+ * oldestFirst 先整条反转再走，因此边界落点与 newestFirst 完全不同。
  */
 export async function findEntriesOnBranch(client, sessionId, query = {}) {
-  if (!query.start) {
-    throw new Error('findEntriesOnBranch requires a start entry id');
-  }
   assertValidLimit(query.limit);
   assertValidCursor(query.cursor?.afterSeq);
-
-  const params = [sessionId, query.start];
-  const sql = `
-    WITH RECURSIVE branch AS (
-      SELECT ${ENTRY_COLUMNS}
-        FROM ${SESSION_TABLES.entries}
-       WHERE session_id = $1 AND id = $2
-      UNION ALL
-      SELECT ${ENTRY_COLUMNS_QUALIFIED}
-        FROM ${SESSION_TABLES.entries} e
-        JOIN branch ON e.id = branch.parent_id
-       WHERE e.session_id = $1
-    )
-    SELECT ${ENTRY_COLUMNS} FROM branch ORDER BY seq DESC`;
-
-  const result = await client.query(sql, params);
-  // 从 leaf 向 root 的顺序（seq 降序）应用包含式边界，与 walkToRoot 一致
-  const walked = [];
-  for (const row of result.rows) {
-    const entry = rowToEntry(row);
-    walked.push(entry);
-    if (entry.id === query.stopAtId || entry.type === query.stopAtType) break;
+  if (!query.start) {
+    throw sessionError('invalid_query', 'findEntriesOnBranch requires a start');
   }
 
-  const ordered = query.order === 'oldestFirst' ? walked.reverse() : walked;
-  const filtered = ordered.filter(
-    (entry) =>
-      (query.type === undefined || entry.type === query.type) &&
-      (query.customType === undefined || entry.customType === query.customType) &&
-      (query.cursor?.afterSeq === undefined || entry.seq > query.cursor.afterSeq),
+  const result = await client.query(
+    `WITH RECURSIVE branch AS (
+       SELECT ${ENTRY_COLUMNS}
+         FROM ${SESSION_TABLES.entries}
+        WHERE session_id = $1 AND id = $2
+       UNION ALL
+       SELECT ${ENTRY_COLUMNS_QUALIFIED}
+         FROM ${SESSION_TABLES.entries} e
+         JOIN branch ON e.id = branch.parent_id
+        WHERE e.session_id = $1
+     )
+     SELECT ${ENTRY_COLUMNS} FROM branch ORDER BY seq DESC`,
+    [sessionId, query.start],
   );
 
-  return query.limit === undefined ? filtered : filtered.slice(0, query.limit);
+  if (result.rows.length === 0) {
+    throw sessionError('not_found', `Entry not found: ${query.start}`);
+  }
+
+  const leafToRoot = result.rows.map(rowToEntry);
+  const results = [];
+
+  if (query.order === 'oldestFirst') {
+    for (const entry of [...leafToRoot].reverse()) {
+      const reachedBound =
+        entry.id === query.stopAtId || entry.type === query.stopAtType;
+      if (matchesEntryQuery(entry, query)) results.push(entry);
+      if (reachedBound || results.length === query.limit) break;
+    }
+  } else {
+    for (const entry of leafToRoot) {
+      if (matchesEntryQuery(entry, query)) results.push(entry);
+      if (results.length === query.limit) break;
+      if (entry.id === query.stopAtId || entry.type === query.stopAtType) break;
+    }
+  }
+
+  return results;
 }
 
 /**
