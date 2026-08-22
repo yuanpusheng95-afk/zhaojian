@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { loadApiConfig, loadWorkerConfig } from '../src/config.mjs';
+import { loadApiConfig, loadImageConfig, loadWorkerConfig } from '../src/config.mjs';
 
 const FULL_WORKER_ENV = {
   LLM_API_KEY: 'llm-key',
@@ -62,6 +62,25 @@ test('image edit route defaults to chat and rejects unknown values', () => {
   assert.throws(
     () => loadWorkerConfig({ ...FULL_WORKER_ENV, IMAGE_EDIT_ROUTE: 'magic' }),
     /IMAGE_EDIT_ROUTE/,
+  );
+});
+
+test('image-only config does not require llm credentials', () => {
+  const config = loadImageConfig({
+    IMAGE_BASE_URL: 'https://relay.example.com/v1',
+    IMAGE_API_KEY: 'image-key',
+    S3_ACCESS_KEY: 'ak',
+    S3_SECRET_KEY: 'sk',
+  });
+  assert.equal(config.image.modelId, 'gpt-image-2');
+  assert.equal(config.image.size, '1024x1024');
+  assert.ok(!('llm' in config), 'the image smoke never calls the LLM');
+});
+
+test('image-only config still requires the relay credentials it does use', () => {
+  assert.throws(
+    () => loadImageConfig({ S3_ACCESS_KEY: 'ak', S3_SECRET_KEY: 'sk' }),
+    /IMAGE_BASE_URL/,
   );
 });
 

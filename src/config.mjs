@@ -70,6 +70,26 @@ export function loadWorkerConfig(env = process.env) {
   };
 }
 
+/**
+ * 只做生图的进程（冒烟脚本）用这个：不需要 LLM 凭证，也不需要数据库。
+ *
+ * 校验必须只要求本进程真正用到的东西——要求过宽会逼人填假值绕过去，
+ * 那 fail-fast 这道护栏就废了。
+ */
+export function loadImageConfig(env = process.env) {
+  const worker = { image: null, s3: null, guards: null };
+  worker.image = {
+    baseUrl: required(env, 'IMAGE_BASE_URL'),
+    apiKey: required(env, 'IMAGE_API_KEY'),
+    modelId: env.IMAGE_MODEL ?? 'gpt-image-2',
+    size: env.IMAGE_SIZE ?? '1024x1024',
+    editRoute: editRoute(env),
+  };
+  worker.s3 = s3Config(env);
+  worker.guards = { imageTimeoutMs: integer(env, 'IMAGE_TIMEOUT_MS', 180_000) };
+  return worker;
+}
+
 /** API 不加载 pi Agent（设计文档 §3.1），因此不需要任何模型凭证。 */
 export function loadApiConfig(env = process.env) {
   return {
