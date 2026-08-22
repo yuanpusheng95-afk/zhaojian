@@ -20,7 +20,7 @@
 - 迁移编号沿用序号规则，`migrations/005_agent_sessions.sql` 已被占用，本切片新增 006–009
 - **迁移不携带存量数据迁移逻辑**（理由见「开发库策略」），因此迁移按「空表或可丢弃数据」编写
 - 本切片结束前不新增 `agent-turn-queue`（那是 2c 的 `claimNextTurn` / `renewTurnLease` / `finishTurn` / `requestTurn`）；本切片只交付它们依赖的表和列
-- **每个 Task 结束时 `npm test` 必须全绿**（只允许 `test-integration/` 内已声明的预期红灯）；为此失效调用方在改 domain/repository **之前**删除（Task 2）
+- **每个 Task 结束时 `npm test` 与 `npm run test:integration` 必须全绿，本切片没有计划内红灯窗口**；为此失效调用方在改 domain/repository **之前**删除（Task 1）
 
 ## 对设计文档的六处修正（实施前已核实，以本计划为准）
 
@@ -38,19 +38,19 @@
 
 | 用例（行号） | 处置 | 理由 |
 |---|---|---|
-| creates a revision only after selection（87） | 保留 | 断言不变；仅 `createProject` 的 `anchorAssetId` 参数（46 行处使用）机械改为 `anchorAsset` 对象 |
+| creates a revision only after selection（87） | 保留断言，重写构造 | 最终断言（114–118 行）不变；构造路径换掉——`advanceToCompleted` helper（66–85 行，5 次 transitionGeneration + addCandidate）被删，改为单次带 outcome 的 recordGeneration；98 行 `status === 'queued'` 断言改 `'completed'`；46 行 anchorAssetId 机械改 anchorAsset 对象 |
 | returns the original generation for the same idempotency key（121） | **删除** | 幂等离开 domain，由 `agent_turns` 唯一约束承担（§7.5），2c/2d 验收 |
 | rejects a new generation while another is active（138） | **重写** | ProjectBusyError 消失 → 改为「一轮内连续两次 recordGeneration 都成功」（重 roll 在 domain 层的直接表达） |
-| rejects an edit based on a stale revision（161） | 保留 | 语义不变 |
+| rejects an edit based on a stale revision（161） | 保留 | 仅 requestGeneration 调用点换 recordGeneration 新签名（去 idempotencyKey、补 turnId/outcome），断言不变 |
 | rejects status jumps（177） | **删除** | 状态机删除，generation 创建即终态 |
-| selecting same candidate idempotent / another rejected（197） | 保留 | 语义不变 |
+| selecting same candidate idempotent / another rejected（197） | 保留断言，重写构造 | 「同 candidate 幂等 / 异 candidate 拒绝」保留；但旧构造给一个 generation 塞两个 candidate（215–226 行）——MVP 一次生图一候选（§5.2），该前提不复存在。「异 candidate 拒绝」改用不存在的 candidateId 表达（仍命中 already-selected 分支） |
 | rejects reusing an idempotency key for a different request（252） | **删除** | 同 121 |
 | releases the project lock when a generation fails（278） | **删除** | domain 不再持有锁 |
 | older completed generation cannot change active revision（301） | **重写** | ProjectBusyError 消失 → 改为断言 `RevisionConflictError`（stale inputRevision 保护仍然存在） |
 | requires an idempotency key（330） | **删除** | 参数已不存在 |
 | rejects invalid initial photo state（345） | 保留 | 语义不变 |
 
-   结果：4 保留（1 个含机械参数更新）、2 重写、5 删除，另有新增用例（见 Task 3）。
+   结果：4 保留（断言语义不变；其中 2 个重写构造路径、1 个仅签名适配、1 个原样）、2 重写、5 删除，另有新增用例（见 Task 2）。
 
 ## 开发库策略（Task 3 第一步执行）
 
@@ -98,16 +98,16 @@ migrations/007_generations.sql             改名 + 逐列清算 + 约束/索引
 migrations/008_projects_turns.sql          running_turn_id + owner_id
 migrations/009_drop_legacy.sql             删除 idempotency_requests
 
-src/domain/generation-lifecycle.mjs        GENERATION_TRANSITIONS 删除；TERMINAL/SELECTABLE 砍到二态
-src/domain/photo-project-service.mjs       锁/幂等/状态机摘除；requestGeneration → recordGeneration
+src/domain/generation-lifecycle.mjs        GENERATION_TRANSITIONS 删除；TERMINAL/SELECTABLE 砍到二态（Task 3，随 repository 重写）
+src/domain/photo-project-service.mjs       锁/幂等/状态机摘除；requestGeneration → recordGeneration（Task 2）
 src/infrastructure/postgres/photo-project-repository.mjs
                                            createProject 补 owner/uri；recordGeneration 单事务记录；
                                            selectCandidate 去锁；删 transitionGeneration/recordProviderJob/addCandidate
 
-test/project-workflow.test.mjs             4 保留 / 2 重写 / 5 删除 / 新增
+test/project-workflow.test.mjs             4 保留 / 2 重写 / 5 删除 / 新增 2（Task 2）
 test-integration/postgres-repository.test.mjs   接近重写（22 例 → 新套件，含重 roll 验收）
 
-删除（Task 2，先于 domain/repository 动手——理由见该任务）：
+删除（Task 1，先于 domain/repository 动手——理由见该任务）：
 src/application/edit-interpreter.mjs
 src/application/mock-language-model.mjs
 src/infrastructure/postgres/generation-queue.mjs
@@ -157,7 +157,7 @@ generation_jobs 上的外键：
 
 ### Task 1: 删除失效调用方（先拆脚手架，再改承重墙）
 
-**为什么这一步必须在 domain/repository 之前：** 这些文件调用的接口在后续任务里改形。实测依赖链：`test/generation-worker.test.mjs:4` 与 `src/infrastructure/postgres/generation-queue.mjs:3` 都 import `GenerationLeaseLostError`（Task 3 会从 repository 删除该导出）——若先改 repository，`npm test` 会在 Task 4 与删除之间挂掉，违反「每个 Task 结束 npm test 全绿」的约束。先删调用方，后续改造全程绿灯。
+**为什么这一步必须在 domain/repository 之前：** 这些文件调用的接口在后续任务里改形。实测依赖链：`test/generation-worker.test.mjs:4` 与 `src/infrastructure/postgres/generation-queue.mjs:3` 都 import `GenerationLeaseLostError`（Task 3 会从 repository 删除该导出）——若不先删调用方，repository 改形的瞬间 `npm test` 就会挂掉，违反「每个 Task 结束全绿」的约束。先删调用方，后续改造全程绿灯。
 
 这些代码本来就在 2b 的死刑名单上（spec §2.3「会破坏且已接受」+ §12 删除清单）：它们构成的「固定工作流」正是本次迁移要替换的东西。
 
@@ -185,20 +185,20 @@ npm run test:integration   # 仍全绿——schema 未动，repository 未动
 单测先行：先改测试表达新语义，再改实现让它们变绿。
 
 **Files:**
-- Modify: `src/domain/generation-lifecycle.mjs`
 - Modify: `src/domain/photo-project-service.mjs`
 - Modify: `test/project-workflow.test.mjs`
 
 **Interfaces（Produces）:**
-- `generation-lifecycle.mjs`：只剩 `TERMINAL_GENERATION_STATUSES = new Set(['completed','failed'])`、`SELECTABLE_GENERATION_STATUSES = new Set(['completed'])`。`GENERATION_TRANSITIONS` 删除。
+- **`generation-lifecycle.mjs` 本任务一行不动，重写挪到 Task 3。** 两个理由：其一，`photo-project-repository.mjs:13–17` 此刻仍在 import `GENERATION_TRANSITIONS`——Node ESM 对不存在的命名导出在**链接期**抛 SyntaxError，本任务删除它会让集成套件当场崩，违反「无红灯窗口」；其二，连**值**也不能先改——旧集成套件的仓库路径仍依赖旧值集（`partial_failed` 在旧状态机可达，`TERMINAL` 提前瘦身可能改变旧 lock-release 行为）。新 domain 代码不需要新值：`recordGeneration` 直接产出 completed/failed，旧 `SELECTABLE_GENERATION_STATUSES`（含 `partial_failed`）对新 domain 行为等价——`partial_failed` 在新路径下不可构造。终态版本（`TERMINAL = {completed, failed}`、`SELECTABLE = {completed}`、`GENERATION_TRANSITIONS` 删除）随 Task 3 的 repository 重写一并落地
 - `PhotoProjectService`：
   - `createProject({ projectId, name, initialState, anchorAsset = null })`——`anchorAsset` 从 `anchorAssetId: string` 变为 `{ assetId, uri = null, contentType = null } | null`（与 repository 对齐，revision 的 `anchorAssetId` 字段不变）
-  - `recordGeneration({ projectId, turnId, baseRevisionId, inputAssetId, patch, renderPrompt = null, outcome })`——`turnId` 非空校验（顶替旧 idempotency-key 校验的「垃圾进」防线）；`outcome` 为 `{ kind: 'completed', candidate: { assetId, uri = null, contentType = null } }` 或 `{ kind: 'failed', error }`；校验 revision 一致性与 patch，创建**终态** generation；不设锁、不看锁、无幂等
+  - `recordGeneration({ projectId, turnId, baseRevisionId, inputAssetId, patch, renderPrompt = null, outcome })`——`turnId` 非空校验；`outcome` 为 `{ kind: 'completed', candidate: { assetId, uri = null, contentType = null } }` 或 `{ kind: 'failed', error }`；校验 revision 一致性与 patch，创建**终态** generation；不设锁、不看锁、无幂等。`inputAssetId` 是逻辑基准图 ID：无论成功或失败都必须已存在于 assets，Provider 提前失败也不例外
   - `selectCandidate({ projectId, generationId, candidateId })`——签名不变；删除 ProjectBusy 检查；「同 candidate 幂等返回 / 异 candidate 拒绝」保留
-  - 删除：`requestGeneration`（改名 `recordGeneration`）、`transitionGeneration`、`addCandidate`、`#idempotency`、`#releaseProjectGeneration`、`IdempotencyConflictError`、`ProjectBusyError`、`GenerationTransitionError`、`InvalidGenerationRequestError`
+  - 删除：`requestGeneration`（改名 `recordGeneration`）、`transitionGeneration`、`addCandidate`、`#idempotency`、`#releaseProjectGeneration`
+  - **暂留：`IdempotencyConflictError`、`ProjectBusyError`、`GenerationTransitionError`、`InvalidGenerationRequestError` 继续导出**——`photo-project-repository.mjs` 此刻仍在 import 它们（3–12 行），本任务删除会打断集成套件的 import 链，违反「无红灯窗口」约束。domain 本任务起不再**抛出**它们；四个类在 Task 3 重写 repository 时随之删除（最后一个 import 方消失的时刻）
   - generation 对象新增 `turnId` / `inputAssetId` / `renderPrompt` 字段，删除 `operation` / `idempotencyKey` 字段
 
-- [ ] **Step 1: 按「对设计文档的五处修正」第 5 条的表改 `test/project-workflow.test.mjs`**——5 删、2 重写、保留用例中 46 行的 `anchorAssetId: 'asset_source'` 机械改为 `anchorAsset: { assetId: 'asset_source' }`（断言不动），新增两例：
+- [ ] **Step 1: 按「对设计文档的六处修正」第 6 条的表改 `test/project-workflow.test.mjs`**——5 删、2 重写。保留用例的三类改动：46 行 `anchorAssetId: 'asset_source'` 机械改为 `anchorAsset: { assetId: 'asset_source' }`；`advanceToCompleted` helper（66–85 行）替换为新 helper（单次 `recordGeneration` 带 `outcome: { kind: 'completed', candidate }`，返回 generation），87 号用例 98 行 `status === 'queued'` 断言改 `'completed'`；197 号用例按修正表去掉单 generation 双候选构造。新增两例：
 
 ```js
 // 新增 1：重 roll 的 domain 表达
@@ -215,11 +215,9 @@ test('records a failed generation without candidates', () => {
 
 重写的两例（138 → 并入上方新增 1；301 → 断言 `RevisionConflictError`）。改完跑 `npm test`——**新断言应红**。
 
-- [ ] **Step 2: 改 `generation-lifecycle.mjs`**（22 行 → 约 8 行，纯删减）
+- [ ] **Step 2: 改 `photo-project-service.mjs`**——按 Interfaces 清单摘除与重写。**锁逻辑共 5 处：130（createProject 初始化）、168–170、202、273–276、367–368。** 注意 `selectCandidate` 中 `SELECTABLE_GENERATION_STATUSES` 检查保留（沿用旧值集，理由见 Interfaces），`inputRevisionId` 一致性检查保留
 
-- [ ] **Step 3: 改 `photo-project-service.mjs`**——按 Interfaces 清单摘除与重写。**锁逻辑共 5 处：130（createProject 初始化）、168–170、202、273–276、367–368。** 注意 `selectCandidate` 中 `SELECTABLE_GENERATION_STATUSES` 检查保留（现在只含 `completed`），`inputRevisionId` 一致性检查保留
-
-- [ ] **Step 4: 验证**
+- [ ] **Step 3: 验证**
 
 ```bash
 npm test                 # project-workflow 新套件全绿；photo-state 6 例不动
@@ -236,6 +234,7 @@ git diff --stat src/domain/photo-state.mjs test/photo-state.test.mjs   # 必须�
 
 **Files:**
 - Create: `migrations/006_agent_turns.sql`、`007_generations.sql`、`008_projects_turns.sql`、`009_drop_legacy.sql`
+- Modify: `src/domain/generation-lifecycle.mjs`（Task 2 暂留的终态化在此落地）
 - Modify: `src/infrastructure/postgres/photo-project-repository.mjs`
 - Modify: `test-integration/postgres-repository.test.mjs`（22 例 → 新套件）
 
@@ -244,12 +243,10 @@ git diff --stat src/domain/photo-state.mjs test/photo-state.test.mjs   # 必须�
 
 **Interfaces（Produces）:**
 - `createProject({ projectId, name, initialState, anchorAsset = null, ownerId = 'dev' })`——assets 插入补写 `uri` 与 `metadata_json`（**列在 001 就存在，只是从未被写过**——这是 §6.3 指出的断点）；projects 插入补 `owner_id`、去掉 `running_generation_id`
-- `recordGeneration`——签名与语义同 Task 2 的 domain 版本（含 `turnId` 非空校验）；单事务内：锁行 project（`FOR UPDATE`，只为一致读，不做 busy 检查）→ revision 一致性 → patch 双重校验 → `INSERT assets`（candidate，含 uri/metadata）→ `INSERT generations`（终态、`input_asset_id`、`turn_id`、`metadata_json.renderPrompt`）→ completed 时 `INSERT generation_outputs` → 返回映射结果
+- `recordGeneration`——签名与语义同 Task 2 的 domain 版本（含 `turnId` 非空校验）；单事务内：锁行 project（`FOR UPDATE`，只为一致读，不做 busy 检查）→ 校验 turn 存在且属于该 project（返回稳定的领域错误，不让 FK 冲突穿透）→ 校验 inputAsset 已存在 → revision 一致性 → patch 双重校验 → `INSERT assets`（candidate，含 uri/metadata）→ `INSERT generations`（终态、`input_asset_id`、`turn_id`、`metadata_json.renderPrompt`）→ completed 时 `INSERT generation_outputs` → 返回映射结果。失败路径同样要求 `inputAssetId` 指向已有逻辑基准图
 - `selectCandidate`——删除 `runningGenerationId` 检查（358–363 行），其余原样；表名换 `generations`
-- 删除：`transitionGeneration`、`recordProviderJob`、`addCandidate`、`GenerationLeaseLostError`、`ProviderJobConflictError`、`requireLease`、`requestFingerprint`、`sortObject`
+- 删除：`transitionGeneration`、`recordProviderJob`、`addCandidate`、`GenerationLeaseLostError`、`ProviderJobConflictError`、`requireLease`、`requestFingerprint`、`sortObject`，以及 Task 2 暂留的四个 domain 错误类（`IdempotencyConflictError` / `ProjectBusyError` / `GenerationTransitionError` / `InvalidGenerationRequestError`）——repository 是它们最后的 import 方，重写后从 domain 一并删除
 - 映射层：`mapProject` 的 `runningGenerationId` → `runningTurnId`、补 `ownerId`；`mapGeneration` 补 `turnId` / `inputAssetId` / `renderPrompt`，删 `operation` / `idempotencyKey` / lease / provider 投影；所有 `generation_jobs` SQL 换 `generations`
-
-**Consumes:** Task 1 的 schema、Task 3 的 domain 导出。
 
 - [ ] **Step 1: 重建开发库**（命令见「开发库策略」），确认 `db:migrate` 后 `schema_migrations` 有 001–009
 
@@ -338,7 +335,7 @@ ALTER TABLE projects ADD COLUMN owner_id text NOT NULL DEFAULT 'dev';
 DROP TABLE idempotency_requests;
 ```
 
-- [ ] **Step 6: 重写 repository**（635 行预计减到 ~420 行；`#transaction` / `#require*` 辅助不动），`npm run check` 语法过
+- [ ] **Step 6: 重写 repository 与 `generation-lifecycle.mjs`**——repository 635 行预计减到 ~420 行（`#transaction` / `#require*` 辅助不动）；lifecycle 砍到二值集（`GENERATION_TRANSITIONS` 删除——此刻它的最后一个 import 方正随 repository 重写消失）。同时新增 `TurnNotFoundError`（domain 定义并导出，repo 的 turn 前置校验与 2c 的队列共用）。`npm run check` 语法过
 
 - [ ] **Step 7: 重写集成测试**——沿用既有夹具（模块级 pool、`resetDatabase` 护栏、`after` 关池）。用例清单：
 
@@ -350,21 +347,24 @@ DROP TABLE idempotency_requests;
 4.  recordGeneration records a completed generation in one transaction
       （asset.uri 非空、output 行存在、status='completed'、turn_id/input_asset_id 正确）
 5.  recordGeneration records a failed generation with error json
+      （inputAssetId 也必须指向已有逻辑基准图）
 6.  recordGeneration rejects a stale base revision           RevisionConflict
-7.  recordGeneration rejects an invalid patch                domain 校验穿透
-8.  ★ re-roll: identical patch twice in one turn succeeds twice
+7.  recordGeneration rejects a missing or foreign turn       TurnNotFoundError
+8.  recordGeneration rejects an invalid patch                domain 校验穿透
+9.  ★ re-roll: identical patch twice in one turn succeeds twice
       （同 turnId + 同 patch 两次调用 → 两条 generation 均成功。这是删除
         UNIQUE (project_id, idempotency_key) 的显式验收——spec §18 要求它存在）
-9.  selectCandidate switches the active revision atomically
-10. selectCandidate is idempotent for the same candidate
-11. selectCandidate rejects a different candidate after selection
-12. selectCandidate rejects a stale input revision            RevisionConflict
-13. selectCandidate rejects cross-project generation
-14. foreign keys reject deleting a project that still has turns
-      （**实测全库 14 个外键均为 NO ACTION，无任何 ON DELETE CASCADE**；
-        原「级联删除」断言的是不存在的行为，会直接跑挂。产品也没有删除
+10. selectCandidate switches the active revision atomically
+11. selectCandidate is idempotent for the same candidate
+12. selectCandidate rejects a different candidate after selection
+13. selectCandidate rejects a stale input revision            RevisionConflict
+14. selectCandidate rejects cross-project generation
+15. foreign keys reject deleting a project that still has turns
+      （**实测 projects/revisions/generations/outputs 域的 14 个外键均为 NO ACTION，
+        无 ON DELETE CASCADE**——session 表的 CASCADE 属于 agent_sessions 域，与删除
+        project 无关。原「级联删除」断言的是不存在的行为，会直接跑挂。产品也没有删除
         project 的端点——改为断言外键守护确实生效）
-15. listGenerations / listRevisions / get* 投影包含新字段、不含已删字段
+16. listGenerations / listRevisions / get* 投影包含新字段、不含已删字段
 ```
 
 - [ ] **Step 8: 一次性验收**
@@ -383,15 +383,15 @@ npm run test:integration    # repository 新套件 + session 30 例 + asset-stor
 **Files:**
 - Modify: `src/api/server.mjs`——两处：
   1. 删 POST `/projects/:id/generations` 路由（handler 调用已删的 `requestGeneration`）
-  2. **清理 `mapError` 里的死错误码**（133–136 行）：`IDEMPOTENCY_CONFLICT`、`PROJECT_BUSY`、`INVALID_GENERATION_TRANSITION`——对应 Error 类已在 Task 2 删除，留着是让错误映射说谎
+  2. **清理 `mapError` 里的四个死错误码**：`IDEMPOTENCY_CONFLICT`、`PROJECT_BUSY`、`INVALID_GENERATION_TRANSITION`（133–136 行，409 段）与 `INVALID_GENERATION_REQUEST`（约 146 行，400 段）——对应 Error 类已在 Task 3 随 repository 重写删除，留着是让错误映射说谎
 - Modify: `README.md`——「已实现闭环」改为迁移中间态描述（生图入口 2d 以 `POST /projects/:id/messages` 回归）
 
 - [ ] **Step 1: 改 server.mjs 与 README**，`npm run check` 通过
 - [ ] **Step 2: 残留扫描**
 
 ```bash
-grep -rn 'generation_jobs\|idempotency_requests\|running_generation_id\|EditInterpreter\|recordProviderJob\|transitionGeneration\|addCandidate\|ProjectBusy\|IDEMPOTENCY_CONFLICT\|INVALID_GENERATION_TRANSITION\|requestGeneration' src/ test/ test-integration/ scripts/
-# 预期：零命中（docs/ 与 migrations/ 除外）
+rg -n 'generation_jobs|idempotency_requests|running_generation_id|EditInterpreter|recordProviderJob|transitionGeneration|addCandidate|ProjectBusy|IDEMPOTENCY_CONFLICT|INVALID_GENERATION_TRANSITION|INVALID_GENERATION_REQUEST|requestGeneration|GENERATION_TRANSITIONS' src/ test/ test-integration/ scripts/
+# 预期：零命中（docs/ 与 migrations/ 不在扫描路径内，无需排除）
 ```
 
 - [ ] **Step 3: 全量验证**
@@ -405,13 +405,13 @@ npm test && npm run test:integration && npm run check
 ## 切片 2b 完成标准
 
 - `npm test` 与 `npm run test:integration` 全绿
-- **重 roll 用例存在且绿**（Task 3 用例 8）——旧唯一约束确已删除的最直接证据
+- **重 roll 用例存在且绿**（Task 3 用例 9）——旧唯一约束确已删除的最直接证据
 - `git diff` 确认 `src/domain/photo-state.mjs` 与 `test/photo-state.test.mjs` 零改动
 - Task 4 的残留扫描零命中
 - `npm run start:worker` 不可用（预期，2c 恢复）；API 仅存 `/projects`、`GET /projects/:id`、`GET /generations/:id`、selections、`/health`
 - 开发库已按 006–009 重建并可通过 `npm run db:migrate` 从零复现
 - **每个 Task 结束时 `npm test` 与 `npm run test:integration` 都必须绿**——本切片没有计划内的红灯窗口
-- 外键守护用例（Task 3 用例 14）断言的是「删除被拒绝」，不是级联删除——实测全库 14 个外键均为 NO ACTION
+- 外键守护用例（Task 3 用例 15）断言的是「删除被拒绝」，不是级联删除——实测 projects 域 14 个外键均为 NO ACTION
 - 2a 的四个交付（探针、对象存储、ImagesProvider、telemetry）零改动、测试零回归
 
 ## 下一步
