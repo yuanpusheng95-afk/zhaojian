@@ -3,3 +3,8 @@ node_modules/
 .probe/
 .DS_Store
 coverage/
+
+/.freebuff
+/.claude
+/.idea
+/.probe
