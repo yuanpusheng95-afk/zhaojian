@@ -1,0 +1,46 @@
+{
+  "status": 200,
+  "body": {
+    "id": "96660ce9-3841-4cd8-a1ce-d81e74d4cb89",
+    "object": "chat.completion",
+    "created": 1787410689,
+    "model": "deepseek-v4-flash-vision-exp",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "The user wants me to:\n1. First call read_photo_state\n2. Then call generate_image to change the coat to \"ivory coat\"\n3. Do not select\n\nLet me start with read_photo_state.",
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call_00_xI1G3wasemK94sRu7C5E8263",
+              "type": "function",
+              "function": {
+                "name": "read_photo_state",
+                "arguments": "{}"
+              }
+            }
+          ]
+        },
+        "logprobs": null,
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 691,
+      "completion_tokens": 76,
+      "total_tokens": 767,
+      "prompt_tokens_details": {
+        "cached_tokens": 256
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 46
+      },
+      "prompt_cache_hit_tokens": 256,
+      "prompt_cache_miss_tokens": 435
+    },
+    "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "status": 200,
+  "body": {
+    "id": "chatcmpl-fe52ecb026b04bc7a71a10f7c36e8ab9",
+    "object": "chat.completion",
+    "created": 1787410591,
+    "model": "gpt-image-2",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "![image_1](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA60AAAaICAIAAADgnq+qAABVQGNhQlgAAFVAanVtYgAAAB5qdW1kYzJwYQARABC…<3117070 chars>"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 16,
+      "completion_tokens": 1640,
+      "total_tokens": 1656,
+      "prompt_tokens_details": {
+        "text_tokens": 14,
+        "image_tokens": 2,
+        "cached_tokens": 0
+      },
+      "completion_tokens_details": {
+        "text_tokens": 0,
+        "image_tokens": 1640,
+        "reasoning_tokens": 0
+      }
+    }
+  }
+}

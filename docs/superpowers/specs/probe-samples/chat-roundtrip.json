@@ -1,0 +1,83 @@
+{
+  "first": {
+    "status": 200,
+    "body": {
+      "id": "6cd26fb8-bc34-4cee-a340-7efb065ebd7d",
+      "object": "chat.completion",
+      "created": 1787410687,
+      "model": "deepseek-v4-flash-vision-exp",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "The user wants me to use the report_color tool to report red. The tool requires a color parameter. Let me call it.",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_00_8tECizYsetqLe9LBUyIc8568",
+                "type": "function",
+                "function": {
+                  "name": "report_color",
+                  "arguments": "{\"color\": \"red\"}"
+                }
+              }
+            ]
+          },
+          "logprobs": null,
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 351,
+        "completion_tokens": 70,
+        "total_tokens": 421,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 26
+        },
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 351
+      },
+      "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab"
+    }
+  },
+  "second": {
+    "status": 200,
+    "body": {
+      "id": "47969eff-58b7-481b-bd7e-45fb221c8e0f",
+      "object": "chat.completion",
+      "created": 1787410688,
+      "model": "deepseek-v4-flash-vision-exp",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Already reported the color red.",
+            "reasoning_content": "We need to respond to the user. The user said \"Use report_color to report red.\" We did that, and the tool returned success. Now we should acknowledge the result. There's no further question. We should keep it concise."
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 153,
+        "completion_tokens": 55,
+        "total_tokens": 208,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 48
+        },
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 153
+      },
+      "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab"
+    }
+  }
+}

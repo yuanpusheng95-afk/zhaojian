@@ -61,7 +61,7 @@ Worker 主循环（进程内最多 WORKER_CONCURRENCY 个在途轮）
 
 **基准图指针在轮次上下文（§5.7）：** 轮开始 = Revision 锚定图；`generate_image` 成功后推进到本候选；`select_candidate` 后本轮结束。Agent 不能指定输入图。成本护栏 `imageCount >= MAX_IMAGES_PER_TURN` 在工具内抛错（§9.3，可纠正错误 → 模型转向选图）。
 
-**可纠正错误抛异常，不可纠正错误走 terminate + fatal（§9.1）。** patch 校验失败 / candidateId 不存在 / REVISION_CONFLICT → 抛（pi 转 error tool result 喂回模型自纠）；Provider 401/余额 / 存储不可达 → `terminate: true` + `turnContext.fatal = { code, message }`，Worker 收尾以 fatal 为准。
+**可纠正错误抛异常，不可纠正错误走 terminate + fatal（§9.1）。** patch 校验失败 / candidateId 不存在 / REVISION_CONFLICT → 抛（pi 转 error tool result 喂回模型自纠）；Provider 401/余额 / 存储不可达 / `INVALID_ASSET_URI` / `ASSET_NOT_FOUND` 这类环境或持久化数据状态模型无法自纠 → `terminate: true` + `turnContext.fatal = { code, message }`，Worker 收尾以 fatal 为准。
 
 **fake StreamFn 是确定性支点（§14.1）。** `StreamFn` 是纯函数 `(model, context, options?) => AssistantMessageEventStream`。测试按预设脚本回放工具调用序列，无网络零花费——Worker 编排、自评重生、超限转向、select 终止全部用它测；真实模型只在手动冒烟脚本出现。
 
@@ -166,7 +166,7 @@ docs/superpowers/specs/probe-samples/      探针样本归档（2a 惯例）
 - `createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config })` → `AgentTool`，参数 `{ patch, renderPrompt }`：
   - patch schema 用 **enum 编码两张白名单**（§5.3：让模型在生成阶段就受约束，省一轮自纠往返）
   - 执行序：`imageCount` 护栏（≥ 上限抛 `MAX_IMAGES_REACHED`）→ `getRevision` + `applyPhotoStatePatch` 校验（先于花钱）→ `getAsset(currentBaseAssetId)` 读 `{ uri, metadata.contentType? }` → `resolveAssetStorageKey(uri, assetStorage.bucket)` → `assetStorage.get(storageKey)` 取基准图字节 → `imagesModels.generateImages(...)`（`IMAGE_TIMEOUT_MS`）→ 字节 `PUT` S3（key 由 `buildAssetKey` 按 content type 定扩展名）→ `recordGeneration({ ..., candidate: { ..., uri: buildAssetUri(assetStorage.bucket, key) } })` → `turnContext.advanceBase(candidate.assetId)` → 返回 `{ generationId, candidateId, assetId }` + `ImageContent`（模型看图自评）。若 asset metadata 没有 content type，以生成结果 mimeType 兜底并在 PUT 时显式指定。
-  - Provider 401/余额/持续 429、存储不可达 → `terminate: true` + `setFatal(...)`（§9.1 不可纠正类）；其余一律抛
+  - Provider 401/余额/持续 429、存储不可达、`INVALID_ASSET_URI`、基准 asset `ASSET_NOT_FOUND` → `terminate: true` + `setFatal(...)`（§9.1 不可纠正类）；patch 参数与候选选择等模型可自纠错误一律抛
 - `createSelectCandidateTool({ repository, turnContext })` → `AgentTool`，参数 `{ generationId, candidateId }` → `selectCandidate` → `{ revisionId }` + **`terminate: true`**
 
 **Consumes:** 2b 的 `recordGeneration` / `selectCandidate` / `getRevision`；2a 的 `createRelayImagesModels` / `AssetStorage`。
@@ -183,6 +183,7 @@ generate_image：真实形状的 repository.getAsset 返回 s3:// URI → 只取
 generate_image：asset URI 非法或 bucket 不匹配 → terminate + INVALID_ASSET_URI
 select_candidate：成功 → terminate:true；revision 切换
 select_candidate：错误 candidateId → 抛（可纠正类）
+generate_image：基准 asset 不存在 → terminate + ASSET_NOT_FOUND
 ```
 - [ ] **Step 2: 实现至绿**。工具只做薄适配——**`src/domain/` 零改动**是验收线
 - [ ] **Step 3: `npm run check` + 全套回归**
@@ -245,7 +246,7 @@ type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted
 - Modify: `src/config.mjs`（`TURN_HEARTBEAT_MS` 10_000 / `WORKER_CONCURRENCY` 4 / `SHUTDOWN_GRACE_MS` 600_000 / `WORKER_POLL_INTERVAL_MS` 500）、`package.json`（恢复 `start:worker`）
 
 **Interfaces:**
-- `createAgentTurnWorker({ queue, runTurn, config, timers })`——`runOnce()`：`failExpiredTurns()` → `claimNextTurn()` → 心跳启动 → `runAgentTurn`（整轮超时在 runner 内部：`setTimeout(TURN_TIMEOUT_MS) → agent.abort()`）→ `finishTurn`（终态 = runOutcome + fatal 判定：fatal 存在 → `failed`；超时 → `aborted`；否则 `completed`）→ 停心跳。心跳丢失（`TurnLeaseLostError`）→ 跳过 finishTurn（旧实例无权写）
+- `createAgentTurnWorker({ queue, runAgentTurn, config, timers })`——`runOnce()`：`failExpiredTurns()` → `claimNextTurn()` → 心跳启动 → `runAgentTurn`（整轮超时在 runner 内部：`setTimeout(TURN_TIMEOUT_MS) → agent.abort()`）→ `finishTurn`（终态 = runOutcome + fatal 判定：fatal 存在 → `failed`；超时 → `aborted`；否则 `completed`）→ 停心跳。心跳丢失（`TurnLeaseLostError`）→ 跳过 finishTurn（旧实例无权写）
 - `src/worker/main.mjs`——校验配置 → 建 pool/models/storage/queue → 主循环维持 ≤ `WORKER_CONCURRENCY` 个在途轮（不是串行 `await`）；SIGTERM → 停止领取、`Promise.race`([全部在途, SHUTDOWN_GRACE_MS]) 后退出
 
 - [ ] **Step 1: 复用 Task 4 建好的 `fake-stream-fn.mjs`，为 Worker 剧本补充编排断言**（三段式：解析参数 → 下一个事件 → EOF）
@@ -291,7 +292,13 @@ fatal 剧本（generate 401）→ finishTurn failed + error_json 含 fatal code
 
 ## 探针结论
 
-（Task 1 Step 5 回填：tool_calls 稳定性 / 图片输入 / schema 遵守度 / 降级决策）
+**结论：三问全部通过，无需降级。** 样本见 `docs/superpowers/specs/probe-samples/`。
+
+1. **tool_calls 与多轮 roundtrip 稳定。** 图片输入返回 `finish_reason=tool_calls`；回传 `role=tool` + `tool_call_id` 后模型正常收尾（`stop`）。JSON 参数可解析。
+2. **图片输入被接受。** DeepSeek `deepseek-v4-flash-vision-exp` 对 `image_url` data URI 返回 200，并能描述 1x1 PNG 的颜色。
+3. **生产形状 schema 可遵守。** enum 白名单路径下，第二轮工具结果后模型调用 `generate_image`，参数精确为 `{path:'appearance.outfit', operation:'replace', value:'ivory coat'}`，`renderPrompt` 合理。
+
+实施约束：`renderPrompt` 必须由工具层组装/校验，不能信任模型长文本；图片自评循环按原设计保留。
 
 ## 下一步
 

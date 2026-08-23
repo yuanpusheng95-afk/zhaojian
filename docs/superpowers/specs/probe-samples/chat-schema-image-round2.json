@@ -1,0 +1,46 @@
+{
+  "status": 200,
+  "body": {
+    "id": "d837077f-c890-4cb4-bba4-ffb6fb789583",
+    "object": "chat.completion",
+    "created": 1787410736,
+    "model": "deepseek-v4-flash-vision-exp",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "Now I need to call generate_image to replace appearance.outfit with ivory coat. The patch should be path \"appearance.outfit\", operation \"replace\", value \"ivory coat\".\n\nI'll provide a renderPrompt.",
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call_00_wKtPl9qdGrIvWWhvdhcS6226",
+              "type": "function",
+              "function": {
+                "name": "generate_image",
+                "arguments": "{\"patch\": [{\"path\": \"appearance.outfit\", \"operation\": \"replace\", \"value\": \"ivory coat\"}], \"renderPrompt\": \"Replace the outfit with an ivory coat.\"}"
+              }
+            }
+          ]
+        },
+        "logprobs": null,
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 624,
+      "completion_tokens": 135,
+      "total_tokens": 759,
+      "prompt_tokens_details": {
+        "cached_tokens": 512
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 44
+      },
+      "prompt_cache_hit_tokens": 512,
+      "prompt_cache_miss_tokens": 112
+    },
+    "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab"
+  }
+}

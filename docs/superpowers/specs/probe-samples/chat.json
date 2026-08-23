@@ -1,0 +1,46 @@
+{
+  "status": 200,
+  "body": {
+    "id": "5ccf27cc-b260-4b1d-8f8b-7fca1816d124",
+    "object": "chat.completion",
+    "created": 1787410577,
+    "model": "deepseek-v4-flash-vision-exp",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "The user is asking me to identify the color of the image and must use the report_color tool. The image appears to be a s…<210 chars>",
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call_00_AhPhYiVnbvNR778s4cLB9334",
+              "type": "function",
+              "function": {
+                "name": "report_color",
+                "arguments": "{\"color\": \"粉色\"}"
+              }
+            }
+          ]
+        },
+        "logprobs": null,
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 479,
+      "completion_tokens": 89,
+      "total_tokens": 568,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 45
+      },
+      "prompt_cache_hit_tokens": 0,
+      "prompt_cache_miss_tokens": 479
+    },
+    "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab"
+  }
+}
