@@ -110,8 +110,9 @@ async function createProject(repository, projectId = 'project_1') {
 async function createTurn(projectId, turnId) {
   await pool.query(
     `INSERT INTO agent_turns
-      (id, project_id, user_message, idempotency_key, status, created_at, updated_at)
-     VALUES ($1, $2, 'make the coat ivory', $3, 'running', now(), now())`,
+     (id, project_id, user_message, idempotency_key, status, created_at, updated_at)
+     VALUES ($1, $2, 'make the coat ivory', $3, 'running', now(), now())
+     ON CONFLICT (id) DO NOTHING`,
     [turnId, projectId, `${turnId}-key`],
   );
 }
@@ -566,4 +567,47 @@ test('read projections expose turn fields and omit legacy fields', async () => {
   assert.equal(readGeneration.providerName, undefined);
   assert.equal(revisions.at(-1).id, revision.id);
   assert.equal(generations.at(-1).id, generation.id);
+});
+
+test('listGenerationsByTurn loads only the requested turn generations', async () => {
+  const repository = createRepository();
+  const project = await createProject(repository);
+  await createCompletedGeneration(repository, {
+    projectId: project.id,
+    turnId: 'turn_1',
+    candidateId: 'candidate_1',
+  });
+  await createCompletedGeneration(repository, {
+    projectId: project.id,
+    turnId: 'turn_1',
+    generationId: 'generation_2',
+    candidateId: 'candidate_2',
+  });
+  await createCompletedGeneration(repository, {
+    projectId: project.id,
+    turnId: 'turn_2',
+    generationId: 'generation_3',
+    candidateId: 'candidate_3',
+  });
+
+  const generations = await repository.listGenerationsByTurn({
+    projectId: project.id,
+    turnId: 'turn_1',
+  });
+
+  assert.deepEqual(generations.map(({ id }) => id), ['generation_1', 'generation_2']);
+  assert.ok(generations.every((generation) => generation.turnId === 'turn_1'));
+  assert.deepEqual(generations.map(({ candidates }) => candidates.map(({ id }) => id)), [
+    ['candidate_1'],
+    ['candidate_2'],
+  ]);
+  assert.equal(generations.at(-1).selectedCandidateId, null);
+});
+
+test('listGenerationsByTurn rejects a foreign or missing project', async () => {
+  const repository = createRepository();
+  await assert.rejects(
+    () => repository.listGenerationsByTurn({ projectId: 'missing', turnId: 'turn_1' }),
+    (error) => error.code === 'PROJECT_NOT_FOUND',
+  );
 });

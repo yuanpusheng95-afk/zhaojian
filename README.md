@@ -83,15 +83,38 @@ PostgreSQL: postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent
 
 可通过 `DATABASE_URL`、`PORT` 覆盖。
 
+候选图 URL 默认 900 秒有效，可用 `SIGNED_URL_TTL_SECONDS` 覆盖。
+
 ## 最小 API
 
 ```text
 POST /projects
 GET  /projects/:id
-GET  /generations/:id
-POST /projects/:projectId/generations/:generationId/selections
 GET  /health
+
+# Agent turns
+POST /projects/:projectId/messages                  # Idempotency-Key 必填；202 新建 / 200 重放 / 409 冲突或忙碌
+GET  /projects/:projectId/turns/:turnId             # 轮次详情，completed generation 带签名候选图
+POST /projects/:projectId/turns/:turnId/selections   # 手动选图，成功返回 { revisionId }
+GET  /projects/:projectId/turns/:turnId/events      # SSE：turn + done + error；15s ping
+
+GET /generations/:id                                # deprecated：仅供调试，不签 URL
 ```
+
+`POST .../messages` 需要请求头 `Idempotency-Key` 和 JSON 体 `{ "message": "..." }`。
+`POST .../selections` 需要 `{ "generationId": "...", "candidateId": "..." }`;只有 `completed` generation 可以选图。
+Turn 详情和 SSE 中的 `candidate.url` 是短期签名 URL，不同请求或事件可能不同。仅当候选 asset 缺失时返回 `url: null` 与 `urlError`。SSE 错误事件返回 `{ code, message? }`；未知错误统一为 `INTERNAL_ERROR`。
+
+已知限制：在接入鉴权前，`GET /generations/:id` 不校验项目归属，仅供本地调试使用。
+
+手动端到端冒烟（真实供应商费用）：
+
+```bash
+npm run seed:smoke
+npm run smoke:api -- smoke_agent_1
+```
+
+`smoke-api.mjs` 会启动临时 API 与 Worker，走完发消息、SSE 等终态、取签名图、选图并断言 Revision 切换。
 
 ## 验证
 
@@ -105,6 +128,13 @@ npm test
 
 ```bash
 npm run db:up
+npm run test:integration
+```
+
+HTTP 层集成测试包含真实 MinIO 签名 URL 字节取回与 SSE 终态推送：
+
+```bash
+npm run dev:up
 npm run test:integration
 ```
 
@@ -165,7 +195,7 @@ test-integration/                   真实 PostgreSQL 与 HTTP 纵切测试
   - 供应商修好 edits 后把 `IMAGE_EDIT_ROUTE` 改为 `edits` 即可，无需改代码
 - Agent 会话轨迹已可持久化到 PostgreSQL：实现了 pi 的 `SessionStorage`（17 方法）与 `SessionRepo`（5 方法，含 fork），通过官方 `createSessionBackendConformance` 全部 30 个用例。Agent 本身尚未接线（切片 2）。
 - **assumption：真实入口接入前，同一消息不会并发重复解释；公开入口需要持久化 Message/EditRequest。**
-- 尚未实现对象存储上传、鉴权、SSE 和前端。
+- 已实现对象存储上传与 API/SSE；尚未实现鉴权和前端。
 - 租约只能阻止 stale worker 写数据库，不能撤销已经发给真实 Provider 的外部调用。
 - Worker 已把稳定的 Generation ID 作为供应商幂等键，并持久化 Provider、模型和 Job ID。
 - **assumption：真实 Provider 必须真正兑现该幂等键。** 如果供应商忽略幂等键，崩溃发生在“提交成功、Job ID 落库前”时仍可能重复扣费。

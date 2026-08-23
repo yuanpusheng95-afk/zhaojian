@@ -1,26 +1,40 @@
 import pg from 'pg';
 
 import { runMigrations } from '../infrastructure/postgres/migrate.mjs';
+import { createAgentTurnQueue } from '../infrastructure/postgres/agent-turn-queue.mjs';
+import { createS3AssetStorage } from '../infrastructure/storage/s3-asset-storage.mjs';
+import { loadApiConfig } from '../config.mjs';
+import { createTurnViews } from './turn-views.mjs';
 import { PostgresPhotoProjectRepository } from '../infrastructure/postgres/photo-project-repository.mjs';
 import { createApiServer } from './server.mjs';
 
+const config = loadApiConfig(process.env);
 const { Pool } = pg;
 const pool = new Pool({
-  connectionString:
-    process.env.DATABASE_URL ??
-    'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent',
+  connectionString: config.databaseUrl,
 });
 await runMigrations(pool);
 
 const repository = new PostgresPhotoProjectRepository({ pool });
-const server = createApiServer({ repository });
-const port = Number(process.env.PORT ?? 3000);
+const queue = createAgentTurnQueue({ pool });
+const assetStorage = createS3AssetStorage(config.s3);
+const turnViews = createTurnViews({
+  pool,
+  repository,
+  assetStorage,
+  signedUrlTtlSeconds: config.signedUrlTtlSeconds,
+});
+const server = createApiServer({ repository, queue, turnViews });
+const port = config.port;
 server.listen(port, () => {
   process.stdout.write(`Photo Agent API listening on :${port}\n`);
 });
 
 async function shutdown() {
+  server.closeIdleConnections();
+  server.closeActiveEventStreams();
   await new Promise((resolve) => server.close(resolve));
+  server.closeAllConnections();
   await pool.end();
 }
 

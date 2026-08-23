@@ -107,5 +107,6 @@ export function loadApiConfig(env = process.env) {
     databaseUrl: env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
     port: integer(env, 'PORT', 3000),
     s3: s3Config(env),
+    signedUrlTtlSeconds: integer(env, 'SIGNED_URL_TTL_SECONDS', 900),
   };
 }

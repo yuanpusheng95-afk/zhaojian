@@ -66,8 +66,10 @@ async function executeTurn(turn) {
     createSelectCandidateTool({ repository, turnContext }),
   ];
   const result = await runAgentTurn({ sessionRepo, config, model: llmModel, turn, tools, streamFn, telemetry });
-  const generations = (await repository.listGenerations(turn.projectId))
-    .filter((generation) => generation.turnId === turn.turnId);
+  const generations = await repository.listGenerationsByTurn({
+    projectId: turn.projectId,
+    turnId: turn.turnId,
+  });
   return {
     ...result,
     outcome: {

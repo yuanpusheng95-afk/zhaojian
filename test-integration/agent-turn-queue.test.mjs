@@ -91,6 +91,7 @@ test('claimNextTurn moves a queued turn to running with a lease', async () => {
   const turn = (await pool.query('SELECT * FROM agent_turns WHERE id = $1', [claimed.turnId])).rows[0];
 
   assert.equal(claimed.turnId, requested.turnId);
+  assert.equal(claimed.projectId, 'project_1');
   assert.equal(claimed.userMessage, 'work');
   assert.match(turn.lease_token, /^[\da-f-]{36}$/);
   assert.equal(turn.status, 'running');

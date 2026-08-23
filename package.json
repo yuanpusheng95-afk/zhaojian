@@ -15,8 +15,10 @@
     "db:migrate": "node src/infrastructure/postgres/migrate.mjs",
     "start:api": "node src/api/main.mjs",
     "start:worker": "node src/worker/main.mjs",
+    "seed:smoke": "node --env-file=.env scripts/seed-smoke.mjs",
     "smoke:image": "node --env-file=.env scripts/smoke-image.mjs",
-    "smoke:agent": "node --env-file=.env scripts/smoke-agent.mjs"
+    "smoke:agent": "node --env-file=.env scripts/smoke-agent.mjs",
+    "smoke:api": "node --env-file=.env scripts/smoke-api.mjs"
   },
   "engines": {
     "node": ">=22"

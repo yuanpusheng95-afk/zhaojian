@@ -42,6 +42,7 @@ test('api config does not require model credentials', () => {
   const config = loadApiConfig({ S3_ACCESS_KEY: 'ak', S3_SECRET_KEY: 'sk' });
   assert.equal(config.port, 3000);
   assert.equal(config.s3.accessKey, 'ak');
+  assert.equal(config.signedUrlTtlSeconds, 900);
   assert.ok(
     !('llm' in config),
     'API does not load the agent, so it needs no LLM credentials',

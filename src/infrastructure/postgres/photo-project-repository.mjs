@@ -300,6 +300,39 @@ export class PostgresPhotoProjectRepository {
     );
   }
 
+  async listGenerationsByTurn({ projectId, turnId }) {
+    await this.#requireProject(this.#pool, projectId);
+    const generations = await this.#pool.query(
+      `SELECT * FROM generations
+       WHERE project_id = $1 AND turn_id = $2
+       ORDER BY created_at, id`,
+      [projectId, turnId],
+    );
+    if (generations.rowCount === 0) return [];
+    const candidates = await this.#pool.query(
+      `WITH turn_generations AS (
+         SELECT id
+         FROM generations
+         WHERE project_id = $1 AND turn_id = $2
+       )
+       SELECT output.*
+       FROM generation_outputs AS output
+       JOIN turn_generations ON turn_generations.id = output.generation_id
+       ORDER BY output.generation_id, output.created_at, output.id`,
+      [projectId, turnId],
+    );
+    const candidatesByGeneration = new Map();
+    for (const row of candidates.rows) {
+      const candidateRows = candidatesByGeneration.get(row.generation_id) ?? [];
+      candidateRows.push(row);
+      candidatesByGeneration.set(row.generation_id, candidateRows);
+    }
+    return generations.rows.map((row) => mapGeneration(
+      row,
+      candidatesByGeneration.get(row.id) ?? [],
+    ));
+  }
+
   async #upsertAsset(
     client,
     { id, kind, uri = null, metadata = {}, createdAt },
