@@ -1,0 +1,10 @@
+node_modules
+.git
+.env
+.idea
+.freebuff
+.probe
+docs
+test
+test-integration
+*.md

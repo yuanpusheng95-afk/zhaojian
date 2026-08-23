@@ -7,7 +7,6 @@ import { createSelectCandidateTool } from '../agent/tools/select-candidate.mjs';
 import { createTurnContext } from '../agent/tools/turn-context.mjs';
 import { loadWorkerConfig } from '../config.mjs';
 import { createAgentTurnQueue } from '../infrastructure/postgres/agent-turn-queue.mjs';
-import { runMigrations } from '../infrastructure/postgres/migrate.mjs';
 import { createPostgresSessionRepo } from '../infrastructure/postgres/session/repo.mjs';
 import { PostgresPhotoProjectRepository } from '../infrastructure/postgres/photo-project-repository.mjs';
 import { createLlmModels } from '../infrastructure/models/llm-provider.mjs';
@@ -21,7 +20,6 @@ import { AgentTurnWorker } from './agent-turn-worker.mjs';
 const { Pool } = pg;
 const config = loadWorkerConfig(process.env);
 const pool = new Pool({ connectionString: config.databaseUrl });
-await runMigrations(pool);
 // 双写:stdout 管实时观察(TELEMETRY=noop 可静音该腿),PG 管历史留存与聚合。
 // PG 腿不可关——"哪一层失败、耗时多少"只在 span 里,不留存就不叫全程可观测
 const stdoutTelemetry = config.telemetry === 'stdout' ? createStdoutTelemetry() : createNoopTelemetry();

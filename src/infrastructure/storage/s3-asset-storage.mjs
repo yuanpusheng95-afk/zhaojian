@@ -16,6 +16,7 @@ import { assertAssetStorage } from './asset-storage.mjs';
  */
 export function createS3AssetStorage({
   endpoint,
+  publicEndpoint = endpoint,
   bucket,
   accessKey,
   secretKey,
@@ -30,6 +31,16 @@ export function createS3AssetStorage({
     forcePathStyle,
     credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
   });
+  // 签名专用客户端:容器内用内网端点做读写,但签名 URL 的 host 必须浏览器可达
+  // (SigV4 对 host 签名,宿主转发保留 Host 头,所以公网端点签名 + 内网读写可并存)
+  const signingClient = publicEndpoint === endpoint
+    ? client
+    : new S3Client({
+      endpoint: publicEndpoint,
+      region,
+      forcePathStyle,
+      credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
+    });
 
   let ensured;
   /** MinIO 首次使用时 bucket 可能不存在；生产的 OSS/COS 一般已建好，HeadBucket 成功即跳过。 */
@@ -74,7 +85,7 @@ export function createS3AssetStorage({
 
     async getSignedUrl(key, { expiresInSeconds = 900 } = {}) {
       await ensureBucket();
-      return presign(client, new GetObjectCommand({ Bucket: bucket, Key: key }), {
+      return presign(signingClient, new GetObjectCommand({ Bucket: bucket, Key: key }), {
         expiresIn: expiresInSeconds,
       });
     },

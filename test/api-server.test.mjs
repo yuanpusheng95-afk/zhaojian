@@ -466,3 +466,28 @@ test('SSE pushes only the initial snapshot while the fingerprint is unchanged', 
 });
 
 after(() => new Promise((resolve) => setImmediate(resolve)));
+
+test('CORS preflight allows the frontend custom header and origin', async () => {
+  const server = createApiServer({ repository: {}, queue: fakeQueue(), turnViews: fakeViews({}) });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+  try {
+    const preflight = await fetch(`http://127.0.0.1:${port}/projects/x/messages`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'http://localhost:5173',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'idempotency-key, content-type',
+      },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-origin'), '*');
+    assert.match(preflight.headers.get('access-control-allow-headers'), /idempotency-key/i);
+
+    const health = await fetch(`http://127.0.0.1:${port}/health`, { headers: { origin: 'http://localhost:5173' } });
+    assert.equal(health.headers.get('access-control-allow-origin'), '*');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

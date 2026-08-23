@@ -32,6 +32,60 @@ services:
     volumes:
       - photo_agent_minio:/data
 
+  # 迁移由部署流程显式执行(设计文档 §12.3):api/worker 启动时不再各自跑迁移,
+  # 竞态窗口只存在于这一个 one-shot 里,靠 postgres healthcheck + 服务完成条件排序。
+  migrate:
+    build: .
+    command: ["node", "src/infrastructure/postgres/migrate.mjs"]
+    environment:
+      DATABASE_URL: postgres://photo_agent:photo_agent@postgres:5432/photo_agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: ["node", "src/api/main.mjs"]
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      # 容器内走服务名内网;S3_PUBLIC_ENDPOINT 决定签名 URL 的宿主可达地址(浏览器用)
+      DATABASE_URL: postgres://photo_agent:photo_agent@postgres:5432/photo_agent
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  worker:
+    build: .
+    command: ["node", "src/worker/main.mjs"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://photo_agent:photo_agent@postgres:5432/photo_agent
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # SIGTERM 后 worker 等在途轮次(drain telemetry → 关池);grace 对齐到分钟级
+    stop_grace_period: 70s
+
 volumes:
   photo_agent_postgres:
   photo_agent_minio:

@@ -5,18 +5,30 @@ import { handleTurnEvents } from './sse.mjs';
 
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
-export function createApiServer({ repository, queue, turnViews, logger = console }) {
+export function createApiServer({ repository, queue, turnViews, corsOrigin = '*', logger = console }) {
   if (!repository) throw new TypeError('createApiServer requires repository');
   if (!queue) throw new TypeError('createApiServer requires queue');
   if (!turnViews) throw new TypeError('createApiServer requires turnViews');
   const eventStreamResponses = new Set();
+  // CORS 头统一注入:SSE(EventSource 不发预检,流响应必须自带)与自定义头
+  // Idempotency-Key 都依赖它;所有出口都经 writeJson 或 SSE 的 writeHead
+  const cors = {
+    'access-control-allow-origin': corsOrigin,
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'Content-Type, Idempotency-Key',
+  };
   const server = http.createServer(async (request, response) => {
     try {
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204, cors);
+        response.end();
+        return;
+      }
       await routeRequest({
-        request, response, repository, queue, turnViews, eventStreamResponses,
+        request, response, repository, queue, turnViews, eventStreamResponses, cors,
       });
     } catch (error) {
-      writeError(response, error, logger);
+      writeError(response, error, logger, cors);
     }
   });
   server.closeActiveEventStreams = () => {
@@ -28,25 +40,25 @@ export function createApiServer({ repository, queue, turnViews, logger = console
 }
 
 async function routeRequest({
-  request, response, repository, queue, turnViews, eventStreamResponses,
+  request, response, repository, queue, turnViews, eventStreamResponses, cors,
 }) {
   const url = new URL(request.url, 'http://localhost');
   const path = url.pathname;
 
   if (request.method === 'GET' && path === '/health') {
-    return writeJson(response, 200, { status: 'ok' });
+    return writeJson(response, 200, { status: 'ok' }, cors);
   }
 
   if (request.method === 'POST' && path === '/projects') {
     const body = await readJson(request);
     const project = await repository.createProject(body);
-    return writeJson(response, 201, project);
+    return writeJson(response, 201, project, cors);
   }
 
   const projectMatch = path.match(/^\/projects\/([^/]+)$/);
   if (request.method === 'GET' && projectMatch) {
     const project = await repository.getProject(decode(projectMatch[1]));
-    return writeJson(response, 200, project);
+    return writeJson(response, 200, project, cors);
   }
 
   const generationMatch = path.match(/^\/generations\/([^/]+)$/);
@@ -54,7 +66,7 @@ async function routeRequest({
     const generation = await repository.getGeneration(
       decode(generationMatch[1]),
     );
-    return writeJson(response, 200, generation);
+    return writeJson(response, 200, generation, cors);
   }
 
   const messageMatch = path.match(/^\/projects\/([^/]+)\/messages$/);
@@ -72,7 +84,7 @@ async function routeRequest({
       userMessage: body.message,
       idempotencyKey,
     });
-    return writeJson(response, result.replayed ? 200 : 202, result);
+    return writeJson(response, result.replayed ? 200 : 202, result, cors);
   }
 
   const turnMatch = path.match(/^\/projects\/([^/]+)\/turns\/([^/]+)$/);
@@ -81,7 +93,7 @@ async function routeRequest({
       projectId: decode(turnMatch[1]),
       turnId: decode(turnMatch[2]),
     });
-    return writeJson(response, 200, detail);
+    return writeJson(response, 200, detail, cors);
   }
 
   const turnSelectionMatch = path.match(
@@ -102,7 +114,7 @@ async function routeRequest({
       generationId: body.generationId,
       candidateId: body.candidateId,
     });
-    return writeJson(response, 200, { revisionId: revision.id });
+    return writeJson(response, 200, { revisionId: revision.id }, cors);
   }
 
   const turnEventsMatch = path.match(
@@ -118,6 +130,7 @@ async function routeRequest({
       projectId: decode(turnEventsMatch[1]),
       turnId: decode(turnEventsMatch[2]),
       pollMs: url.searchParams.get('pollMs'),
+      cors,
     });
   }
 
@@ -152,7 +165,7 @@ async function readJson(request) {
   }
 }
 
-function writeError(response, error, logger) {
+function writeError(response, error, logger, cors) {
   if (response.headersSent) {
     response.destroy();
     return;
@@ -162,7 +175,7 @@ function writeError(response, error, logger) {
   if (mapped.status === 500) logger.error(error);
   writeJson(response, mapped.status, {
     error: { code: mapped.code, message: mapped.message },
-  });
+  }, cors);
 }
 
 function mapError(error) {
@@ -210,9 +223,10 @@ function mapError(error) {
   return new HttpError(500, 'INTERNAL_ERROR', 'Internal server error');
 }
 
-function writeJson(response, status, body) {
+function writeJson(response, status, body, cors) {
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
+    ...(cors ?? {}),
   });
   response.end(JSON.stringify(body));
 }

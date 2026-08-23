@@ -21,15 +21,18 @@ export async function handleTurnEvents({
   projectId,
   turnId,
   pollMs,
+  cors = {},
 }) {
   const intervalMs = parsePollMs(pollMs);
   if (!request || !response || typeof request.on !== 'function') {
     throw new TypeError('handleTurnEvents requires HTTP streams');
   }
+  // EventSource 是跨域 GET,不带预检——流响应本身必须带 allow-origin
   response.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
     connection: 'keep-alive',
+    ...cors,
   });
   response.write(': ping\n\n');
 

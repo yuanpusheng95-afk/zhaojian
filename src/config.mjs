@@ -33,8 +33,11 @@ const DEFAULT_DATABASE_URL =
   'postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent';
 
 function s3Config(env) {
+  const endpoint = env.S3_ENDPOINT ?? 'http://127.0.0.1:9000';
   return {
-    endpoint: env.S3_ENDPOINT ?? 'http://127.0.0.1:9000',
+    endpoint,
+    // 签名 URL 的对外端点:容器部署时读写走内网(minio:9000),浏览器走宿主映射
+    publicEndpoint: env.S3_PUBLIC_ENDPOINT ?? endpoint,
     bucket: env.S3_BUCKET ?? 'photo-agent',
     accessKey: required(env, 'S3_ACCESS_KEY'),
     secretKey: required(env, 'S3_SECRET_KEY'),
@@ -108,5 +111,7 @@ export function loadApiConfig(env = process.env) {
     port: integer(env, 'PORT', 3000),
     s3: s3Config(env),
     signedUrlTtlSeconds: integer(env, 'SIGNED_URL_TTL_SECONDS', 900),
+    // 前端跨域来源(vite dev 5173 → api 3000);默认 * 仅限本地开发
+    corsOrigin: env.CORS_ORIGIN ?? '*',
   };
 }

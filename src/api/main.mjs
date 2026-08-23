@@ -1,6 +1,5 @@
 import pg from 'pg';
 
-import { runMigrations } from '../infrastructure/postgres/migrate.mjs';
 import { createAgentTurnQueue } from '../infrastructure/postgres/agent-turn-queue.mjs';
 import { createS3AssetStorage } from '../infrastructure/storage/s3-asset-storage.mjs';
 import { loadApiConfig } from '../config.mjs';
@@ -13,7 +12,6 @@ const { Pool } = pg;
 const pool = new Pool({
   connectionString: config.databaseUrl,
 });
-await runMigrations(pool);
 
 const repository = new PostgresPhotoProjectRepository({ pool });
 const queue = createAgentTurnQueue({ pool });
@@ -24,7 +22,7 @@ const turnViews = createTurnViews({
   assetStorage,
   signedUrlTtlSeconds: config.signedUrlTtlSeconds,
 });
-const server = createApiServer({ repository, queue, turnViews });
+const server = createApiServer({ repository, queue, turnViews, corsOrigin: config.corsOrigin });
 const port = config.port;
 server.listen(port, () => {
   process.stdout.write(`Photo Agent API listening on :${port}\n`);

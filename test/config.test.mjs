@@ -106,3 +106,17 @@ test('image attempt cap defaults to twice the image quota and can be overridden'
   assert.equal(overridden.guards.maxImagesPerTurn, 2);
   assert.equal(overridden.guards.maxImageAttemptsPerTurn, 3);
 });
+
+test('public signing endpoint defaults to the ops endpoint and can be split for containers', () => {
+  const merged = loadApiConfig({ S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k' });
+  assert.equal(merged.s3.publicEndpoint, merged.s3.endpoint);
+
+  const split = loadApiConfig({
+    S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k',
+    S3_ENDPOINT: 'http://minio:9000',
+    S3_PUBLIC_ENDPOINT: 'http://127.0.0.1:9000',
+  });
+  assert.equal(split.s3.endpoint, 'http://minio:9000');
+  assert.equal(split.s3.publicEndpoint, 'http://127.0.0.1:9000');
+  assert.equal(split.corsOrigin, '*');
+});
