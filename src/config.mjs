@@ -61,11 +61,22 @@ export function loadWorkerConfig(env = process.env) {
       editRoute: editRoute(env),
     },
     s3: s3Config(env),
-    guards: {
-      maxImagesPerTurn: integer(env, 'MAX_IMAGES_PER_TURN', 3),
-      imageTimeoutMs: integer(env, 'IMAGE_TIMEOUT_MS', 180_000),
-      turnTimeoutMs: integer(env, 'TURN_TIMEOUT_MS', 600_000),
-    },
+    guards: (() => {
+      const maxImagesPerTurn = integer(env, 'MAX_IMAGES_PER_TURN', 3);
+      return {
+        maxImagesPerTurn,
+        // 失败尝试的独立闸:产品配额只数成功,但瞬时失败的重试循环烧的是真钱,
+        // 这里给尝试总数一个更宽松的上限(默认 2× 成功上限),与配额互不干扰
+        maxImageAttemptsPerTurn: integer(env, 'MAX_IMAGE_ATTEMPTS_PER_TURN', 2 * maxImagesPerTurn),
+        imageTimeoutMs: integer(env, 'IMAGE_TIMEOUT_MS', 180_000),
+        turnTimeoutMs: integer(env, 'TURN_TIMEOUT_MS', 600_000),
+      };
+    })(),
+    turnLeaseMs: integer(env, 'TURN_LEASE_MS', 30_000),
+    heartbeatMs: integer(env, 'TURN_HEARTBEAT_MS', 10_000),
+    workerConcurrency: integer(env, 'WORKER_CONCURRENCY', 4),
+    shutdownGraceMs: integer(env, 'SHUTDOWN_GRACE_MS', 600_000),
+    pollIntervalMs: integer(env, 'WORKER_POLL_INTERVAL_MS', 500),
     telemetry: env.TELEMETRY ?? 'stdout',
   };
 }

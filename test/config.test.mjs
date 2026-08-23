@@ -18,6 +18,11 @@ test('worker config applies documented defaults', () => {
   assert.equal(config.image.modelId, 'gpt-image-2');
   assert.equal(config.guards.maxImagesPerTurn, 3);
   assert.equal(config.guards.imageTimeoutMs, 180000);
+  assert.equal(config.turnLeaseMs, 30000);
+  assert.equal(config.heartbeatMs, 10000);
+  assert.equal(config.workerConcurrency, 4);
+  assert.equal(config.shutdownGraceMs, 600000);
+  assert.equal(config.pollIntervalMs, 500);
   assert.equal(config.telemetry, 'stdout');
 });
 
@@ -89,4 +94,14 @@ test('numeric guards reject non-numeric values instead of silently using NaN', (
     () => loadWorkerConfig({ ...FULL_WORKER_ENV, MAX_IMAGES_PER_TURN: 'many' }),
     /MAX_IMAGES_PER_TURN/,
   );
+});
+
+test('image attempt cap defaults to twice the image quota and can be overridden', () => {
+  const defaults = loadWorkerConfig({ LLM_API_KEY: 'k', IMAGE_BASE_URL: 'https://i', IMAGE_API_KEY: 'k', S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k' });
+  assert.equal(defaults.guards.maxImagesPerTurn, 3);
+  assert.equal(defaults.guards.maxImageAttemptsPerTurn, 6);
+
+  const overridden = loadWorkerConfig({ LLM_API_KEY: 'k', IMAGE_BASE_URL: 'https://i', IMAGE_API_KEY: 'k', S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k', MAX_IMAGES_PER_TURN: '2', MAX_IMAGE_ATTEMPTS_PER_TURN: '3' });
+  assert.equal(overridden.guards.maxImagesPerTurn, 2);
+  assert.equal(overridden.guards.maxImageAttemptsPerTurn, 3);
 });

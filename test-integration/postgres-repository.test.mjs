@@ -208,6 +208,49 @@ test('createProject writes owner and anchor asset uri and metadata', async () =>
   });
 });
 
+test('getAsset round-trips source and generated assets', async () => {
+  const repository = createRepository();
+  await createProject(repository);
+  await createTurn('project_1', 'turn_1');
+
+  await repository.recordGeneration({
+    projectId: 'project_1',
+    turnId: 'turn_1',
+    baseRevisionId: 'revision_1',
+    inputAssetId: 'asset_source_project_1',
+    patch: editPatch(),
+    outcome: completedOutcome(),
+  });
+
+  const source = await repository.getAsset('asset_source_project_1');
+  assert.deepEqual(source, {
+    id: 'asset_source_project_1',
+    kind: 'source',
+    uri: assetUri({
+      projectId: 'project_1',
+      assetId: 'asset_source_project_1',
+    }),
+    metadata: { source: 'upload', contentType: 'image/jpeg' },
+  });
+
+  const generated = await repository.getAsset('asset_candidate_1');
+  assert.deepEqual(generated, {
+    id: 'asset_candidate_1',
+    kind: 'generated',
+    uri: assetUri({
+      projectId: 'project_1',
+      assetId: 'asset_candidate_1',
+      contentType: 'image/png',
+    }),
+    metadata: { model: 'gpt-image-2', contentType: 'image/png' },
+  });
+
+  await assert.rejects(
+    repository.getAsset('asset_missing'),
+    AssetNotFoundError,
+  );
+});
+
 test('recordGeneration records a completed generation in one transaction', async () => {
   const repository = createRepository();
   await createProject(repository);

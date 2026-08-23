@@ -1,6 +1,6 @@
 # 照见（Zhaojian）Photo Agent
 
-PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、带租约的 SQL Job Queue、独立 Generation Worker 和 Mock ImageGenerationProvider。
+PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、带租约的 SQL Job Queue、独立 Agent Turn Worker 和真实图像供应商。
 
 ## 已实现闭环
 
@@ -71,6 +71,7 @@ npm run db:migrate
 
 ```bash
 npm run start:api
+npm run start:worker
 ```
 
 默认地址：
@@ -106,6 +107,17 @@ npm test
 npm run db:up
 npm run test:integration
 ```
+
+## Agent 冒烟
+
+冒烟需要 `.env` 里的 LLM 与图像供应商凭证，并先创建带基准图的项目：
+
+```bash
+npm run smoke:agent -- <projectId> 把背景换成海边沙滩，保持人物面部特征不变
+npm run start:worker
+```
+
+`smoke:agent` 只负责提交 Turn 并等待终态；`start:worker` 执行 Agent 循环、调用工具、生成图像并把轨迹写进 PostgreSQL。stdout 保持 JSON 行 telemetry，人类可读进度走 stderr。
 
 测试脚本默认创建并重置独立的 `photo_agent_test` 数据库；如果数据库名不以 `_test` 结尾，会拒绝执行破坏性重置。
 

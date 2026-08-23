@@ -78,3 +78,14 @@ export function createStdoutTelemetry({
 
   return { startSpan };
 }
+
+/** 测试与 TELEMETRY=noop 时的空实现：span 语义保持，什么都不输出。 */
+export function createNoopTelemetry() {
+  const noopSpan = {
+    startSpan: (_options, callback) => callback(noopSpan),
+    addEvent() {},
+    setAttributes() {},
+    setStatus() {},
+  };
+  return { startSpan: (_options, callback) => callback(noopSpan) };
+}

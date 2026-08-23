@@ -272,6 +272,10 @@ export class PostgresPhotoProjectRepository {
     return this.#requireRevision(this.#pool, revisionId);
   }
 
+  async getAsset(assetId) {
+    return this.#requireAsset(this.#pool, assetId);
+  }
+
   async listRevisions(projectId) {
     await this.#requireProject(this.#pool, projectId);
     const result = await this.#pool.query(
@@ -347,6 +351,15 @@ export class PostgresPhotoProjectRepository {
     return mapRevision(result.rows[0]);
   }
 
+  async #requireAsset(database, assetId) {
+    const result = await database.query(
+      'SELECT * FROM assets WHERE id = $1',
+      [assetId],
+    );
+    if (result.rowCount === 0) throw new AssetNotFoundError(assetId);
+    return mapAsset(result.rows[0]);
+  }
+
   async #transaction(callback) {
     const client = await this.#pool.connect();
     try {
@@ -384,6 +397,15 @@ function mapRevision(row) {
     anchorAssetId: row.anchor_asset_id,
     sourceGenerationId: row.source_generation_id,
     createdAt: toIso(row.created_at),
+  };
+}
+
+function mapAsset(row) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    uri: row.uri,
+    metadata: row.metadata_json,
   };
 }
 
