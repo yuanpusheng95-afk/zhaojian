@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { after, beforeEach, test } from 'node:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 
 import pg from 'pg';
 
@@ -8,8 +8,8 @@ import {
   ProjectBusyError,
   TurnLeaseLostError,
   createAgentTurnQueue,
-} from '../src/infrastructure/postgres/agent-turn-queue.mjs';
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
+} from '../src/infrastructure/postgres/agent-turn-queue.js';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -28,9 +28,7 @@ beforeEach(async () => {
   await runMigrations(pool);
 });
 
-after(async () => {
-  await pool.end();
-});
+
 
 async function createProject(projectId = 'project_1') {
   await pool.query(

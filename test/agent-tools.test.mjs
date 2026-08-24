@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import {
   createGenerateImageTool,
   createReadPhotoStateTool,
   createSelectCandidateTool,
   createTurnContext,
-} from '../src/agent/tools/index.mjs';
-import { AssetNotFoundError } from '../src/domain/photo-project-service.mjs';
+} from '../src/agent/tools/index.js';
+import { AssetNotFoundError } from '../src/domain/photo-project-service.js';
 
 const revision = {
   id: 'revision_1',
@@ -265,10 +265,10 @@ test('select_candidate lets a bad candidate remain recoverable', async () => {
   const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
   const tool = createSelectCandidateTool({ repository, turnContext });
 
-  await assert.rejects(
-    tool.execute('call_1', { generationId: 'generation_1', candidateId: 'candidate_bad' }),
-  );
-  assert.equal(turnContext.fatal, null);
+  const result = await tool.execute('call_1', { generationId: 'generation_1', candidateId: 'candidate_bad' });
+  assert.equal(result.isError, true);
+  assert.equal(result.terminate, undefined);
+  assert.equal(result.details.recoverable, true);
 });
 
 test('generate_image returns terminate with a fatal code when the base asset is missing', async () => {

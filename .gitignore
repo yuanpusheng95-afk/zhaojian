@@ -8,3 +8,4 @@ coverage/
 /.claude
 /.idea
 /.probe
+.env.test

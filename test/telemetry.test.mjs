@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
-import { instrumentStreamFn } from '../src/infrastructure/telemetry/stream-fn.mjs';
-import { createNoopTelemetry } from '../src/infrastructure/telemetry/stdout-telemetry.mjs';
-import { createTeeTelemetry } from '../src/infrastructure/telemetry/pg-telemetry.mjs';
+import { instrumentStreamFn } from '../src/infrastructure/telemetry/stream-fn.js';
+import { createNoopTelemetry } from '../src/infrastructure/telemetry/stdout-telemetry.js';
+import { createTeeTelemetry } from '../src/infrastructure/telemetry/pg-telemetry.js';
 
 test('tee telemetry runs the callback once and emits to every sink', async () => {
   const emitted = [];

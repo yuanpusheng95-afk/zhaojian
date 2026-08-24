@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
-import { loadApiConfig, loadImageConfig, loadWorkerConfig } from '../src/config.mjs';
+import { loadApiConfig, loadImageConfig, loadWorkerConfig } from '../src/config.js';
 
 const FULL_WORKER_ENV = {
   LLM_API_KEY: 'llm-key',

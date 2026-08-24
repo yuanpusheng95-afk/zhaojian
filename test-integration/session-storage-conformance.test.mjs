@@ -1,11 +1,11 @@
-import { after, test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import pg from 'pg';
 
 import { createSessionBackendConformance } from '@earendil-works/pi-agent-core/session/testing';
 
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
-import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.mjs';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
+import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.js';
 
 const { Pool } = pg;
 
@@ -44,6 +44,4 @@ for (const conformanceCase of createSessionBackendConformance(createFixture)) {
   });
 }
 
-after(async () => {
-  await pool.end();
-});
+

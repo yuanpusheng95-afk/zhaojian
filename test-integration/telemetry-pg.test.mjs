@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { after, beforeEach, test } from 'node:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 
 import pg from 'pg';
 
-import { createPgTelemetry } from '../src/infrastructure/telemetry/pg-telemetry.mjs';
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
+import { createPgTelemetry } from '../src/infrastructure/telemetry/pg-telemetry.js';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -22,9 +22,7 @@ beforeEach(async () => {
   await runMigrations(pool);
 });
 
-after(async () => {
-  await pool.end();
-});
+
 
 test('pg telemetry persists spans with turn and project extraction', async () => {
   await pool.query(

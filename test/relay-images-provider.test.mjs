@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
-import { relayGenerateImages } from '../src/infrastructure/models/relay-images-provider.mjs';
+import { relayGenerateImages } from '../src/infrastructure/models/relay-images-provider.js';
 
 /** baseUrl 带 /v1，覆盖「中转站已含版本段」这种常见写法。 */
 const MODEL = {

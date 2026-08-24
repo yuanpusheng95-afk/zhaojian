@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import { InMemorySessionRepo, SessionError } from '@earendil-works/pi-agent-core';
 
-import { runAgentTurn } from '../src/agent/agent-runner.mjs';
+import { runAgentTurn } from '../src/agent/agent-runner.js';
 import { createFakeStreamFn } from '../test/support/fake-stream-fn.mjs';
 
 const config = {

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import { NOOP_TELEMETRY_CONTEXT } from '@earendil-works/pi-agent-core';
 
-import { createStdoutTelemetry } from '../src/infrastructure/telemetry/stdout-telemetry.mjs';
+import { createStdoutTelemetry } from '../src/infrastructure/telemetry/stdout-telemetry.js';
 
 function collector() {
   const lines = [];

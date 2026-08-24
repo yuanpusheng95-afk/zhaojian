@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { after, test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import http from 'node:http';
 
-import { IdempotencyConflictError, ProjectBusyError } from '../src/infrastructure/postgres/agent-turn-queue.mjs';
-import { handleTurnEvents, parsePollMs } from '../src/api/sse.mjs';
-import { createApiServer } from '../src/api/server.mjs';
+import { IdempotencyConflictError, ProjectBusyError } from '../src/infrastructure/postgres/agent-turn-queue.js';
+import { handleTurnEvents, parsePollMs } from '../src/api/sse.js';
+import { createApiServer } from '../src/api/server.js';
+import { createApp } from '../src/api/app.js';
 
 function startServer(dependencies) {
   const server = createApiServer({
@@ -444,31 +445,32 @@ test('SSE pushes only the initial snapshot while the fingerprint is unchanged', 
     },
     turnChangedSince: async () => ({ changed: calls === 0, fingerprint: `f${calls}` }),
   };
-  const server = http.createServer((req, res) =>
-    handleTurnEvents({ request: req, response: res, turnViews: views, projectId: 'p1', turnId: 't1', pollMs: '40' }));
-  await new Promise((resolve) => server.listen(0, resolve));
-  const port = server.address().port;
-
+  const app = createApp({
+    pool: {},
+    queue: {},
+    repository: {},
+    assetStorage: { bucket: 'photo-agent' },
+    turnViews: views,
+  });
+  const abortController = new AbortController();
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/projects/p1/turns/t1/events`);
+    const response = await app.request('/projects/p1/turns/t1/events?pollMs=40', { signal: abortController.signal });
     const reader = response.body.getReader();
-    const deadline = Date.now() + 400;
     let events = '';
-    while (Date.now() < deadline) {
+    for (let index = 0; index < 3; index += 1) {
       const { value, done } = await reader.read();
       if (done) break;
       events += Buffer.from(value).toString();
+      if (events.includes('event: turn')) break;
     }
     const turnEvents = (events.match(/event: turn/g) ?? []).length;
     assert.equal(turnEvents, 1, `expected only the initial snapshot, got ${turnEvents}`);
     assert.ok(events.includes('event: done') === false, 'non-terminal turn must not emit done');
   } finally {
-    server.closeAllConnections();
-    await new Promise((resolve) => server.close(resolve));
+    abortController.abort();
   }
 });
 
-after(() => new Promise((resolve) => setImmediate(resolve)));
 
 test('CORS preflight allows the frontend custom header and origin', async () => {
   const server = createApiServer({ repository: {}, queue: fakeQueue(), turnViews: fakeViews({}), assetStorage: { bucket: 'photo-agent', async put() {} } });

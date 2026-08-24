@@ -1,42 +1,42 @@
 import assert from 'node:assert/strict';
-import { after, test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import pg from 'pg';
 
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
 import {
   appendEntry,
   readEntry,
-} from '../src/infrastructure/postgres/session/entries.mjs';
+} from '../src/infrastructure/postgres/session/entries.js';
 import {
   computeStats,
   getFact,
   setFact,
-} from '../src/infrastructure/postgres/session/facts.mjs';
+} from '../src/infrastructure/postgres/session/facts.js';
 import {
   createLane,
   insertLane,
   moveLane,
   readLaneLeaf,
   readLanes,
-} from '../src/infrastructure/postgres/session/lanes.mjs';
+} from '../src/infrastructure/postgres/session/lanes.js';
 import {
   findEntries,
   findEntriesOnBranch,
   getLog,
-} from '../src/infrastructure/postgres/session/queries.mjs';
+} from '../src/infrastructure/postgres/session/queries.js';
 import {
   appendRecord,
   findOpenOperations,
   findRecords,
-} from '../src/infrastructure/postgres/session/records.mjs';
-import { nextSeq } from '../src/infrastructure/postgres/session/sequences.mjs';
-import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.mjs';
-import { createPostgresSessionStorage } from '../src/infrastructure/postgres/session/storage.mjs';
+} from '../src/infrastructure/postgres/session/records.js';
+import { nextSeq } from '../src/infrastructure/postgres/session/sequences.js';
+import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.js';
+import { createPostgresSessionStorage } from '../src/infrastructure/postgres/session/storage.js';
 import {
   insertSession,
   readSession,
-} from '../src/infrastructure/postgres/session/sessions.mjs';
+} from '../src/infrastructure/postgres/session/sessions.js';
 
 const { Pool } = pg;
 
@@ -69,9 +69,7 @@ async function withClient(fn) {
   }
 }
 
-after(async () => {
-  await pool.end();
-});
+
 
 function messageEntry(id, text) {
   return {

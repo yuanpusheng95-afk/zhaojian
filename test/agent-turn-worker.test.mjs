@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
-import { createAgentTurnWorker } from '../src/worker/agent-turn-worker.mjs';
+import { createAgentTurnWorker } from '../src/worker/agent-turn-worker.js';
 import { createFakeStreamFn } from './support/fake-stream-fn.mjs';
-import { runAgentTurn } from '../src/agent/agent-runner.mjs';
+import { runAgentTurn } from '../src/agent/agent-runner.js';
 import { InMemorySessionRepo, SessionError } from '@earendil-works/pi-agent-core';
 
 const config = {

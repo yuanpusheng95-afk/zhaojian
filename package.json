@@ -4,21 +4,12 @@
   "private": true,
   "description": "照见 Photo Agent V1 modular monolith and generation worker",
   "scripts": {
-    "test": "node --test test/*.test.mjs",
-    "test:integration": "node scripts/prepare-test-database.mjs && node --test --test-concurrency=1 test-integration/*.test.mjs",
-    "test:session": "node scripts/prepare-test-database.mjs && node --test --test-concurrency=1 test-integration/session-storage-*.test.mjs",
-    "check": "node scripts/check-syntax.mjs",
-    "db:up": "docker compose up -d postgres",
-    "dev:up": "docker compose up -d postgres minio",
-    "db:down": "docker compose down",
-    "dev:down": "docker compose down",
-    "db:migrate": "node src/infrastructure/postgres/migrate.mjs",
-    "start:api": "node src/api/main.mjs",
-    "start:worker": "node src/worker/main.mjs",
-    "seed:smoke": "node --env-file=.env scripts/seed-smoke.mjs",
-    "smoke:image": "node --env-file=.env scripts/smoke-image.mjs",
-    "smoke:agent": "node --env-file=.env scripts/smoke-agent.mjs",
-    "smoke:api": "node --env-file=.env scripts/smoke-api.mjs"
+    "test": "bun test test/",
+    "test:integration": "bun run scripts/prepare-test-database.mjs && bun --env-file=.env.test test test-integration/",
+    "check": "tsc --noEmit",
+    "db:migrate": "bun run src/infrastructure/postgres/migrate.ts",
+    "start:api": "bun run src/api/main.ts",
+    "start:worker": "bun run src/worker/main.ts"
   },
   "engines": {
     "node": ">=22"
@@ -28,6 +19,18 @@
     "@aws-sdk/s3-request-presigner": "3.1115.0",
     "@earendil-works/pi-agent-core": "0.84.2",
     "@earendil-works/pi-ai": "0.84.2",
-    "pg": "^8.16.3"
+    "@hono/node-server": "^2.1.1",
+    "@types/node": "^26.2.0",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.3",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.0",
+    "typescript": "^7.0.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "bun-types": "^1.4.0",
+    "drizzle-kit": "^0.31.10"
   }
 }

@@ -1,12 +1,12 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
+import { describe, expect, test } from 'bun:test';
 
 import {
   CandidateSelectionError,
   PhotoProjectService,
   RevisionConflictError,
   RevisionNotFoundError,
-} from '../src/domain/photo-project-service.mjs';
+} from '../src/domain/photo-project-service.js';
 
 function createIdFactory() {
   const counters = new Map();

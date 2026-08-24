@@ -1,7 +1,7 @@
 import pg from 'pg';
-import { loadWorkerConfig } from '../src/config.mjs';
-import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.mjs';
-import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
+import { loadWorkerConfig } from '../src/config.js';
+import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.js';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.js';
 
 const config = loadWorkerConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });

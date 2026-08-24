@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
-import { after, beforeEach, test } from 'node:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 
 import pg from 'pg';
 
-import { createAgentTurnQueue } from '../src/infrastructure/postgres/agent-turn-queue.mjs';
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
-import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
-import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.mjs';
-import { buildAssetKey, buildAssetUri } from '../src/infrastructure/storage/asset-storage.mjs';
-import { loadApiConfig } from '../src/config.mjs';
-import { createTurnViews } from '../src/api/turn-views.mjs';
-import { createApiServer } from '../src/api/server.mjs';
+import { createAgentTurnQueue } from '../src/infrastructure/postgres/agent-turn-queue.js';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.js';
+import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.js';
+import { buildAssetKey, buildAssetUri } from '../src/infrastructure/storage/asset-storage.js';
+import { loadApiConfig } from '../src/config.js';
+import { createTurnViews } from '../src/api/turn-views.js';
+import { createApiServer } from '../src/api/server.js';
 
 const config = loadApiConfig({
   ...process.env,
@@ -50,7 +50,7 @@ beforeEach(async () => {
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
-after(async () => {
+process.on('beforeExit', async () => {
   await new Promise((resolve) => server?.close(resolve));
   await pool.end();
 });

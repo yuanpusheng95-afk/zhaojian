@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { after, beforeEach, test } from 'node:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 
 import pg from 'pg';
 
@@ -7,13 +7,13 @@ import {
   AssetNotFoundError,
   RevisionConflictError,
   TurnNotFoundError,
-} from '../src/domain/photo-project-service.mjs';
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
+} from '../src/domain/photo-project-service.js';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
 import {
   buildAssetKey,
   buildAssetUri,
-} from '../src/infrastructure/storage/asset-storage.mjs';
-import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
+} from '../src/infrastructure/storage/asset-storage.js';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -33,9 +33,7 @@ beforeEach(async () => {
   await runMigrations(pool);
 });
 
-after(async () => {
-  await pool.end();
-});
+
 
 function createIdFactory() {
   const counters = new Map();

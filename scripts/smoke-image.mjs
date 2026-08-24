@@ -5,11 +5,11 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
-import { loadImageConfig } from '../src/config.mjs';
-import { createRelayImagesModels } from '../src/infrastructure/models/relay-images-provider.mjs';
-import { buildAssetKey } from '../src/infrastructure/storage/asset-storage.mjs';
-import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.mjs';
-import { createStdoutTelemetry } from '../src/infrastructure/telemetry/stdout-telemetry.mjs';
+import { loadImageConfig } from '../src/config.js';
+import { createRelayImagesModels } from '../src/infrastructure/models/relay-images-provider.js';
+import { buildAssetKey } from '../src/infrastructure/storage/asset-storage.js';
+import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.js';
+import { createStdoutTelemetry } from '../src/infrastructure/telemetry/stdout-telemetry.js';
 
 const log = (message) => process.stderr.write(`${message}\n`);
 

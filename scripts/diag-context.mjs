@@ -1,9 +1,9 @@
 import { buildSessionContext } from '@earendil-works/pi-agent-core';
 import pg from 'pg';
-import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.mjs';
-import { createLlmModels } from '../src/infrastructure/models/llm-provider.mjs';
-import { loadWorkerConfig } from '../src/config.mjs';
-import { SYSTEM_PROMPT } from '../src/agent/system-prompt.mjs';
+import { createPostgresSessionRepo } from '../src/infrastructure/postgres/session/repo.js';
+import { createLlmModels } from '../src/infrastructure/models/llm-provider.js';
+import { loadWorkerConfig } from '../src/config.js';
+import { SYSTEM_PROMPT } from '../src/agent/system-prompt.js';
 
 const config = loadWorkerConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });

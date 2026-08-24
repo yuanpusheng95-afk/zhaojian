@@ -32,11 +32,21 @@ services:
     volumes:
       - photo_agent_minio:/data
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "63790:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   # 迁移由部署流程显式执行(设计文档 §12.3):api/worker 启动时不再各自跑迁移,
   # 竞态窗口只存在于这一个 one-shot 里,靠 postgres healthcheck + 服务完成条件排序。
   migrate:
     build: .
-    command: ["node", "src/infrastructure/postgres/migrate.mjs"]
+    command: ["bun", "run", "src/infrastructure/postgres/migrate.ts"]
     environment:
       DATABASE_URL: postgres://photo_agent:photo_agent@postgres:5432/photo_agent
     depends_on:
@@ -46,7 +56,7 @@ services:
 
   api:
     build: .
-    command: ["node", "src/api/main.mjs"]
+    command: ["bun", "run", "src/api/main.ts"]
     ports:
       - "3000:3000"
     env_file: .env
@@ -56,30 +66,36 @@ services:
       S3_ENDPOINT: http://minio:9000
       S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
       CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      REDIS_URL: redis://redis:6379
     depends_on:
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "bun", "-e", "const response = await fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health'); if (!response.ok) process.exit(1)"]
       interval: 5s
       timeout: 3s
       retries: 12
 
   worker:
     build: .
-    command: ["node", "src/worker/main.mjs"]
+    command: ["bun", "run", "src/worker/main.ts"]
     env_file: .env
     environment:
       DATABASE_URL: postgres://photo_agent:photo_agent@postgres:5432/photo_agent
       S3_ENDPOINT: http://minio:9000
+      REDIS_URL: redis://redis:6379
     depends_on:
       postgres:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
-import { createTurnViews } from '../src/api/turn-views.mjs';
+import { createTurnViews } from '../src/api/turn-views.js';
 
 function createDependencies({
   turn = null,

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { describe, expect, test } from 'bun:test';
 
 import {
   buildAssetKey,
   buildAssetUri,
   resolveAssetStorageKey,
-} from '../src/infrastructure/storage/asset-storage.mjs';
-import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.mjs';
+} from '../src/infrastructure/storage/asset-storage.js';
+import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.js';
 
 function createStorage() {
   return createS3AssetStorage({

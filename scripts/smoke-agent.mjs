@@ -3,10 +3,10 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 
-import { loadWorkerConfig } from '../src/config.mjs';
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
-import { createAgentTurnQueue } from '../src/infrastructure/postgres/agent-turn-queue.mjs';
-import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
+import { loadWorkerConfig } from '../src/config.js';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
+import { createAgentTurnQueue } from '../src/infrastructure/postgres/agent-turn-queue.js';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.js';
 
 const config = loadWorkerConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });

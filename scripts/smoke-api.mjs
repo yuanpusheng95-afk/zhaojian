@@ -6,14 +6,14 @@ import { randomUUID } from 'node:crypto';
 
 import pg from 'pg';
 
-import { loadApiConfig, loadWorkerConfig } from '../src/config.mjs';
-import { runMigrations } from '../src/infrastructure/postgres/migrate.mjs';
-import { createAgentTurnQueue } from '../src/infrastructure/postgres/agent-turn-queue.mjs';
-import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.mjs';
-import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.mjs';
-import { buildAssetKey, buildAssetUri } from '../src/infrastructure/storage/asset-storage.mjs';
-import { createTurnViews } from '../src/api/turn-views.mjs';
-import { createApiServer } from '../src/api/server.mjs';
+import { loadApiConfig, loadWorkerConfig } from '../src/config.js';
+import { runMigrations } from '../src/infrastructure/postgres/migrate.js';
+import { createAgentTurnQueue } from '../src/infrastructure/postgres/agent-turn-queue.js';
+import { PostgresPhotoProjectRepository } from '../src/infrastructure/postgres/photo-project-repository.js';
+import { createS3AssetStorage } from '../src/infrastructure/storage/s3-asset-storage.js';
+import { buildAssetKey, buildAssetUri } from '../src/infrastructure/storage/asset-storage.js';
+import { createTurnViews } from '../src/api/turn-views.js';
+import { createApiServer } from '../src/api/server.js';
 
 function emit(name, data = {}) {
   process.stdout.write(`${JSON.stringify({ name, ...data })}\n`);

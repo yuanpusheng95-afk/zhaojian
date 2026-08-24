@@ -1,11 +1,11 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
+import { describe, expect, test } from 'bun:test';
 
 import {
   PatchConflictError,
   UnsafeStatePathError,
   applyPhotoStatePatch,
-} from '../src/domain/photo-state.mjs';
+} from '../src/domain/photo-state.js';
 
 function baseState() {
   return {
