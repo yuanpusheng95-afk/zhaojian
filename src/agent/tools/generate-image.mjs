@@ -238,7 +238,10 @@ export function createGenerateImageTool({
           // ID 必须进 content:details 只被 pi 持久化、不发给模型,
           // 模型看不到 generationId/candidateId 就无法调 select_candidate(实测踩过)
           content: [
-            {
+            ...(generation.fallbackUsed ? [{
+              type: 'text',
+              text: '注意：供应商 img2img 暂时不可用，此图由纯文生图生成，未基于原图编辑。',
+            }] : []), {
               type: 'text',
               text: JSON.stringify({ generationId: generation.id, candidateId, assetId }),
             },

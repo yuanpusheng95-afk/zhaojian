@@ -276,6 +276,20 @@ export class PostgresPhotoProjectRepository {
     return this.#requireAsset(this.#pool, assetId);
   }
 
+  /** 公开的上传落库:API 的 /uploads 端点存完字节后记录 asset 行。 */
+  async recordAsset({ assetId, kind = 'source', uri = null, metadata = {} }) {
+    return this.#transaction(async (client) => {
+      await this.#upsertAsset(client, {
+        id: assetId,
+        kind,
+        uri,
+        metadata,
+        createdAt: this.#now(),
+      });
+      return this.#requireAsset(client, assetId);
+    });
+  }
+
   async listRevisions(projectId) {
     await this.#requireProject(this.#pool, projectId);
     const result = await this.#pool.query(

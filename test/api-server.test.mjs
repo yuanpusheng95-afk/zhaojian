@@ -8,7 +8,10 @@ import { handleTurnEvents, parsePollMs } from '../src/api/sse.mjs';
 import { createApiServer } from '../src/api/server.mjs';
 
 function startServer(dependencies) {
-  const server = createApiServer(dependencies);
+  const server = createApiServer({
+    assetStorage: { bucket: 'photo-agent', async put() {} },
+    ...dependencies,
+  });
   return new Promise((resolve) => {
     server.listen(0, () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }));
   });
@@ -468,7 +471,7 @@ test('SSE pushes only the initial snapshot while the fingerprint is unchanged', 
 after(() => new Promise((resolve) => setImmediate(resolve)));
 
 test('CORS preflight allows the frontend custom header and origin', async () => {
-  const server = createApiServer({ repository: {}, queue: fakeQueue(), turnViews: fakeViews({}) });
+  const server = createApiServer({ repository: {}, queue: fakeQueue(), turnViews: fakeViews({}), assetStorage: { bucket: 'photo-agent', async put() {} } });
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
   try {
@@ -486,6 +489,45 @@ test('CORS preflight allows the frontend custom header and origin', async () => 
 
     const health = await fetch(`http://127.0.0.1:${port}/health`, { headers: { origin: 'http://localhost:5173' } });
     assert.equal(health.headers.get('access-control-allow-origin'), '*');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('uploads stores bytes and returns the anchor descriptor', async () => {
+  const puts = [];
+  const fakeRepository = { ...{}, async recordAsset({ assetId, uri, metadata }) { return { id: assetId, uri, metadata }; } };
+  const fakeStorage = {
+    bucket: 'photo-agent',
+    async put(key, bytes, contentType) { puts.push({ key, bytes, contentType }); },
+  };
+  const { server, url } = await startServer({
+    repository: fakeRepository,
+    queue: fakeQueue(),
+    turnViews: fakeViews({}),
+    assetStorage: fakeStorage,
+  });
+  try {
+    const png = Buffer.from('89504e470d0a1a0a', 'hex');
+    const response = await fetch(`${url}/uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'image/png' },
+      body: png,
+    });
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.match(body.assetId, /^upload_/);
+    assert.match(body.uri, /^s3:\/\/photo-agent\/users\/dev\/projects\/uploads\/upload_[^.]+\.png$/);
+    assert.equal(body.metadata.contentType, 'image/png');
+    assert.deepEqual(puts[0].bytes, png);
+
+    const rejected = await fetch(`${url}/uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(rejected.status, 415);
   } finally {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));

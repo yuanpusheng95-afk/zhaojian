@@ -163,9 +163,13 @@ test('reports auth failures as an error result instead of throwing', async () =>
 });
 
 test('reports a non-JSON edge failure without crashing on the parse', async () => {
-  const { fetchImpl } = fakeFetch(
-    () => new Response('error code: 502', { status: 502, headers: { 'Content-Type': 'text/plain' } }),
-  );
+  const { fetchImpl, calls } = fakeFetch((input) => {
+    const url = typeof input === 'string' ? input : input.url ?? String(input);
+    if (url.includes('/images/generations')) {
+      return new Response(JSON.stringify({ created: 1, data: [{ b64_json: PNG_B64 }] }), { status: 200 });
+    }
+    return new Response('error code: 502', { status: 502, headers: { 'Content-Type': 'text/plain' } });
+  });
 
   const result = await relayGenerateImages(MODEL, contextWith('x', PNG_B64), {
     apiKey: 'k',
@@ -174,6 +178,7 @@ test('reports a non-JSON edge failure without crashing on the parse', async () =
 
   assert.equal(result.stopReason, 'error');
   assert.match(result.errorMessage, /502/);
+  assert.ok(!calls.some((call) => call.url.includes('/images/generations')));
 });
 
 test('abort surfaces as stopReason aborted', async () => {

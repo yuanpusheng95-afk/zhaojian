@@ -107,48 +107,51 @@ export const relayGenerateImages = async (model, context, options = {}) => {
 
     let response;
     let viaChat = false;
+    let lastError;
+    const MAX_RETRIES = 2;
 
-    if (image && editRoute === 'chat') {
-      viaChat = true;
-      response = await fetchImpl(apiUrl(model.baseUrl, '/chat/completions'), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: model.id,
-          messages: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: prompt },
-                {
-                  type: 'image_url',
-                  image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-                },
-              ],
-            },
-          ],
-        }),
-        ...signal,
-      });
-    } else if (image) {
-      const form = new FormData();
-      form.set('model', model.id);
-      form.set('prompt', prompt);
-      form.set('size', size);
-      form.set(
-        'image',
-        new Blob([Buffer.from(image.data, 'base64')], { type: image.mimeType }),
-        'base.png',
-      );
-      response = await fetchImpl(apiUrl(model.baseUrl, '/images/edits'), {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}` },
-        body: form,
-        ...signal,
-      });
+    if (image) {
+      // 中转站不稳定(间歇 502),img2img 先重试
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 1000 * attempt));
+        try {
+          if (editRoute === 'chat') {
+            viaChat = true;
+            response = await fetchImpl(apiUrl(model.baseUrl, '/chat/completions'), {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: model.id,
+                messages: [{ role: 'user', content: [
+                  { type: 'text', text: prompt },
+                  { type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } },
+                ]}],
+              }),
+              ...signal,
+            });
+          } else {
+            const form = new FormData();
+            form.set('model', model.id);
+            form.set('prompt', prompt);
+            form.set('size', size);
+            form.set('image', new Blob([Buffer.from(image.data, 'base64')], { type: image.mimeType }), 'base.png');
+            response = await fetchImpl(apiUrl(model.baseUrl, '/images/edits'), {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${apiKey}` },
+              body: form,
+              ...signal,
+            });
+          }
+          if (response.ok || response.status < 500) break;
+          lastError = response.status;
+        } catch (e) {
+          if (e?.name === 'AbortError') throw e;
+          lastError = e?.message ?? String(e);
+        }
+      }
+
+      // img2img 重试耗尽仍失败——直接报错，不降级为纯文生图。
+      // 错误的图比没有图更糟：浪费钱且误导用户。
     } else {
       response = await fetchImpl(apiUrl(model.baseUrl, '/images/generations'), {
         method: 'POST',
@@ -162,15 +165,21 @@ export const relayGenerateImages = async (model, context, options = {}) => {
     }
 
     const payload = await readPayload(response);
-    if (!response.ok) {
+    if (!response.ok && response.status < 500) {
       return { ...base, stopReason: 'error', errorMessage: errorMessage(response, payload) };
     }
 
-    const output = viaChat
+    if (!response.ok || !response) {
+      return { ...base, stopReason: 'error', errorMessage: `Provider unavailable after retries (${lastError ?? response?.status})` };
+    }
+
+    let finalOutput = viaChat
       ? parseMarkdownImages(payload?.choices?.[0]?.message?.content)
       : parseImagesApi(payload);
 
-    if (output.length === 0) {
+    if (finalOutput.length === 0) finalOutput = parseImagesApi(payload);
+
+    if (finalOutput.length === 0) {
       // 中转站会以 200 返回一段不含图的文本（例如泄露的请求体片段）。
       // 静默当成功会让上层拿到空候选，必须显式判错。
       return {
@@ -180,7 +189,7 @@ export const relayGenerateImages = async (model, context, options = {}) => {
       };
     }
 
-    return { ...base, output, responseId: payload?.id };
+    return { ...base, output: finalOutput, responseId: payload?.id };
   } catch (error) {
     if (error?.name === 'AbortError') {
       return { ...base, stopReason: 'aborted', errorMessage: 'Image generation aborted' };

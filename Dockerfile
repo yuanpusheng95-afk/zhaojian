@@ -7,6 +7,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY src ./src
+COPY public ./public
 COPY scripts ./scripts
 COPY migrations ./migrations
 

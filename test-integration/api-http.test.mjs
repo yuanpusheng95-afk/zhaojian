@@ -45,7 +45,7 @@ beforeEach(async () => {
   await runMigrations(pool);
 
   server?.close();
-  server = createApiServer({ repository, queue, turnViews, logger: console });
+  server = createApiServer({ repository, queue, turnViews, assetStorage, logger: console });
   await new Promise((resolve) => server.listen(0, resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });

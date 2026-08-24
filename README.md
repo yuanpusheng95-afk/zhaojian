@@ -85,9 +85,24 @@ PostgreSQL: postgres://photo_agent:photo_agent@127.0.0.1:54329/photo_agent
 
 候选图 URL 默认 900 秒有效，可用 `SIGNED_URL_TTL_SECONDS` 覆盖。
 
+## Docker Compose 部署
+
+```bash
+cp .env.example .env          # 填写 LLM_API_KEY / IMAGE_API_KEY / IMAGE_BASE_URL
+docker compose up -d --build  # 构建、迁移、启动 postgres/minio/api/worker
+```
+
+`migrate` 是一次性任务，由 Compose 在数据库健康后执行；API 和 worker 等它成功后启动。
+前端由 API 容器直接提供，访问 `http://127.0.0.1:3000/`。停止：
+
+```bash
+docker compose down
+```
+
 ## 最小 API
 
 ```text
+POST /uploads                                       # 图片上传，Content-Type 必须 image/*，最大 20MB
 POST /projects
 GET  /projects/:id
 GET  /health

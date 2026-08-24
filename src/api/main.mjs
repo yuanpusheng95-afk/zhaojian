@@ -22,7 +22,7 @@ const turnViews = createTurnViews({
   assetStorage,
   signedUrlTtlSeconds: config.signedUrlTtlSeconds,
 });
-const server = createApiServer({ repository, queue, turnViews, corsOrigin: config.corsOrigin });
+const server = createApiServer({ repository, queue, turnViews, assetStorage, corsOrigin: config.corsOrigin });
 const port = config.port;
 server.listen(port, () => {
   process.stdout.write(`Photo Agent API listening on :${port}\n`);

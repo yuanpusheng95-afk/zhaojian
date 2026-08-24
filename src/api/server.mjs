@@ -1,14 +1,22 @@
+import { randomUUID } from 'node:crypto';
 import http from 'node:http';
+import { readFile } from 'node:fs/promises';
+import nodePath from 'node:path';
+
+import { buildAssetKey, buildAssetUri } from '../infrastructure/storage/asset-storage.mjs';
 
 import { IdempotencyConflictError, ProjectBusyError } from '../infrastructure/postgres/agent-turn-queue.mjs';
 import { handleTurnEvents } from './sse.mjs';
 
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+const MAX_UPLOAD_BODY_BYTES = 20 * 1024 * 1024;
+const PUBLIC_DIR = nodePath.resolve(process.cwd(), 'public');
 
-export function createApiServer({ repository, queue, turnViews, corsOrigin = '*', logger = console }) {
+export function createApiServer({ repository, queue, turnViews, assetStorage, corsOrigin = '*', logger = console }) {
   if (!repository) throw new TypeError('createApiServer requires repository');
   if (!queue) throw new TypeError('createApiServer requires queue');
   if (!turnViews) throw new TypeError('createApiServer requires turnViews');
+  if (!assetStorage) throw new TypeError('createApiServer requires assetStorage');
   const eventStreamResponses = new Set();
   // CORS 头统一注入:SSE(EventSource 不发预检,流响应必须自带)与自定义头
   // Idempotency-Key 都依赖它;所有出口都经 writeJson 或 SSE 的 writeHead
@@ -25,7 +33,7 @@ export function createApiServer({ repository, queue, turnViews, corsOrigin = '*'
         return;
       }
       await routeRequest({
-        request, response, repository, queue, turnViews, eventStreamResponses, cors,
+        request, response, repository, queue, turnViews, assetStorage, eventStreamResponses, cors, logger,
       });
     } catch (error) {
       writeError(response, error, logger, cors);
@@ -40,10 +48,21 @@ export function createApiServer({ repository, queue, turnViews, corsOrigin = '*'
 }
 
 async function routeRequest({
-  request, response, repository, queue, turnViews, eventStreamResponses, cors,
+  request, response, repository, queue, turnViews, assetStorage, eventStreamResponses, cors, logger,
 }) {
   const url = new URL(request.url, 'http://localhost');
   const path = url.pathname;
+
+  if (request.method === 'GET' && (path === '/' || path === '/index.html')) {
+    try {
+      const html = await readFile(nodePath.join(PUBLIC_DIR, 'index.html'));
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...cors });
+      response.end(html);
+    } catch {
+      writeError(response, new HttpError(404, 'NOT_FOUND', 'index.html not found'), logger);
+    }
+    return;
+  }
 
   if (request.method === 'GET' && path === '/health') {
     return writeJson(response, 200, { status: 'ok' }, cors);
@@ -67,6 +86,29 @@ async function routeRequest({
       decode(generationMatch[1]),
     );
     return writeJson(response, 200, generation, cors);
+  }
+
+  // 图片上传:原始字节做请求体,Content-Type 头决定扩展名(§6.2)。
+  // 上传先于项目存在,故 key 用 uploads 作用域;POST /projects 时随 anchorAsset 回传
+  if (request.method === 'POST' && path === '/uploads') {
+    const contentType = (request.headers['content-type'] ?? '').toLowerCase().split(';')[0].trim();
+    if (!contentType.startsWith('image/')) {
+      throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Content-Type must be image/*');
+    }
+    const bytes = await readBody(request);
+    const assetId = `upload_${randomUUID()}`;
+    const key = buildAssetKey({ ownerId: 'dev', projectId: 'uploads', assetId, contentType });
+    await assetStorage.put(key, bytes, contentType);
+    const asset = await repository.recordAsset({
+      assetId,
+      uri: buildAssetUri(assetStorage.bucket, key),
+      metadata: { contentType },
+    });
+    return writeJson(response, 201, {
+      assetId: asset.id,
+      uri: asset.uri,
+      metadata: asset.metadata,
+    }, cors);
   }
 
   const messageMatch = path.match(/^\/projects\/([^/]+)\/messages$/);
@@ -137,6 +179,19 @@ async function routeRequest({
   throw new HttpError(404, 'NOT_FOUND', 'Route not found');
 }
 
+async function readBody(request, maxBytes = MAX_UPLOAD_BODY_BYTES) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += Buffer.byteLength(chunk);
+    if (size > maxBytes) {
+      throw new HttpError(413, 'REQUEST_TOO_LARGE', `Upload exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 async function readJson(request) {
   let body = '';
   let size = 0;
@@ -191,6 +246,10 @@ function mapError(error) {
     ].includes(error.code)
 ) {
     return new HttpError(404, error.code, error.message);
+  }
+
+  if (error.code === 'UNSUPPORTED_MEDIA_TYPE') {
+    return new HttpError(415, error.code, error.message);
   }
 
   if (error.code === '23505') {

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>照见 · Photo Agent</title>
+<style>
+:root { --bg:#0d1117; --surface:#161b22; --border:#30363d; --text:#e6edf3; --dim:#8b949e; --accent:#58a6ff; --green:#3fb950; --red:#f85149; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; padding:2rem 1rem; }
+.wrap { max-width:720px; margin:0 auto; }
+h1 { font-size:1.4rem; margin-bottom:.25rem; }
+.sub { color:var(--dim); font-size:.85rem; margin-bottom:1.5rem; }
+section { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:1rem 1.25rem; margin-bottom:1rem; }
+label { display:block; font-size:.8rem; color:var(--dim); margin-bottom:.35rem; text-transform:uppercase; letter-spacing:.05em; }
+input[type=file], input[type=text], textarea { width:100%; background:#0a0d12; border:1px solid var(--border); border-radius:6px; color:var(--text); padding:.5rem .75rem; font-size:.95rem; outline:none; transition:border-color .15s; }
+input:focus, textarea:focus { border-color:var(--accent); }
+textarea { resize:vertical; min-height:70px; font-family:inherit; }
+button { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:.55rem 1.2rem; font-size:.95rem; cursor:pointer; transition:opacity .15s; }
+button:hover { opacity:.88; } button:disabled { opacity:.45; cursor:not-allowed; }
+.btn-green { background:var(--green); }
+.preview { max-width:200px; border-radius:6px; margin-top:.5rem; border:1px solid var(--border); }
+.status { font-size:.85rem; padding:.35rem .7rem; border-radius:5px; display:inline-block; margin-top:.5rem; }
+.st-ok { color:var(--green); } .st-err { color:var(--red); } .st-info { color:var(--accent); }
+#candidates img { max-width:100%; border-radius:6px; border:2px solid transparent; cursor:pointer; transition:border-color .15s, transform .15s; margin:.35rem .35rem 0 0; }
+#candidates img:hover { transform:scale(1.02); border-color:var(--accent); }
+.gen-status { font-size:.8rem; color:var(--dim); margin-top:.3rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>照见 Photo Agent</h1>
+  <p class="sub">上传照片 → 输入编辑指令 → 等待生成 → 选一张</p>
+
+  <section>
+    <label>1 · 上传基准图</label>
+    <input type="file" id="file" accept="image/*">
+    <img class="preview" id="preview" style="display:none">
+    <div id="uploadStatus"></div>
+  </section>
+
+  <section>
+    <label>2 · 编辑指令</label>
+    <textarea id="message" placeholder="例：把背景换成海边日落，保持面部不变">把背景换成海边日落，保持面部特征和服装不变</textarea>
+    <br><br>
+    <button id="btnSend" disabled>开始生成</button>
+    <div id="sendStatus"></div>
+  </section>
+
+  <section id="progressSection" style="display:none">
+    <label>3 · 进度</label>
+    <div id="turnStatus" class="st-info">等待中…</div>
+    <div id="candidates" style="margin-top:.75rem"></div>
+  </section>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+let projectId = null, uploadResult = null;
+
+$('#file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  $('#preview').src = URL.createObjectURL(file);
+  $('#preview').style.display = 'block';
+  const buf = await file.arrayBuffer();
+  const res = await fetch('/uploads', {
+    method: 'POST',
+    headers: { 'Content-Type': file.type },
+    body: buf,
+  });
+  if (!res.ok) return setStatus('#uploadStatus', `上传失败 ${res.status}`, 'err');
+  const data = await res.json();
+  uploadResult = data;
+  setStatus('#uploadStatus', '上传成功 ✓', 'ok');
+  $('#btnSend').disabled = false;
+});
+
+$('#btnSend').addEventListener('click', async () => {
+  if (!uploadResult) return;
+  const message = $('#message').value.trim();
+  if (!message) return setStatus('#sendStatus', '请输入指令', 'err');
+  $('#btnSend').disabled = true;
+  setStatus('#sendStatus', '创建项目中…', 'info');
+
+  // Create project with uploaded asset as anchor
+  const projectRes = await fetch('/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'web-' + Date.now(),
+      initialState: {
+        subject: { identity: { preserve: true } },
+        scene: { location: 'studio' },
+        appearance: { outfit: 'casual' },
+        composition: { shot: 'medium' },
+        constraints: [],
+      },
+      anchorAsset: {
+        assetId: uploadResult.assetId,
+        uri: uploadResult.uri,
+        metadata: uploadResult.metadata,
+      },
+      ownerId: 'dev',
+    }),
+  });
+  if (!projectRes.ok) return setStatus('#sendStatus', `创建项目失败 ${projectRes.status}`, 'err');
+  projectId = (await projectRes.json()).id;
+
+  // Submit turn
+  const msgRes = await fetch(`/projects/${projectId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ message }),
+  });
+  if (!msgRes.ok) return setStatus('#sendStatus', `提交失败 ${msgRes.status}`, 'err');
+  const { turnId } = await msgRes.json();
+  setStatus('#sendStatus', '', '');
+  listenSSE(projectId, turnId);
+});
+
+function listenSSE(pid, tid) {
+  $('#progressSection').style.display = '';
+  $('#candidates').innerHTML = '';
+  const es = new EventSource(`/projects/${pid}/turns/${tid}/events?pollMs=500`);
+  es.addEventListener('turn', (ev) => {
+    const d = JSON.parse(ev.data);
+    $('#turnStatus').textContent = d.status === 'running' ? '生成中…' : d.status;
+    for (const gen of d.generations ?? []) {
+      const div = document.createElement('div');
+      if (gen.candidate?.url) {
+        const img = document.createElement('img');
+        img.src = gen.candidate.url;
+        img.onclick = () => selectCandidate(pid, tid, gen.generationId, gen.candidate.id);
+        div.appendChild(img);
+      }
+      div.insertAdjacentHTML('beforeend',
+        `<div class="gen-status">${gen.generationId} → ${gen.status}${gen.selectedCandidateId ? ' · 已选' : ''}</div>`);
+      $('#candidates').appendChild(div);
+    }
+  });
+  es.addEventListener('done', () => { es.close(); $('#turnStatus').textContent = '完成 ✓'; });
+  es.addEventListener('error', (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      $('#turnStatus').textContent = d.code + ': ' + (d.message ?? '');
+    } catch { /* connection drop, EventSource will retry */ }
+    es.close();
+  });
+}
+
+async function selectCandidate(pid, tid, gid, cid) {
+  const res = await fetch(`/projects/${pid}/turns/${tid}/selections`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ generationId: gid, candidateId: cid }),
+  });
+  if (!res.ok) return alert(`选图失败: ${(await res.json()).error?.code}`);
+  const { revisionId } = await res.json();
+  setStatus('#sendStatus', `已选定 → revision ${revisionId.slice(0,12)}…`, 'ok');
+}
+
+function setStatus(sel, text, cls) {
+  $(sel).textContent = text;
+  $(sel).className = `status st-${cls}`;
+}
+</script>
+</body>
+</html>
