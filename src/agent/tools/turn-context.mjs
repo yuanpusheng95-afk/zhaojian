@@ -20,7 +20,6 @@ export function createTurnContext({ projectId, turnId, initialBaseAssetId, activ
   // turnId 必填：recordGeneration 靠它过 FK，assetId 靠它跨轮去重。
   // 此前解构静默丢弃该参数，真实路径上生成 undefined——单测的 fake repo 不校验才没暴露
   if (!turnId) throw new TypeError('createTurnContext requires turnId');
-  if (!initialBaseAssetId) throw new TypeError('createTurnContext requires initialBaseAssetId');
   if (!activeRevisionId) throw new TypeError('createTurnContext requires activeRevisionId');
 
   return {
@@ -28,7 +27,7 @@ export function createTurnContext({ projectId, turnId, initialBaseAssetId, activ
     turnId,
     currentBaseAssetId: initialBaseAssetId,
     activeRevisionId,
-    origin: 'revision_anchor',
+    origin: initialBaseAssetId ? 'revision_anchor' : 'text_to_image',
     imageCount: 0,
     imageAttempts: 0,
     fatal: null,

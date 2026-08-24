@@ -30,7 +30,7 @@ button:hover { opacity:.88; } button:disabled { opacity:.45; cursor:not-allowed;
 <body>
 <div class="wrap">
   <h1>照见 Photo Agent</h1>
-  <p class="sub">上传照片 → 输入编辑指令 → 等待生成 → 选一张</p>
+  <p class="sub">上传照片可基于原图编辑；不上传则直接文生图</p>
 
   <section>
     <label>1 · 上传基准图</label>
@@ -43,7 +43,7 @@ button:hover { opacity:.88; } button:disabled { opacity:.45; cursor:not-allowed;
     <label>2 · 编辑指令</label>
     <textarea id="message" placeholder="例：把背景换成海边日落，保持面部不变">把背景换成海边日落，保持面部特征和服装不变</textarea>
     <br><br>
-    <button id="btnSend" disabled>开始生成</button>
+    <button id="btnSend">开始生成</button>
     <div id="sendStatus"></div>
   </section>
 
@@ -76,7 +76,6 @@ $('#file').addEventListener('change', async (e) => {
 });
 
 $('#btnSend').addEventListener('click', async () => {
-  if (!uploadResult) return;
   const message = $('#message').value.trim();
   if (!message) return setStatus('#sendStatus', '请输入指令', 'err');
   $('#btnSend').disabled = true;
@@ -95,11 +94,13 @@ $('#btnSend').addEventListener('click', async () => {
         composition: { shot: 'medium' },
         constraints: [],
       },
-      anchorAsset: {
-        assetId: uploadResult.assetId,
-        uri: uploadResult.uri,
-        metadata: uploadResult.metadata,
-      },
+      ...(uploadResult ? {
+        anchorAsset: {
+          assetId: uploadResult.assetId,
+          uri: uploadResult.uri,
+          metadata: uploadResult.metadata,
+        },
+      } : {}),
       ownerId: 'dev',
     }),
   });

@@ -160,8 +160,8 @@ export function createGenerateImageTool({
       turnContext.noteAttempt();
 
       try {
-        const base = await readBaseImage();
-        const stored = await fetchBaseBytes(base);
+        const base = turnContext.currentBaseAssetId ? await readBaseImage() : null;
+        const stored = base ? await fetchBaseBytes(base) : null;
         // 生图单独一个 span:把 pi.agent.tool 的总时长拆出"供应商生图"这一层(§11.3)
         const generated = await telemetry.startSpan(
           {
@@ -177,7 +177,11 @@ export function createGenerateImageTool({
             {
               input: [
                 { type: 'text', text: params.renderPrompt },
-                { type: 'image', data: stored.bytes.toString('base64'), mimeType: stored.contentType ?? 'image/png' },
+                ...(stored ? [{
+                  type: 'image',
+                  data: stored.bytes.toString('base64'),
+                  mimeType: stored.contentType ?? 'image/png',
+                }] : []),
               ],
             },
             {

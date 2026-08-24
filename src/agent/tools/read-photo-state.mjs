@@ -14,6 +14,7 @@ export function createReadPhotoStateTool({ repository, turnContext }) {
         state: revision.state,
         baseImage: {
           assetId: turnContext.currentBaseAssetId,
+          ...(turnContext.currentBaseAssetId ? {} : { mode: 'text_to_image' }),
           origin: turnContext.origin,
         },
       };

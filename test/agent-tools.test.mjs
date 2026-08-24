@@ -118,6 +118,29 @@ test('read_photo_state returns the current pointer and origin marker', async () 
   }) });
 });
 
+test('text to image starts from an empty asset pointer and skips storage reads', async () => {
+  const repository = createRepository();
+  const models = createModels();
+  const storage = createStorage();
+  const turnContext = createTurnContext({
+    projectId: 'project_1',
+    turnId: 'turn_text',
+    initialBaseAssetId: null,
+    activeRevisionId: 'revision_1',
+  });
+  const tool = createGenerateImageTool({ repository, imagesModels: models, assetStorage: storage, turnContext, config });
+
+  const result = await tool.execute('call_text', { patch, renderPrompt: 'a portrait in soft light' });
+
+  assert.deepEqual(models.calls[0].context.input, [
+    { type: 'text', text: 'a portrait in soft light' },
+  ]);
+  assert.equal(storage.gets.length, 0);
+  assert.equal(turnContext.currentBaseAssetId, 'candidate_turn_text_1');
+  assert.equal(repository.generations[0].inputAssetId, null);
+  assert.equal(result.details.fatalCode, undefined);
+});
+
 test('generate_image validates, generates, persists, stores, and advances the pointer', async () => {
   const repository = createRepository();
   const imagesModels = createModels();
