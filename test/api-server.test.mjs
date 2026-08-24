@@ -524,6 +524,13 @@ test('uploads stores bytes and returns the anchor descriptor', async () => {
     assert.equal(body.metadata.contentType, 'image/png');
     assert.deepEqual(puts[0].bytes, png);
 
+    const parameterized = await fetch(`${url}/uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'image/png; boundary=example' },
+      body: png,
+    });
+    assert.equal(parameterized.status, 201);
+
     const rejected = await fetch(`${url}/uploads`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -534,4 +541,35 @@ test('uploads stores bytes and returns the anchor descriptor', async () => {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test('SSE falls back to polling after a Redis stream error', async () => {
+  const detail = { turnId: 't1', status: 'completed', generations: [] };
+  let readCalls = 0;
+  let loadCalls = 0;
+  const app = createApp({
+    pool: {},
+    queue: {},
+    repository: {},
+    assetStorage: { bucket: 'photo-agent' },
+    eventConsumer: {
+      async readTurnEvent() {
+        readCalls += 1;
+        throw new Error('redis went away');
+      },
+    },
+    turnViews: {
+      loadTurnDetail: async () => {
+        loadCalls += 1;
+        return detail;
+      },
+      turnChangedSince: async () => ({ changed: true, fingerprint: `f${loadCalls}` }),
+    },
+  });
+
+  const response = await app.request('/projects/p1/turns/t1/events?pollMs=250');
+  const events = await new Response(response.body).text();
+  assert.equal(readCalls, 1);
+  assert.match(events, /event: turn\ndata:/);
+  assert.match(events, /event: done\ndata: \{\}/);
 });

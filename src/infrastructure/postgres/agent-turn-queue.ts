@@ -160,11 +160,11 @@ export function createAgentTurnQueue({ pool, leaseMs = 30_000, eventPublisher }:
       });
     },
 
-    finishTurn({ turnId, leaseToken, status, outcome = null, error = null }: {
+    async finishTurn({ turnId, leaseToken, status, outcome = null, error = null }: {
       turnId: string; leaseToken: string; status: string; outcome?: Record<string, unknown> | null; error?: Record<string, unknown> | null;
     }) {
       if (!TERMINAL_STATUSES.has(status)) throw new TypeError("finishTurn status must be completed, failed, or aborted");
-      return withTransaction(pool, async (client) => {
+      const result = await withTransaction(pool, async (client) => {
         const result = await client.query("SELECT * FROM agent_turns WHERE id = $1 FOR UPDATE", [turnId]);
         const turn = result.rows[0];
         if (!turn) throw new TurnLeaseLostError(turnId);
@@ -179,9 +179,22 @@ export function createAgentTurnQueue({ pool, leaseMs = 30_000, eventPublisher }:
            WHERE id = $1`, [turnId, status, outcome ? JSON.stringify(outcome) : null, error ? JSON.stringify(error) : null],
         );
         await client.query("UPDATE projects SET running_turn_id = NULL, updated_at = now() WHERE id = $1 AND running_turn_id = $2", [turn.project_id, turnId]);
-        await eventPublisher?.publishTurnEvent({ turnId, projectId: turn.project_id, status });
         return { turnId, status };
       });
+
+      const turnRows = await pool.query(
+        "SELECT project_id, status FROM agent_turns WHERE id = $1", [turnId],
+      );
+      const turn = turnRows.rows[0];
+      if (turn?.status === status) {
+        await eventPublisher?.publishTurnEvent({
+          turnId,
+          projectId: turn.project_id,
+          status: turn.status,
+        }).catch(() => undefined);
+      }
+
+      return result;
     },
   };
 }

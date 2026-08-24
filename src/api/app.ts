@@ -77,12 +77,12 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
   app.post("/uploads", async (c) => {
     const contentType = c.req.header("content-type") ?? "";
     const mediaType = contentType.toLowerCase().split(";")[0].trim();
-    if (!mediaType.startsWith("image/") || mediaType !== contentType.toLowerCase()) {
+    if (!mediaType.startsWith("image/")) {
       throw new HttpError(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be image/*");
     }
     const bytes = await c.req.arrayBuffer();
     if (bytes.byteLength > 20 * 1024 * 1024) {
-      return c.json({ error: { code: "PAYLOAD_TOO_LARGE", message: "Upload exceeds 20MB" } }, 413);
+      return c.json({ error: { code: "REQUEST_TOO_LARGE", message: "Upload exceeds 20971520 bytes" } }, 413);
     }
     const buffer = Buffer.from(bytes);
     const assetId = `upload_${crypto.randomUUID()}`;
@@ -164,6 +164,7 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
 
     return streamSSE(c, async (stream) => {
       let lastFingerprint: string | null | undefined;
+      let useRedis = eventConsumer != null;
       if (eventConsumer) {
         let lastEventId = "0";
         while (!streamClosed && !abortSignal.aborted) {
@@ -179,12 +180,13 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
               }
             }
           } catch {
+            useRedis = false;
             break;
           }
         }
-        return;
       }
-      while (!streamClosed && !abortSignal.aborted) {
+
+      while (!useRedis && !streamClosed && !abortSignal.aborted) {
         try {
           const changed = await turnViews.turnChangedSince({ projectId, turnId, lastFingerprint });
           lastFingerprint = changed.fingerprint;

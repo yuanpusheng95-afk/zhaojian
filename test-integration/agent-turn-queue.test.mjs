@@ -184,6 +184,34 @@ test('finishTurn rejects a wrong token without changing state', async () => {
   assert.equal(turn.status, 'running');
 });
 
+test('finishTurn commits when the terminal event publisher fails', async () => {
+  await createProject();
+  await queue.requestTurn({ projectId: 'project_1', userMessage: 'event failure', idempotencyKey: 'key_event' });
+  const claimed = await queue.claimNextTurn();
+  const failingQueue = createAgentTurnQueue({
+    pool,
+    leaseMs: 30_000,
+    eventPublisher: {
+      publishTurnEvent: async () => {
+        throw new Error('redis unavailable');
+      },
+      close: async () => {},
+    },
+  });
+
+  const result = await failingQueue.finishTurn({
+    turnId: claimed.turnId,
+    leaseToken: claimed.leaseToken,
+    status: 'completed',
+  });
+
+  assert.deepEqual(result, { turnId: claimed.turnId, status: 'completed' });
+  const turn = (await pool.query('SELECT status FROM agent_turns WHERE id = $1', [claimed.turnId])).rows[0];
+  const project = (await pool.query('SELECT running_turn_id FROM projects WHERE id = $1', ['project_1'])).rows[0];
+  assert.equal(turn.status, 'completed');
+  assert.equal(project.running_turn_id, null);
+});
+
 test('concurrent requestTurn with the same key replays the same turn instead of PROJECT_BUSY', async () => {
   await createProject();
   const request = () =>
