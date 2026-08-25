@@ -7,6 +7,7 @@ import { HttpError } from "../../api/http-error.js";
 import { hashPassword, verifyPassword } from "./password.js";
 import { AuthError, type JwtSessionStore } from "./jwt-session.js";
 import { createUserRepository, type UserRepository } from "./user-repository.js";
+import { createApiKeyStore, type ApiKeyStore } from "./api-keys.js";
 
 const RegisterSchema = z.object({
   email: z.string().email(),
@@ -22,14 +23,16 @@ const LoginSchema = z.object({
 export interface AuthDeps {
   pool: Pool;
   sessionStore: JwtSessionStore;
+  apiKeyStore?: ApiKeyStore;
 }
 
 /**
  * /auth 路由：注册、登录、登出、当前用户。
  * 成功后设置 HttpOnly cookie（auth_token），前端无需手动管 token。
  */
-export function createAuthRoutes({ pool, sessionStore }: AuthDeps) {
+export function createAuthRoutes({ pool, sessionStore, apiKeyStore }: AuthDeps) {
   const users: UserRepository = createUserRepository({ pool });
+  const keys = apiKeyStore ?? createApiKeyStore({ pool });
   const app = new Hono();
 
   app.post("/register", async (c) => {
@@ -98,6 +101,42 @@ export function createAuthRoutes({ pool, sessionStore }: AuthDeps) {
       throw error;
     }
   });
+
+  // ---- API keys：必须用登录会话管理，key 本身不能创建 key ----
+
+  app.post("/keys", async (c) => {
+    const userId = await requireSessionUser(c);
+    const body = await c.req.json().catch(() => ({}));
+    const name = typeof body?.name === "string" && body.name.trim() ? body.name.trim().slice(0, 64) : "";
+    const { record, plaintext } = await keys.issue(userId, name);
+    return c.json({ id: record.id, name: record.name, createdAt: record.createdAt, key: plaintext }, 201);
+  });
+
+  app.get("/keys", async (c) => {
+    const userId = await requireSessionUser(c);
+    const list = await keys.list(userId);
+    return c.json(list.map(({ id, name, lastUsedAt, revokedAt, createdAt }) => ({
+      id, name, lastUsedAt, revokedAt, createdAt,
+    })));
+  });
+
+  app.delete("/keys/:keyId", async (c) => {
+    const userId = await requireSessionUser(c);
+    const revoked = await keys.revoke(userId, c.req.param("keyId"));
+    if (!revoked) throw new HttpError(404, "API_KEY_NOT_FOUND", "API key not found");
+    return c.json({ ok: true });
+  });
+
+  async function requireSessionUser(c: Context): Promise<string> {
+    const token = readAuthCookie(c);
+    if (!token) throw new HttpError(401, "UNAUTHENTICATED", "Sign in required");
+    try {
+      return (await sessionStore.verify(token)).userId;
+    } catch (error) {
+      if (error instanceof AuthError) throw new HttpError(401, "UNAUTHENTICATED", error.message);
+      throw error;
+    }
+  }
 
   return app;
 }

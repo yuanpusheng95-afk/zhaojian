@@ -6,19 +6,20 @@ import type { Pool } from "pg";
 
 import { z } from "zod";
 
-import { ERROR_STATUS } from "../domain/errors.js";
+import { ERROR_STATUS } from "@/domain/errors";
 import { AllowAllAccessPolicy, type AccessPolicy, type AccessAction } from "./access-policy.js";
 import { OwnerOnlyAccessPolicy } from "./owner-only-policy.js";
-import { AuthError, type JwtSessionStore } from "../infrastructure/auth/jwt-session.js";
-import { createAuthRoutes } from "../infrastructure/auth/routes.js";
+import { AuthError, type JwtSessionStore } from "@/infrastructure/auth/jwt-session";
+import { createAuthRoutes } from "@/infrastructure/auth/routes";
+import { createApiKeyStore, API_KEY_PREFIX } from "@/infrastructure/auth/api-keys";
 import { HttpError } from "./http-error.js";
 
 import { createTurnEventStream, parsePollMs } from "./sse.js";
 import type { TurnViews } from "./turn-views.js";
-import type { PhotoProjectRepository } from "../domain/photo-project.js";
-import type { AgentTurnQueue } from "../infrastructure/postgres/agent-turn-queue.js";
-import type { TurnEventConsumer } from "../infrastructure/redis/turn-events.js";
-import type { AssetStorageLike } from "../infrastructure/storage/asset-storage.js";
+import type { PhotoProjectRepository } from "@/domain";
+import type { AgentTurnQueue } from "@/infrastructure/postgres/agent-turn-queue";
+import type { TurnEventConsumer } from "@/infrastructure/redis/turn-events";
+import type { AssetStorageLike } from "@/infrastructure/storage/asset-storage";
 
 export interface AppDeps {
   repository: Pick<PhotoProjectRepository, "createProject" | "getProject" | "getGeneration" | "recordAsset" | "selectCandidate">;
@@ -31,6 +32,8 @@ export interface AppDeps {
   sessionStore?: JwtSessionStore;
   /** users 表访问；认证模式下必填。 */
   authPool?: Pool;
+  /** 提供后支持 Authorization: Bearer zj_... 机器凭证；缺省时用 authPool 现建。 */
+  apiKeyStore?: ReturnType<typeof createApiKeyStore>;
   logger?: Console;
 }
 
@@ -71,6 +74,12 @@ function currentUserId(c: { get(key: "userId"): string | undefined; req: { heade
 
 const AUTH_COOKIE_NAME = "auth_token";
 
+const BEARER_PATTERN = /^Bearer (.+)$/;
+
+function readBearerToken(header: string | undefined): string | null {
+  return header?.match(BEARER_PATTERN)?.[1] ?? null;
+}
+
 function readAuthToken(cookieHeader: string | undefined): string | null {
   if (!cookieHeader) return null;
   for (const part of cookieHeader.split(";")) {
@@ -102,16 +111,29 @@ function errorResponse(error: unknown) {
   return { status: 500, body: { error: { code: "INTERNAL_ERROR", message: "Internal server error" } } };
 }
 
-export function createApp({ repository, queue, turnViews, assetStorage, eventConsumer = null, accessPolicy, sessionStore, authPool, logger = console }: AppDeps) {
+export function createApp({ repository, queue, turnViews, assetStorage, eventConsumer = null, accessPolicy, sessionStore, authPool, apiKeyStore, logger = console }: AppDeps) {
   const app = new Hono();
   // 认证开启时强制归属校验；未开启（测试/本地）保持放行
   const policy = accessPolicy ?? (sessionStore ? new OwnerOnlyAccessPolicy() : new AllowAllAccessPolicy());
 
   app.use("*", cors());
 
-  // 从 cookie 解析登录用户；认证模式下挂到 c.var.userId
+  // 身份解析中间件，两条路径：
+  // 1. Authorization: Bearer zj_... → API key 查库（机器/CLI）
+  // 2. cookie auth_token → JWT + Redis session（浏览器）
   app.use("*", async (c, next) => {
     if (!sessionStore) return next();
+
+    const bearer = readBearerToken(c.req.header("authorization"));
+    if (bearer?.startsWith(API_KEY_PREFIX)) {
+      if (!authPool && !apiKeyStore) throw new HttpError(500, "INTERNAL_ERROR", "API key store not configured");
+      const keys = apiKeyStore ?? createApiKeyStore({ pool: authPool! });
+      const userId = await keys.authenticate(bearer);
+      if (!userId) throw new HttpError(401, "UNAUTHENTICATED", "Invalid or revoked API key");
+      (c as unknown as { set(key: "userId", value: string): void }).set("userId", userId);
+      return next();
+    }
+
     const token = readAuthToken(c.req.header("cookie"));
     if (!token) return next();
     try {
@@ -133,7 +155,11 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
   app.get("/health", (c) => c.json({ status: "ok" }));
 
   if (sessionStore) {
-    app.route("/", createAuthRoutes({ pool: authPool!, sessionStore }));
+    app.route("/auth", createAuthRoutes({
+      pool: authPool!,
+      sessionStore,
+      apiKeyStore: apiKeyStore ?? (authPool ? createApiKeyStore({ pool: authPool }) : undefined),
+    }));
   }
 
   app.use("/", serveStatic({ root: "./public", index: "index.html" }));

@@ -1,4 +1,4 @@
-import { ErrorCode } from "../domain/errors.js";
+import { ErrorCode } from "@/domain/errors";
 import type { TurnViews } from "./turn-views.js";
 
 export const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "aborted"]);

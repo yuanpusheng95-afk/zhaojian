@@ -98,3 +98,15 @@ export const users = pgTable("users", {
   displayName: text().notNull().default(""),
   createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
 });
+
+export const apiKeys = pgTable("api_keys", {
+  id: text().primaryKey(),
+  userId: text().notNull().references(() => users.id),
+  keyHash: text().notNull().unique(),
+  name: text().notNull().default(""),
+  lastUsedAt: timestamp({ withTimezone: true }),
+  revokedAt: timestamp({ withTimezone: true }),
+  createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("api_keys_user_created_idx").on(table.userId, table.createdAt),
+]);

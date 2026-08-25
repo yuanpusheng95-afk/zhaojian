@@ -599,3 +599,98 @@ test('auth mode: unauthenticated requests get 401 and authenticated ones pass ow
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('api key auth: Bearer zj_ token grants the owner access without a cookie', async () => {
+  const { createJwtSessionStore } = await import('../src/infrastructure/auth/jwt-session.js');
+  const { createApiKeyStore } = await import('../src/infrastructure/auth/api-keys.js');
+
+  const sessionMap = new Map();
+  const redis = {
+    async set(k, v) { sessionMap.set(k, v); },
+    async get(k) { return sessionMap.get(k) ?? null; },
+    async del(k) { sessionMap.delete(k); },
+  };
+  const sessionStore = createJwtSessionStore({
+    jwtSecret: 'api-test-secret-0123456789abcdef',
+    redis,
+    ttlSeconds: 3600,
+  });
+
+  // 内存 api_keys 表
+  const keyRows = new Map();
+  const authPool = {
+    async query(sql, params) {
+      if (sql.includes('INSERT INTO api_keys')) {
+        const row = { id: params[0], userId: params[1], keyHash: params[2], name: params[3], lastUsedAt: null, revokedAt: null, createdAt: new Date() };
+        keyRows.set(row.id, row);
+        keyRows.byHash ??= new Map();
+        return { rows: [{ id: row.id, userId: row.userId, name: row.name, createdAt: row.createdAt }], rowCount: 1 };
+      }
+      if (sql.includes('SET last_used_at')) {
+        const found = [...keyRows.values()].find((r) => r?.keyHash === params[0] && !r.revokedAt);
+        if (!found) return { rows: [], rowCount: 0 };
+        return { rows: [{ user_id: found.userId }], rowCount: 1 };
+      }
+      if (sql.includes('SET revoked_at')) {
+        const row = keyRows.get(params[0]);
+        if (!row || row.userId !== params[1] || row.revokedAt) return { rowCount: 0 };
+        row.revokedAt = new Date();
+        return { rowCount: 1 };
+      }
+      if (sql.includes('ORDER BY created_at')) {
+        return { rows: [...keyRows.values()].filter((r) => r.userId === params[0]) };
+      }
+      throw new Error('unexpected sql');
+    },
+  };
+
+  const server = createApiServer({
+    repository: fakeRepository(),
+    queue: fakeQueue(),
+    turnViews: fakeViews({}),
+    assetStorage: { bucket: 'photo-agent', async put() {} },
+    sessionStore,
+    authPool,
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    // 先用会话登录创建一个 key
+    const login = await sessionStore.issue('dev');
+    const createRes = await fetch(`${url}/auth/keys`, {
+      method: 'POST',
+      headers: { cookie: `auth_token=${login.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'cli' }),
+    });
+    assert.equal(createRes.status, 201);
+    const { key, id: keyId } = await createRes.json();
+    assert.match(key, /^zj_/);
+
+    // Bearer key 访问业务接口 → 200（p1 属于 dev）
+    const viaKey = await fetch(`${url}/projects/p1`, {
+      headers: { authorization: `Bearer ${key}` },
+    });
+    assert.equal(viaKey.status, 200);
+
+    // 无效 key → 401
+    const bad = await fetch(`${url}/projects/p1`, {
+      headers: { authorization: `Bearer zj_invalidinvalidinvalidinvalidinvalid12` },
+    });
+    assert.equal(bad.status, 401);
+
+    // 吊销后立即失效
+    const revokeRes = await fetch(`${url}/auth/keys/${keyId}`, {
+      method: 'DELETE',
+      headers: { cookie: `auth_token=${login.token}` },
+    });
+    assert.equal(revokeRes.status, 200);
+    const afterRevoke = await fetch(`${url}/projects/p1`, {
+      headers: { authorization: `Bearer ${key}` },
+    });
+    assert.equal(afterRevoke.status, 401);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
