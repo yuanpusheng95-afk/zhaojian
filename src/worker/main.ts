@@ -20,7 +20,7 @@ const config = loadWorkerConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });
 const stdoutTelemetry = config.telemetry === "stdout" ? createStdoutTelemetry() : createNoopTelemetry();
 const pgTelemetry = createPgTelemetry({ pool });
-const telemetry = createTeeTelemetry([stdoutTelemetry as any, pgTelemetry as any]);
+const telemetry = createTeeTelemetry([stdoutTelemetry, pgTelemetry]);
 
 const repository = new PostgresPhotoProjectRepository({ pool });
 const sessionRepo = createPostgresSessionRepo({ pool });
@@ -60,7 +60,7 @@ async function executeTurn(turn: ClaimedTurn) {
   });
   const streamFn = instrumentStreamFn({
     telemetry,
-    streamFn: rawStreamFn as unknown as (...args: any[]) => Promise<any>,
+    streamFn: rawStreamFn,
     attributes: { "pi.turn.id": turn.turnId, "pi.project.id": turn.projectId },
   });
   const tools = createAgentTools({ repository, imageProvider, assetStorage, turnContext, config, telemetry });

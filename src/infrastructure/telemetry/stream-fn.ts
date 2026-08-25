@@ -1,3 +1,6 @@
+import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+
 import type { TelemetryContext } from "./stdout-telemetry.js";
 
 export const RETRYABLE_STREAM_ERROR = /429|rate.?limit|timeout|econn|reset|5\d{2}|temporar|overload/i;
@@ -11,7 +14,7 @@ export function instrumentStreamFn({
   sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
 }: {
   telemetry: TelemetryContext;
-  streamFn: (...args: any[]) => Promise<any>;
+  streamFn: StreamFn;
   attributes?: Record<string, unknown>;
   maxRetries?: number;
   backoffBaseMs?: number;
@@ -20,13 +23,13 @@ export function instrumentStreamFn({
   if (!telemetry) throw new TypeError("instrumentStreamFn requires telemetry");
   if (typeof streamFn !== "function") throw new TypeError("instrumentStreamFn requires a streamFn");
 
-  return (model: any, context: any, options: any): Promise<any> =>
+  const wrapped: StreamFn = async (model, context, options) =>
     telemetry.startSpan(
       {
         name: "pi.ai.request",
         attributes: { "pi.model.provider": model.provider, "pi.model.id": model.id, ...attributes },
       },
-      async (span: any) => {
+      async (span) => {
         for (let attempt = 1; ; attempt += 1) {
           const stream = await streamFn(model, context, options);
           const message = await stream.result();
@@ -44,4 +47,5 @@ export function instrumentStreamFn({
         }
       },
     );
+  return wrapped;
 }
