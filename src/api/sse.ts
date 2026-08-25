@@ -22,9 +22,10 @@ export type TurnStreamEvent =
   | { type: "done" }
   | { type: "error"; payload: { code: string; message: string } };
 
-export function toErrorPayload(error: any): { code: string; message: string } {
-  if (CONTROLLED_ERROR_CODES.has(error?.code)) {
-    return { code: error.code, message: error.message };
+export function toErrorPayload(error: unknown): { code: string; message: string } {
+  const coded = error as { code?: string; message?: string };
+  if (coded?.code && CONTROLLED_ERROR_CODES.has(coded.code)) {
+    return { code: coded.code, message: coded.message ?? "Request failed" };
   }
   return { code: "INTERNAL_ERROR", message: "Turn event stream failed" };
 }

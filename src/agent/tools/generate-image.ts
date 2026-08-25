@@ -1,9 +1,10 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { TSchema } from "typebox";
 
 import { AssetNotFoundError } from "../../domain/photo-project-service.js";
 import { ErrorCode } from "../../domain/errors.js";
 import type { PhotoProjectRepository } from "../../domain/photo-project.js";
-import { applyPhotoStatePatch } from "../../domain/photo-state.js";
+import { applyPhotoStatePatch, type StatePatch } from "../../domain/photo-state.js";
 import type { ImageGenerationProvider } from "../../infrastructure/models/image-provider.js";
 import { createNoopTelemetry } from "../../infrastructure/telemetry/stdout-telemetry.js";
 import type { TelemetryContext } from "../../infrastructure/telemetry/stdout-telemetry.js";
@@ -35,6 +36,18 @@ const EXTENSION_BY_MIME = new Map([
 
 type GenerateImageRepository = Pick<PhotoProjectRepository, "getRevision" | "recordGeneration" | "getAsset">;
 
+export interface GenerateImageParams {
+  patch: Record<string, unknown>;
+  renderPrompt: string;
+}
+
+export interface GenerateImageDetails {
+  generationId?: string;
+  candidateId?: string;
+  assetId?: string;
+  fatalCode?: string;
+}
+
 interface GenerateImageConfig {
   guards: { maxImagesPerTurn: number; maxImageAttemptsPerTurn: number };
 }
@@ -48,7 +61,7 @@ export function createGenerateImageTool({
   turnContext: TurnContext;
   config: GenerateImageConfig;
   telemetry?: TelemetryContext;
-}): AgentTool<any> {
+}): AgentTool<TSchema, GenerateImageDetails> {
   async function readBaseImage() {
     let asset;
     try {
@@ -148,7 +161,8 @@ export function createGenerateImageTool({
       },
       required: ["patch", "renderPrompt"],
     },
-    async execute(_toolCallId: string, params: any, signal?: AbortSignal) {
+    async execute(_toolCallId: string, rawParams: unknown, signal?: AbortSignal) {
+      const params = rawParams as GenerateImageParams;
       if (turnContext.imageCount >= config.guards.maxImagesPerTurn) {
         throw new MaxImagesReachedError(config.guards.maxImagesPerTurn);
       }
@@ -157,7 +171,7 @@ export function createGenerateImageTool({
       }
 
       const revision = await repository.getRevision(turnContext.activeRevisionId);
-      const proposedState = applyPhotoStatePatch(revision.state, params.patch);
+      const proposedState = applyPhotoStatePatch(revision.state, params.patch as unknown as StatePatch);
       turnContext.noteAttempt();
 
       try {
@@ -238,12 +252,13 @@ export function createGenerateImageTool({
           ],
           details: { generationId: generation.id, candidateId, assetId },
         };
-      } catch (error: any) {
-        if (error.fatalCode) {
-          turnContext.setFatal(error.fatalCode, error.cause ?? error);
+      } catch (error) {
+        const fatal = error instanceof ToolFatalError ? error : null;
+        if (fatal) {
+          turnContext.setFatal(fatal.fatalCode, fatal.cause ?? fatal);
           return {
-            content: [{ type: "text" as const, text: `Fatal image generation failure: ${error.message}` }],
-            details: { fatalCode: error.fatalCode },
+            content: [{ type: "text" as const, text: `Fatal image generation failure: ${fatal.message}` }],
+            details: { fatalCode: fatal.fatalCode },
             terminate: true,
           };
         }

@@ -1,12 +1,24 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { TSchema } from "typebox";
 
+import type { PhotoState } from "../../domain/photo-project.js";
 import type { PhotoProjectRepository } from "../../domain/photo-project.js";
 import type { TurnContext } from "./turn-context.js";
+
+export interface ReadPhotoStateDetails {
+  revisionId: string;
+  state: PhotoState;
+  baseImage: {
+    assetId: string | null;
+    mode?: "text_to_image";
+    origin: string;
+  };
+}
 
 export function createReadPhotoStateTool({ repository, turnContext }: {
   repository: Pick<PhotoProjectRepository, "getRevision">;
   turnContext: TurnContext;
-}): AgentTool<any> {
+}): AgentTool<TSchema, ReadPhotoStateDetails> {
   return {
     name: "read_photo_state",
     description: "Read the current photo editing state for the active turn",
@@ -19,7 +31,7 @@ export function createReadPhotoStateTool({ repository, turnContext }: {
         state: revision.state,
         baseImage: {
           assetId: turnContext.currentBaseAssetId,
-          ...(turnContext.currentBaseAssetId ? {} : { mode: "text_to_image" }),
+          ...(turnContext.currentBaseAssetId ? {} : { mode: "text_to_image" as const }),
           origin: turnContext.origin,
         },
       };

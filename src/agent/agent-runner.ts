@@ -1,8 +1,12 @@
 import { Agent, buildSessionContext } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, Entry, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { AgentState, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import { createNoopTelemetry } from "../infrastructure/telemetry/stdout-telemetry.js";
 import type { TelemetryContext } from "../infrastructure/telemetry/stdout-telemetry.js";
 import { SYSTEM_PROMPT } from "./system-prompt.js";
+type ToolDetails = import("./tools/index.js").GenerateImageDetails | import("./tools/index.js").ReadPhotoStateDetails | import("./tools/index.js").SelectCandidateDetails;
+type ProjectAgentTool = import("@earendil-works/pi-agent-core").AgentTool<import("typebox").TSchema, ToolDetails>;
 
 type AgentModel = AgentState["model"];
 
@@ -48,12 +52,12 @@ export function projectSessionId(projectId: string): string {
 async function openOrCreateSession(sessionRepo: AgentSessionRepo, sessionId: string): Promise<AgentSession> {
   try {
     return await sessionRepo.open({ id: sessionId });
-  } catch (error: any) {
-    if (error?.code !== "not_found") throw error;
+  } catch (error) {
+    if ((error as { code?: string })?.code !== "not_found") throw error;
     try {
       return await sessionRepo.create({ id: sessionId });
-    } catch (createError: any) {
-      if (createError?.code !== "already_exists") throw createError;
+    } catch (createError) {
+      if ((createError as { code?: string })?.code !== "already_exists") throw createError;
       return sessionRepo.open({ id: sessionId });
     }
   }
@@ -65,10 +69,14 @@ function createUserMessage(text: string) {
 
 const IMAGE_PLACEHOLDER = { type: "text" as const, text: "[generated image omitted — bytes live in object storage, ids above]" };
 
-function stripHistoricalImages(toolResults: any[]) {
+interface ContentBlock {
+  type?: string;
+}
+
+function stripHistoricalImages<T extends { content?: ContentBlock[] }>(toolResults: T[]) {
   return toolResults.map((result) => ({
     ...result,
-    content: (result.content ?? []).map((block: any) => (block.type === "image" ? IMAGE_PLACEHOLDER : block)),
+    content: (result.content ?? []).map((block) => (block.type === "image" ? IMAGE_PLACEHOLDER : block)),
   }));
 }
 
@@ -88,7 +96,7 @@ function toolResultsProjector(entry: AgentSessionEntry, index: number, allEntrie
     }
   }
   const isMostRecent = index >= lastKeptIndex - (KEEP_RECENT_TOOL_RESULTS - 1);
-  return isMostRecent ? entry.data : stripHistoricalImages(entry.data as any[]);
+  return isMostRecent ? entry.data : stripHistoricalImages((entry.data ?? []) as Array<{ content?: ContentBlock[] } & Record<string, unknown>>);
 }
 
 export async function runAgentTurn({
@@ -98,7 +106,7 @@ export async function runAgentTurn({
   config: AgentTurnConfig;
   model: AgentModel;
   turn: AgentTurnRequest;
-  tools: AgentTool<any>[];
+  tools: ProjectAgentTool[];
   streamFn: StreamFn;
   telemetry?: TelemetryContext;
 }): Promise<AgentTurnResult> {
@@ -125,7 +133,7 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
   config: AgentTurnConfig;
   model: AgentModel;
   turn: AgentTurnRequest;
-  tools: AgentTool<any>[];
+  tools: ProjectAgentTool[];
   streamFn: StreamFn;
   telemetry: TelemetryContext;
 }): Promise<AgentTurnResult> {
@@ -142,8 +150,8 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
     const entries = (await session.findEntriesOnBranch())
       .slice()
       .sort((left, right) => left.seq - right.seq);
-    const context: any = buildSessionContext(entries as any, {
-      entryProjectors: { tool_results: toolResultsProjector } as any,
+    const context = buildSessionContext(entries as unknown as Entry[], {
+      entryProjectors: { tool_results: toolResultsProjector as never },
     });
     await session.appendMessage(createUserMessage(turn.userMessage ?? ""));
     const agent = new Agent({
@@ -151,7 +159,7 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
       initialState: {
         systemPrompt: SYSTEM_PROMPT,
         model,
-        thinkingLevel: (context.thinkingLevel ?? "off") as any,
+        thinkingLevel: (context.thinkingLevel ?? "off") as ThinkingLevel,
         tools,
         messages: context.messages,
       },
@@ -159,7 +167,7 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
       shouldStopAfterTurn: () => shouldStop,
     });
 
-    agent.subscribe(async (event: any) => {
+    agent.subscribe(async (event: AgentEvent) => {
       if (event.type === "tool_execution_end") {
         stats.toolCalls += 1;
         if (event.isError) stats.toolErrors += 1;
@@ -186,6 +194,7 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
       }
       if (event.type !== "turn_end") return;
       const message = event.message;
+      if (!("stopReason" in message)) return;
       if (message.stopReason === "error") {
         streamError = { code: "LLM_STREAM_ERROR", message: message.errorMessage ?? "LLM stream failed" };
         await session.appendCustomEntry("stream_error", { message: message.errorMessage ?? null });
@@ -210,7 +219,7 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
       if (timedOut) {
         return { kind: "aborted" as const, fatal, error: { code: "TURN_TIMEOUT", message: "Turn timed out" }, stats };
       }
-      const lastMessage = agent.state.messages.at(-1) as any;
+      const lastMessage = agent.state.messages.at(-1) as AssistantMessage | undefined;
       if (agent.state.errorMessage || lastMessage?.stopReason === "aborted") {
         return {
           kind: "aborted" as const,
@@ -236,9 +245,9 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
     } finally {
       clearTimeout(timeout);
     }
-  } catch (error: any) {
+  } catch (error) {
     if (!fatal && error) {
-      fatal = { code: "AGENT_RUN_FAILED", message: error.message };
+      fatal = { code: "AGENT_RUN_FAILED", message: (error as Error).message };
     }
     return { kind: "failed" as const, fatal, error: fatal, stats };
   }

@@ -61,11 +61,11 @@ export function createTurnContext({ projectId, ownerId, turnId, initialBaseAsset
       this.origin = "turn_candidate";
     },
     setFatal(code: string, error?: unknown) {
-      const err = error as any;
+      const err = error instanceof Error ? error : undefined;
       this.fatal = {
         code,
         message: err?.message ?? String(error),
-        ...(err instanceof Error ? { name: err.name } : {}),
+        ...(err ? { name: err.name } : {}),
       };
       this.fatal!.error = error;
       return this.fatal!;
