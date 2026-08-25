@@ -14,14 +14,47 @@ const API_ID = "relay-openai-images";
 const DEFAULT_MIME = "image/png";
 const DEFAULT_SIZE = "1024x1024";
 
+// ---------------------------------------------------------------------------
+// pi-ai 边界的本地类型：库的 model/context 是弱类型 API，这里收口成最小契约。
+// ---------------------------------------------------------------------------
+
+/** pi-ai 传给 generateImages 的输入项（我们只发 text 和 image）。 */
+type ProviderInput =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+
+interface ProviderContext {
+  input: ProviderInput[];
+}
+
+interface ProviderModel {
+  id: string;
+  provider: string;
+  api: string;
+  baseUrl: string;
+}
+
+interface ProviderImage {
+  data: string;
+  mimeType?: string;
+}
+
+/** relay 响应里可能出现的形状（chat choices / images data），按需取字段。 */
+interface RelayResponsePayload {
+  id?: string;
+  choices?: Array<{ message?: { content?: unknown } }>;
+  data?: Array<{ b64_json?: string }>;
+  error?: { message?: string };
+}
+
 function apiUrl(baseUrl: string, path: string): string {
   const base = String(baseUrl).replace(/\/+$/, "");
   return base.endsWith("/v1") ? `${base}${path}` : `${base}/v1${path}`;
 }
 
-function splitInput(context: any): { prompt: string; image?: any } {
+function splitInput(context: ProviderContext): { prompt: string; image?: ProviderImage } {
   const texts: string[] = [];
-  let image: any;
+  let image: ProviderImage | undefined;
   for (const item of context.input ?? []) {
     if (item.type === "text") texts.push(item.text);
     else if (item.type === "image" && !image) image = item;
@@ -40,17 +73,17 @@ function parseMarkdownImages(content: unknown) {
   }));
 }
 
-function parseImagesApi(payload: any) {
+function parseImagesApi(payload: RelayResponsePayload) {
   return (payload?.data ?? [])
-    .filter((entry: any) => entry?.b64_json)
-    .map((entry: any) => ({
+    .filter((entry): entry is { b64_json: string } => Boolean(entry?.b64_json))
+    .map((entry) => ({
       type: "image" as const,
       data: entry.b64_json,
       mimeType: DEFAULT_MIME,
     }));
 }
 
-async function readPayload(response: Response) {
+async function readPayload(response: Response): Promise<RelayResponsePayload & { __raw?: string }> {
   const text = await response.text();
   try {
     return JSON.parse(text);
@@ -59,7 +92,7 @@ async function readPayload(response: Response) {
   }
 }
 
-function errorMessage(response: Response, payload: any): string {
+function errorMessage(response: Response, payload: RelayResponsePayload & { __raw?: string }): string {
   return payload?.error?.message ?? payload?.__raw ?? `HTTP ${response.status}`;
 }
 
@@ -80,8 +113,9 @@ function authHeaders(apiKey: string, contentType?: string): Record<string, strin
 /** chat completions 路由：把图片塞进 message content，响应里解析 markdown data URI。 */
 async function sendChatEdit(
   fetchImpl: typeof fetch, baseUrl: string, modelId: string, apiKey: string,
-  prompt: string, image: { data: string; mimeType: string }, signal?: AbortSignal,
+  prompt: string, image: ProviderImage, signal?: AbortSignal,
 ): Promise<Response> {
+  const mimeType = image.mimeType ?? DEFAULT_MIME;
   return fetchImpl(apiUrl(baseUrl, "/chat/completions"), {
     method: "POST",
     headers: authHeaders(apiKey, "application/json"),
@@ -89,7 +123,7 @@ async function sendChatEdit(
       model: modelId,
       messages: [{ role: "user", content: [
         { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } },
+        { type: "image_url", image_url: { url: `data:${mimeType};base64,${image.data}` } },
       ] }],
     }),
     ...(signal ? { signal } : {}),
@@ -99,13 +133,14 @@ async function sendChatEdit(
 /** images/edits 路由：multipart 表单。 */
 async function sendMultipartEdit(
   fetchImpl: typeof fetch, baseUrl: string, modelId: string, apiKey: string,
-  prompt: string, size: string, image: { data: string; mimeType: string }, signal?: AbortSignal,
+  prompt: string, size: string, image: ProviderImage, signal?: AbortSignal,
 ): Promise<Response> {
+  const mimeType = image.mimeType ?? DEFAULT_MIME;
   const form = new FormData();
   form.set("model", modelId);
   form.set("prompt", prompt);
   form.set("size", size);
-  form.set("image", new Blob([Buffer.from(image.data, "base64")], { type: image.mimeType }), "base.png");
+  form.set("image", new Blob([Buffer.from(image.data, "base64")], { type: mimeType }), "base.png");
   return fetchImpl(apiUrl(baseUrl, "/images/edits"), {
     method: "POST",
     headers: authHeaders(apiKey),
@@ -126,9 +161,9 @@ async function withRetries(
       const response = await send();
       if (response.ok || response.status < 500) return { response, lastError };
       lastError = response.status;
-    } catch (error: any) {
-      if (error?.name === "AbortError") throw error;
-      lastError = error?.message ?? String(error);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      lastError = error instanceof Error ? error.message : String(error);
     }
   }
   return { response: null, lastError };
@@ -147,20 +182,39 @@ async function sendGenerationRequest(
   });
 }
 
-export const relayGenerateImages = async (model: any, context: any, options: any = {}): Promise<any> => {
+/** pi-ai images API 的返回协议：stopReason/output/errorMessage 是库消费的字段。 */
+export interface RelayGenerateResult {
+  api: string;
+  provider: string;
+  model: string;
+  output: Array<{ type: "image"; data: string; mimeType: string }>;
+  stopReason: "stop" | "error" | "aborted";
+  errorMessage?: string;
+  responseId?: string;
+  timestamp: number;
+}
+
+export const relayGenerateImages = async (
+  weakModel: unknown, context: ProviderContext, options: Partial<RelayRequestOptions> = {},
+): Promise<RelayGenerateResult> => {
+  const model = weakModel as ProviderModel;
   const base = {
     api: model.api,
     provider: model.provider,
     model: model.id,
-    output: [] as unknown[],
-    stopReason: "stop",
+    output: [] as RelayGenerateResult["output"],
+    stopReason: "stop" as const,
     timestamp: Date.now(),
   };
 
   try {
-    const opts: RelayRequestOptions = options;
-    const fetchImpl: typeof fetch = opts.fetch ?? globalThis.fetch;
+    const opts = {
+      size: DEFAULT_SIZE,
+      editRoute: "chat",
+      ...options,
+    } as RelayRequestOptions & { apiKey: string };
     if (!opts.apiKey) throw new Error(`No API key for provider: ${model.provider}`);
+    const fetchImpl: typeof fetch = opts.fetch ?? globalThis.fetch;
 
     const { prompt, image } = splitInput(context);
     const size = opts.size ?? DEFAULT_SIZE;
@@ -202,11 +256,11 @@ export const relayGenerateImages = async (model: any, context: any, options: any
     }
 
     return { ...base, output: finalOutput, responseId: payload?.id };
-  } catch (error: any) {
-    if (error?.name === "AbortError") {
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
       return { ...base, stopReason: "aborted", errorMessage: "Image generation aborted" };
     }
-    return { ...base, stopReason: "error", errorMessage: error?.message ?? String(error) };
+    return { ...base, stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error) };
   }
 };
 
@@ -275,9 +329,9 @@ export function createRelayImageProvider({
     async generate(request) {
       const generated = await relayGenerateImages(model, {
         input: [
-          { type: "text", text: request.prompt },
+          { type: "text", text: request.prompt } as const,
           ...(request.baseImage
-            ? [{ type: "image", data: request.baseImage.data, mimeType: request.baseImage.mimeType }]
+            ? [{ type: "image", data: request.baseImage.data, mimeType: request.baseImage.mimeType } as const]
             : []),
         ],
       }, {

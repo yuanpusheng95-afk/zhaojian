@@ -55,16 +55,16 @@ export function createStdoutTelemetry({
     let result: T | Promise<T>;
     try {
       result = callback(span);
-    } catch (error: any) {
-      span.setStatus({ status: "error", error: { name: error?.name ?? "Error", message: error?.message ?? String(error) } });
+    } catch (error) {
+      span.setStatus(toErrorStatus(error));
       emit();
       return Promise.reject(error);
     }
 
     return Promise.resolve(result).then(
       (value) => { emit(); return value; },
-      (error: any) => {
-        span.setStatus({ status: "error", error: { name: error?.name ?? "Error", message: error?.message ?? String(error) } });
+      (error: unknown) => {
+        span.setStatus(toErrorStatus(error));
         emit();
         throw error;
       },
