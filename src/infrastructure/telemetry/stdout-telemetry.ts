@@ -1,9 +1,9 @@
-interface SpanOptions {
+export interface SpanOptions {
   name: string;
   attributes?: Record<string, unknown>;
 }
 
-interface TelemetrySpan {
+export interface TelemetrySpan {
   startSpan: <T>(options: SpanOptions, callback: (span: TelemetrySpan) => T | Promise<T>) => Promise<T>;
   addEvent(name: string, attributes?: Record<string, unknown>): void;
   setAttributes(next: Record<string, unknown>): void;
@@ -72,6 +72,13 @@ export function createStdoutTelemetry({
   }
 
   return { startSpan };
+}
+
+function toErrorStatus(error: unknown): { status: string; error: Record<string, unknown> } {
+  if (error instanceof Error) {
+    return { status: "error", error: { name: error.name, message: error.message } };
+  }
+  return { status: "error", error: { name: "Error", message: String(error) } };
 }
 
 export function createNoopTelemetry(): TelemetryContext {

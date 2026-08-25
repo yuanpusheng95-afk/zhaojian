@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import type { TelemetryContext } from "./stdout-telemetry.js";
+import type { SpanOptions, TelemetryContext, TelemetrySpan } from "./stdout-telemetry.js";
 
 export function createPgTelemetry({ pool, now = () => Date.now() }: {
   pool: Pool; now?: () => number;
@@ -8,10 +8,10 @@ export function createPgTelemetry({ pool, now = () => Date.now() }: {
 
   const pending = new Set<Promise<unknown>>();
 
-  function startSpan<T>(options: { name: string; attributes?: Record<string, unknown> }, callback: (span: any) => T | Promise<T>): Promise<T> {
+  function startSpan<T>(options: SpanOptions, callback: (span: TelemetrySpan) => T | Promise<T>): Promise<T> {
     const startedAt = now();
     const attributes: Record<string, unknown> = { ...(options.attributes ?? {}) };
-    const events: any[] = [];
+    const events: Array<{ name: string; attributes?: Record<string, unknown> }> = [];
     let status: { status: string; error?: Record<string, unknown> } = { status: "ok" };
 
     const span = {
@@ -37,8 +37,9 @@ export function createPgTelemetry({ pool, now = () => Date.now() }: {
           [turnId, projectId, options.name, now() - startedAt,
             status?.status ?? "ok", { ...attributes, ...(events.length ? { events } : {}) }, status?.error ?? null],
         )
-        .catch((error: any) => {
-          process.stderr.write(`telemetry persist failed (${options.name}): ${error?.message ?? error}\n`);
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          process.stderr.write(`telemetry persist failed (${options.name}): ${message}\n`);
         })
         .finally(() => { pending.delete(write); });
       pending.add(write);
@@ -47,16 +48,16 @@ export function createPgTelemetry({ pool, now = () => Date.now() }: {
     let result: T | Promise<T>;
     try {
       result = callback(span);
-    } catch (error: any) {
-      span.setStatus({ status: "error", error: { name: error?.name ?? "Error", message: error?.message ?? String(error) } });
+    } catch (error) {
+      span.setStatus(errorStatus(error));
       persist();
       throw error;
     }
 
     return Promise.resolve(result).then(
       (value) => { persist(); return value; },
-      (error: any) => {
-        span.setStatus({ status: "error", error: { name: error?.name ?? "Error", message: error?.message ?? String(error) } });
+      (error: unknown) => {
+        span.setStatus(errorStatus(error));
         persist();
         throw error;
       },
@@ -73,13 +74,20 @@ export function createPgTelemetry({ pool, now = () => Date.now() }: {
   return { startSpan, drain };
 }
 
-export function createTeeTelemetry(sinks: Array<TelemetryContext & Record<string, any>>): TelemetryContext {
+function errorStatus(error: unknown): { status: string; error: Record<string, unknown> } {
+  if (error instanceof Error) {
+    return { status: "error", error: { name: error.name, message: error.message } };
+  }
+  return { status: "error", error: { name: "Error", message: String(error) } };
+}
+
+export function createTeeTelemetry(sinks: TelemetryContext[]): TelemetryContext {
   if (!Array.isArray(sinks) || sinks.length === 0) throw new TypeError("createTeeTelemetry requires at least one sink");
   return {
-    startSpan(options, callback) {
-      const wrap = (index: number): ((span: any) => any) =>
-        index >= sinks.length - 1 ? callback : () => sinks[index + 1].startSpan(options as any, wrap(index + 1));
-      return sinks[0].startSpan(options as any, wrap(0));
+    startSpan<T>(options: SpanOptions, callback: (span: TelemetrySpan) => T | Promise<T>): Promise<T> {
+      const wrap = (index: number): ((span: TelemetrySpan) => T | Promise<T>) =>
+        index >= sinks.length - 1 ? callback : () => sinks[index + 1].startSpan(options, wrap(index + 1));
+      return sinks[0].startSpan(options, wrap(0));
     },
   };
 }
