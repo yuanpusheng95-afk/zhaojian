@@ -136,16 +136,6 @@ bun run test:integration
 
 集成测试包含真实 MinIO 签名 URL 字节取回与 SSE 终态推送。集成测试必须串行运行：各文件共享同一测试库并在 `beforeEach` 重置 schema。
 
-## 中转站现状（实测）
-
-`bun --env-file=.env scripts/probe-providers.mjs` 可复查：
-
-- `/v1/chat/completions` + 图片 —— **唯一可靠的 img2img 路径**（Markdown data URI 内嵌）
-- `/v1/images/edits` —— 恒 502
-- `/v1/images/generations` —— 不稳定（Cloudflare 502）
-- `size` 不可为 `auto`，否则上游超时
-- 供应商修好 edits 后把 `IMAGE_EDIT_ROUTE` 改为 `edits` 即可，无需改代码
-
 ## 当前限制
 
 - 无鉴权：`x-user-id` 可任意声明（见上文身份说明）；`AccessPolicy` 接缝已就位。
