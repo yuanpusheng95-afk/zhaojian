@@ -2,6 +2,13 @@
 
 PhotoAgent V1 的最小可执行纵切：模块化单体 API、PostgreSQL 持久化、带租约的 SQL Job Queue、独立 Agent Turn Worker 和真实图像供应商。
 
+## 运行时
+
+本项目运行在 **Bun 1.3.10** 上（`package.json` 的 `engines` 字段是唯一事实来源）。
+这是从 Node.js >= 22 有意迁移的结果：测试运行器（`bun test`）、脚本执行和
+TypeScript 直跑都依赖 Bun，Node 不受支持。安装依赖用 `bun install`，
+启动服务用 `bun run start:api` / `bun run start:worker`。
+
 ## 已实现闭环
 
 ```text

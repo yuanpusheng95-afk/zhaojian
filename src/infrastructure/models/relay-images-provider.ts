@@ -63,6 +63,90 @@ function errorMessage(response: Response, payload: any): string {
   return payload?.error?.message ?? payload?.__raw ?? `HTTP ${response.status}`;
 }
 
+interface RelayRequestOptions {
+  apiKey: string;
+  size?: string;
+  editRoute?: string;
+  signal?: AbortSignal;
+  fetch?: typeof fetch;
+}
+
+function authHeaders(apiKey: string, contentType?: string): Record<string, string> {
+  return contentType
+    ? { Authorization: `Bearer ${apiKey}`, "Content-Type": contentType }
+    : { Authorization: `Bearer ${apiKey}` };
+}
+
+/** chat completions 路由：把图片塞进 message content，响应里解析 markdown data URI。 */
+async function sendChatEdit(
+  fetchImpl: typeof fetch, baseUrl: string, modelId: string, apiKey: string,
+  prompt: string, image: { data: string; mimeType: string }, signal?: AbortSignal,
+): Promise<Response> {
+  return fetchImpl(apiUrl(baseUrl, "/chat/completions"), {
+    method: "POST",
+    headers: authHeaders(apiKey, "application/json"),
+    body: JSON.stringify({
+      model: modelId,
+      messages: [{ role: "user", content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } },
+      ] }],
+    }),
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** images/edits 路由：multipart 表单。 */
+async function sendMultipartEdit(
+  fetchImpl: typeof fetch, baseUrl: string, modelId: string, apiKey: string,
+  prompt: string, size: string, image: { data: string; mimeType: string }, signal?: AbortSignal,
+): Promise<Response> {
+  const form = new FormData();
+  form.set("model", modelId);
+  form.set("prompt", prompt);
+  form.set("size", size);
+  form.set("image", new Blob([Buffer.from(image.data, "base64")], { type: image.mimeType }), "base.png");
+  return fetchImpl(apiUrl(baseUrl, "/images/edits"), {
+    method: "POST",
+    headers: authHeaders(apiKey),
+    body: form,
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** 带退避的重试包装：5xx 重试最多 2 次；AbortError 直接上抛。 */
+async function withRetries(
+  send: () => Promise<Response>,
+  maxRetries = 2,
+): Promise<{ response: Response | null; lastError: string | number | undefined }> {
+  let lastError: string | number | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
+    try {
+      const response = await send();
+      if (response.ok || response.status < 500) return { response, lastError };
+      lastError = response.status;
+    } catch (error: any) {
+      if (error?.name === "AbortError") throw error;
+      lastError = error?.message ?? String(error);
+    }
+  }
+  return { response: null, lastError };
+}
+
+/** 文生图路由：无重试，一次请求。 */
+async function sendGenerationRequest(
+  fetchImpl: typeof fetch, baseUrl: string, modelId: string, apiKey: string,
+  prompt: string, size: string, signal?: AbortSignal,
+): Promise<Response> {
+  return fetchImpl(apiUrl(baseUrl, "/images/generations"), {
+    method: "POST",
+    headers: authHeaders(apiKey, "application/json"),
+    body: JSON.stringify({ model: modelId, prompt, n: 1, size }),
+    ...(signal ? { signal } : {}),
+  });
+}
+
 export const relayGenerateImages = async (model: any, context: any, options: any = {}): Promise<any> => {
   const base = {
     api: model.api,
@@ -74,82 +158,45 @@ export const relayGenerateImages = async (model: any, context: any, options: any
   };
 
   try {
-    const fetchImpl: typeof fetch = options.fetch ?? globalThis.fetch;
-    const apiKey = options.apiKey as string;
-    if (!apiKey) throw new Error(`No API key for provider: ${model.provider}`);
+    const opts: RelayRequestOptions = options;
+    const fetchImpl: typeof fetch = opts.fetch ?? globalThis.fetch;
+    if (!opts.apiKey) throw new Error(`No API key for provider: ${model.provider}`);
 
     const { prompt, image } = splitInput(context);
-    const size = (options.size as string) ?? DEFAULT_SIZE;
-    const editRoute = (options.editRoute as string) ?? "chat";
-    const signal = options.signal ? { signal: options.signal } : {};
+    const size = opts.size ?? DEFAULT_SIZE;
+    const signal = opts.signal;
 
-    let response!: Response;
+    let response: Response | null;
     let viaChat = false;
     let lastError: string | number | undefined;
-    const MAX_RETRIES = 2;
 
     if (image) {
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
-        try {
-          if (editRoute === "chat") {
-            viaChat = true;
-            response = await fetchImpl(apiUrl(model.baseUrl, "/chat/completions"), {
-              method: "POST",
-              headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-              body: JSON.stringify({
-                model: model.id,
-                messages: [{ role: "user", content: [
-                  { type: "text", text: prompt },
-                  { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } },
-                ] }],
-              }),
-              ...signal,
-            });
-          } else {
-            const form = new FormData();
-            form.set("model", model.id);
-            form.set("prompt", prompt);
-            form.set("size", size);
-            form.set("image", new Blob([Buffer.from(image.data, "base64")], { type: image.mimeType }), "base.png");
-            response = await fetchImpl(apiUrl(model.baseUrl, "/images/edits"), {
-              method: "POST",
-              headers: { Authorization: `Bearer ${apiKey}` },
-              body: form,
-              ...signal,
-            });
-          }
-          if (response.ok || response.status < 500) break;
-          lastError = response.status;
-        } catch (e: any) {
-          if (e?.name === "AbortError") throw e;
-          lastError = e?.message ?? String(e);
-        }
-      }
+      // 编辑路径：chat 路由或 multipart 路由，带重试
+      viaChat = opts.editRoute !== "edits";
+      const send = viaChat
+        ? () => sendChatEdit(fetchImpl, model.baseUrl, model.id, opts.apiKey, prompt, image, signal)
+        : () => sendMultipartEdit(fetchImpl, model.baseUrl, model.id, opts.apiKey, prompt, size, image, signal);
+      ({ response, lastError } = await withRetries(send));
     } else {
-      response = await fetchImpl(apiUrl(model.baseUrl, "/images/generations"), {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: model.id, prompt, n: 1, size }),
-        ...signal,
-      });
+      response = await sendGenerationRequest(fetchImpl, model.baseUrl, model.id, opts.apiKey, prompt, size, signal);
+    }
+
+    if (!response) {
+      return { ...base, stopReason: "error", errorMessage: `Provider unavailable after retries (${lastError})` };
     }
 
     const payload = await readPayload(response);
     if (!response.ok && response.status < 500) {
       return { ...base, stopReason: "error", errorMessage: errorMessage(response, payload) };
     }
-
-    if (!response.ok || !response) {
-      return { ...base, stopReason: "error", errorMessage: `Provider unavailable after retries (${lastError ?? response?.status})` };
+    if (!response.ok) {
+      return { ...base, stopReason: "error", errorMessage: `Provider unavailable after retries (${response.status})` };
     }
 
     let finalOutput = viaChat
       ? parseMarkdownImages(payload?.choices?.[0]?.message?.content)
       : parseImagesApi(payload);
-
     if (finalOutput.length === 0) finalOutput = parseImagesApi(payload);
-
     if (finalOutput.length === 0) {
       return { ...base, stopReason: "error", errorMessage: "Provider returned no image in a successful response" };
     }
