@@ -87,8 +87,8 @@ export class AgentTurnWorker {
           turnId: turn.turnId,
           leaseToken: turn.leaseToken,
         });
-      } catch (error: any) {
-        if (error?.code === ErrorCode.TURN_LEASE_LOST) return false;
+      } catch (error) {
+        if ((error as { code?: string })?.code === ErrorCode.TURN_LEASE_LOST) return false;
         throw error;
       }
     }
@@ -100,7 +100,7 @@ export class AgentTurnWorker {
     const heartbeatController = new AbortController();
     const heartbeat = this.#heartbeat(turn, heartbeatController.signal)
       .catch((error) => {
-        if ((error as any)?.code === ErrorCode.TURN_LEASE_LOST) {
+        if ((error as { code?: string })?.code === ErrorCode.TURN_LEASE_LOST) {
           heartbeatLost = true;
           return false;
         }

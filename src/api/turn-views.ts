@@ -42,9 +42,10 @@ export function createTurnViews({ pool, repository, assetStorage, signedUrlTtlSe
       view.url = await assetStorage.getSignedUrl(key, { expiresInSeconds: signedUrlTtlSeconds });
       view.contentType = (asset.metadata as Record<string, unknown>)?.contentType as string ?? null;
       return view;
-    } catch (error: any) {
-      if (error?.code !== "ASSET_NOT_FOUND") throw error;
-      return { ...view, urlError: error?.message ?? String(error) };
+    } catch (error) {
+      const coded = error as { code?: string; message?: string };
+      if (coded?.code !== "ASSET_NOT_FOUND") throw error;
+      return { ...view, urlError: coded?.message ?? String(error) };
     }
   }
 
@@ -62,7 +63,7 @@ export function createTurnViews({ pool, repository, assetStorage, signedUrlTtlSe
       userMessage: row.userMessage,
       error: row.errorJson ?? null,
       outcome: row.outcomeJson ?? null,
-      generations: await Promise.all(generations.map(async (generation: any) => ({
+      generations: await Promise.all(generations.map(async (generation) => ({
         generationId: generation.id,
         status: generation.status,
         patch: generation.patch,

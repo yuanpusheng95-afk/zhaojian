@@ -53,10 +53,11 @@ function assertProjectAccess(policy: AccessPolicy, userId: string, resource: { o
 }
 
 function errorResponse(error: unknown) {
-  const code = (error as any)?.code ?? (error as any)?.cause?.code;
+  const coded = error as { code?: string; cause?: { code?: string } };
+  const code = coded?.code ?? coded?.cause?.code;
   if (error instanceof HttpError || code) {
     return {
-      status: error instanceof HttpError ? error.status : ERROR_STATUS[code] ?? 500,
+      status: error instanceof HttpError ? error.status : (code && ERROR_STATUS[code]) || 500,
       body: {
         error: {
           code: error instanceof HttpError ? error.code : code,
@@ -76,7 +77,7 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
   app.onError((error, c) => {
     const mapped = errorResponse(error);
     if (mapped.status >= 500) logger.error("Unhandled error:", error);
-    return c.json(mapped.body, mapped.status as any);
+    return c.json(mapped.body, mapped.status as never);
   });
 
   app.get("/health", (c) => c.json({ status: "ok" }));
@@ -143,7 +144,7 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
     const project = await repository.getProject(projectId);
     assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "write");
     const result = await queue.requestTurn({ projectId, userMessage: message, idempotencyKey });
-    return c.json(result, (result.replayed ? 200 : 202) as any);
+    return c.json(result, (result.replayed ? 200 : 202) as never);
   });
 
   app.get("/projects/:projectId/turns/:turnId", async (c) => {
