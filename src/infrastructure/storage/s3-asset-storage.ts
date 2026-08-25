@@ -7,7 +7,6 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl as presign } from "@aws-sdk/s3-request-presigner";
 
-import { assertAssetStorage } from "./asset-storage.js";
 
 export function createS3AssetStorage({
   endpoint,
@@ -55,7 +54,7 @@ export function createS3AssetStorage({
     return ensured;
   }
 
-  return assertAssetStorage({
+  return {
     bucket,
 
     async put(key: string, bytes: Buffer | Uint8Array, contentType: string): Promise<void> {
@@ -79,5 +78,6 @@ export function createS3AssetStorage({
         expiresIn: expiresInSeconds,
       });
     },
-  });
+  };
+
 }

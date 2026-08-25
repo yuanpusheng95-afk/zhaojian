@@ -5,28 +5,11 @@ const EXTENSION_BY_CONTENT_TYPE = new Map([
   ["image/webp", "webp"],
 ]);
 
-const REQUIRED_METHODS = ["put", "get", "getSignedUrl"] as const;
-const REQUIRED_FIELDS = ["bucket"] as const;
-
 export interface AssetStorageLike {
   put: (key: string, bytes: Buffer | Uint8Array, contentType: string) => Promise<void>;
   get: (key: string) => Promise<{ bytes: Buffer; contentType?: string }>;
   getSignedUrl: (key: string, options?: { expiresInSeconds?: number }) => Promise<string>;
   bucket: string;
-}
-
-export function assertAssetStorage<T extends AssetStorageLike>(storage: T): T {
-  for (const method of REQUIRED_METHODS) {
-    if (typeof storage?.[method] !== "function") {
-      throw new TypeError(`Asset storage must implement ${method}()`);
-    }
-  }
-  for (const field of REQUIRED_FIELDS) {
-    if (typeof storage?.[field] !== "string" || storage[field] === "") {
-      throw new TypeError(`Asset storage must expose ${field}`);
-    }
-  }
-  return storage;
 }
 
 export function buildAssetUri(bucket: string, key: string): string {

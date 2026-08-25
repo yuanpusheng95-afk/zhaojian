@@ -306,7 +306,7 @@ test('SSE pushes only the initial snapshot while the fingerprint is unchanged', 
   const app = createApp({
     pool: {},
     queue: {},
-    repository: {},
+    repository: { async getProject() { return { id: 'p1', ownerId: 'dev' }; } },
     assetStorage: { bucket: 'photo-agent' },
     turnViews: views,
   });
@@ -331,7 +331,7 @@ test('SSE pushes only the initial snapshot while the fingerprint is unchanged', 
 
 
 test('CORS preflight allows the frontend custom header and origin', async () => {
-  const server = createApiServer({ repository: {}, queue: fakeQueue(), turnViews: fakeViews({}), assetStorage: { bucket: 'photo-agent', async put() {} } });
+  const server = createApiServer({ repository: { async getProject() { return { id: 'p1', ownerId: 'dev' }; } }, queue: fakeQueue(), turnViews: fakeViews({}), assetStorage: { bucket: 'photo-agent', async put() {} } });
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
   try {
@@ -407,7 +407,7 @@ test('SSE falls back to polling after a Redis stream error', async () => {
   const app = createApp({
     pool: {},
     queue: {},
-    repository: {},
+    repository: { async getProject() { return { id: 'p1', ownerId: 'dev' }; } },
     assetStorage: { bucket: 'photo-agent' },
     eventConsumer: {
       async readTurnEvent() {

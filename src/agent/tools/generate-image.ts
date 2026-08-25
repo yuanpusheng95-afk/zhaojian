@@ -57,15 +57,10 @@ export function createGenerateImageTool({
       if (!(error instanceof AssetNotFoundError)) {
         throw new ToolFatalError(ErrorCode.ASSET_REPOSITORY_UNAVAILABLE, `Base asset repository unavailable: ${(error as Error).message}`, { cause: error });
       }
-      throw Object.assign(new Error(`Base asset cannot be read: ${(error as Error).message}`), {
-        fatalCode: "ASSET_NOT_FOUND",
-        cause: error,
-      });
+      throw new ToolFatalError(ErrorCode.ASSET_NOT_FOUND, `Base asset cannot be read: ${(error as Error).message}`, { cause: error });
     }
     if (!asset?.uri) {
-      throw Object.assign(new Error(`Base asset has no uri: ${asset?.id}`), {
-        fatalCode: "INVALID_ASSET_URI",
-      });
+      throw new ToolFatalError(ErrorCode.INVALID_ASSET_URI, `Base asset has no uri: ${asset?.id}`);
     }
     try {
       const key = resolveAssetStorageKey(asset.uri, assetStorage.bucket);
@@ -82,10 +77,7 @@ export function createGenerateImageTool({
     try {
       return await assetStorage.get(base.storageKey);
     } catch (error) {
-      throw Object.assign(new Error(`Base image bytes cannot be fetched: ${(error as Error).message}`), {
-        fatalCode: ErrorCode.ASSET_STORAGE_UNAVAILABLE,
-        cause: error,
-      });
+      throw new ToolFatalError(ErrorCode.ASSET_STORAGE_UNAVAILABLE, `Base image bytes cannot be fetched: ${(error as Error).message}`, { cause: error });
     }
   }
 
@@ -93,10 +85,7 @@ export function createGenerateImageTool({
     try {
       await assetStorage.put(key, bytes, contentType);
     } catch (error) {
-      throw Object.assign(new Error(`Generated image cannot be stored: ${(error as Error).message}`), {
-        fatalCode: ErrorCode.ASSET_STORAGE_UNAVAILABLE,
-        cause: error,
-      });
+      throw new ToolFatalError(ErrorCode.ASSET_STORAGE_UNAVAILABLE, `Generated image cannot be stored: ${(error as Error).message}`, { cause: error });
     }
   }
 

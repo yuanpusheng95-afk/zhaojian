@@ -88,8 +88,10 @@ class RedisEventSource implements TurnEventSource {
   private lastEventId = "0";
 }
 
-/** Redis 失败时永久降级为纯轮询的装饰器。 */
+/** Redis 失败后一次性熔断：第一次失败即永久切换到纯轮询，不再重试 primary。 */
 class FallbackEventSource implements TurnEventSource {
+  #degraded = false;
+
   constructor(
     private readonly primary: TurnEventSource,
     private readonly fallback: TurnEventSource,
@@ -97,12 +99,19 @@ class FallbackEventSource implements TurnEventSource {
   ) {}
 
   async next(lastFingerprint: string | null | undefined) {
-    try {
-      return await this.primary.next(lastFingerprint);
-    } catch (error) {
-      this.onFallback(error);
-      return this.fallback.next(lastFingerprint);
+    if (!this.#degraded) {
+      try {
+        return await this.primary.next(lastFingerprint);
+      } catch (error) {
+        if (!(error instanceof Error && error.name === "AbortError")) {
+          this.#degraded = true;
+          this.onFallback(error);
+        } else {
+          throw error;
+        }
+      }
     }
+    return this.fallback.next(lastFingerprint);
   }
 }
 

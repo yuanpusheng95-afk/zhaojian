@@ -125,6 +125,8 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
 
   app.get("/generations/:generationId", async (c) => {
     const generation = await repository.getGeneration(c.req.param("generationId"));
+    const project = await repository.getProject(generation.projectId);
+    assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "read");
     return c.json(generation);
   });
 
@@ -145,6 +147,8 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
   });
 
   app.get("/projects/:projectId/turns/:turnId", async (c) => {
+    const project = await repository.getProject(c.req.param("projectId"));
+    assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "read");
     const view = await turnViews.loadTurnDetail({ projectId: c.req.param("projectId"), turnId: c.req.param("turnId") });
     return c.json(view);
   });
@@ -168,11 +172,13 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
     return c.json({ revisionId: revision.id });
   });
 
-  app.get("/projects/:projectId/turns/:turnId/events", (c) => {
+  app.get("/projects/:projectId/turns/:turnId/events", async (c) => {
     const projectId = c.req.param("projectId");
     const turnId = c.req.param("turnId");
     const pollMs = parsePollMs(c.req.query("pollMs"));
     const abortSignal = c.req.raw.signal;
+    const project = await repository.getProject(projectId);
+    assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "read");
 
     return streamSSE(c, async (stream) => {
       const events = createTurnEventStream({
