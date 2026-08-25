@@ -64,22 +64,18 @@ function createRepository() {
 
 function createModels({ fail = false } = {}) {
   const calls = [];
-  const model = { provider: 'relay', id: 'image-model', api: 'relay-openai-images' };
   return {
     calls,
-    model,
-    async generateImages(actualModel, context) {
-      calls.push({ actualModel, context });
+    modelId: 'image-model',
+    async generate(request) {
+      calls.push({ context: request });
       if (fail === 'transient') {
-        return { output: [], stopReason: 'error', errorMessage: 'HTTP 503 service unavailable' };
+        return { ok: false, failure: { code: 'IMAGE_PROVIDER_UNAVAILABLE', message: 'HTTP 503 service unavailable', fatal: false } };
       }
       if (fail) {
-        return { output: [], stopReason: 'error', errorMessage: 'HTTP 401 Unauthorized' };
+        return { ok: false, failure: { code: 'IMAGE_PROVIDER_UNAUTHORIZED', message: 'HTTP 401 Unauthorized', fatal: true } };
       }
-      return {
-        output: [{ type: 'image', data: 'ZmFrZQ==', mimeType: 'image/png' }],
-        stopReason: 'stop',
-      };
+      return { ok: true, image: { data: 'ZmFrZQ==', mimeType: 'image/png' } };
     },
   };
 }
@@ -102,12 +98,12 @@ function createStorage({ getError } = {}) {
   };
 }
 
-const config = { guards: { maxImagesPerTurn: 2 }, image: { size: '1024x1024', modelId: 'gpt-image-2' } };
+const config = { guards: { maxImagesPerTurn: 2 }, image: { size: '1024x1024', modelId: 'image-model' } };
 const patch = { modify: [{ path: 'appearance.outfit', operation: 'replace', value: 'ivory coat' }], preserve: [] };
 
 test('read_photo_state returns the current pointer and origin marker', async () => {
   const repository = createRepository();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
   const tool = createReadPhotoStateTool({ repository, turnContext });
 
   const result = await tool.execute('call_1', {});
@@ -123,18 +119,17 @@ test('text to image starts from an empty asset pointer and skips storage reads',
   const models = createModels();
   const storage = createStorage();
   const turnContext = createTurnContext({
+    ownerId: 'dev',
     projectId: 'project_1',
     turnId: 'turn_text',
     initialBaseAssetId: null,
     activeRevisionId: 'revision_1',
   });
-  const tool = createGenerateImageTool({ repository, imagesModels: models, assetStorage: storage, turnContext, config });
+  const tool = createGenerateImageTool({ repository, imageProvider: models, assetStorage: storage, turnContext, config });
 
   const result = await tool.execute('call_text', { patch, renderPrompt: 'a portrait in soft light' });
 
-  assert.deepEqual(models.calls[0].context.input, [
-    { type: 'text', text: 'a portrait in soft light' },
-  ]);
+  assert.equal(models.calls[0].context.prompt, 'a portrait in soft light');
   assert.equal(storage.gets.length, 0);
   assert.equal(turnContext.currentBaseAssetId, 'candidate_turn_text_1');
   assert.equal(repository.generations[0].inputAssetId, null);
@@ -143,10 +138,10 @@ test('text to image starts from an empty asset pointer and skips storage reads',
 
 test('generate_image validates, generates, persists, stores, and advances the pointer', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   const result = await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
   assert.equal(result.terminate, undefined);
@@ -159,24 +154,24 @@ test('generate_image validates, generates, persists, stores, and advances the po
 
 test('generate_image rejects an invalid patch before spending money', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   await assert.rejects(
     tool.execute('call_1', { patch: { modify: [{ path: 'not.allowed', operation: 'replace', value: 1 }] }, renderPrompt: 'x' }),
   );
-  assert.equal(imagesModels.calls.length, 0);
+  assert.equal(imageProvider.calls.length, 0);
   assert.equal(repository.generations.length, 0);
 });
 
 test('generate_image enforces the per-turn image limit as a recoverable error', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   await tool.execute('call_1', { patch, renderPrompt: 'one' });
   await tool.execute('call_2', { patch, renderPrompt: 'two' });
@@ -188,10 +183,10 @@ test('generate_image enforces the per-turn image limit as a recoverable error', 
 
 test('generate_image marks provider auth failure as fatal and terminates', async () => {
   const repository = createRepository();
-  const imagesModels = createModels({ fail: true });
+  const imageProvider = createModels({ fail: true });
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   const result = await tool.execute('call_1', { patch, renderPrompt: 'fail' });
   assert.equal(result.terminate, true);
@@ -200,9 +195,9 @@ test('generate_image marks provider auth failure as fatal and terminates', async
 
 test('generate_image does not consume the image quota when the provider fails', async () => {
   const repository = createRepository();
-  const imagesModels = createModels({ fail: true });
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage: createStorage(), turnContext, config });
+  const imageProvider = createModels({ fail: true });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage: createStorage(), turnContext, config });
 
   await tool.execute('call_1', { patch, renderPrompt: 'fail' });
 
@@ -214,8 +209,8 @@ test('generate_image distinguishes a missing base asset from a repository failur
   repository.getAsset = async () => {
     throw new Error('connection refused');
   };
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels: createModels(), assetStorage: createStorage(), turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider: createModels(), assetStorage: createStorage(), turnContext, config });
 
   const result = await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
 
@@ -225,10 +220,10 @@ test('generate_image distinguishes a missing base asset from a repository failur
 
 test('generate_image uses the previous candidate as the next base image', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   await tool.execute('call_1', { patch, renderPrompt: 'first' });
   await tool.execute('call_2', { patch, renderPrompt: 'second' });
@@ -238,21 +233,21 @@ test('generate_image uses the previous candidate as the next base image', async 
 test('generate_image treats invalid asset uris as fatal', async () => {
   const repository = createRepository();
   repository.assets.get('asset_base').uri = 'not-a-uri';
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   const result = await tool.execute('call_1', { patch, renderPrompt: 'invalid uri' });
   assert.equal(result.terminate, true);
   assert.equal(result.details.fatalCode, 'INVALID_ASSET_URI');
   assert.equal(turnContext.fatal.code, 'INVALID_ASSET_URI');
-  assert.equal(imagesModels.calls.length, 0);
+  assert.equal(imageProvider.calls.length, 0);
 });
 
 test('select_candidate selects the candidate and terminates the turn', async () => {
   const repository = createRepository();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
   const tool = createSelectCandidateTool({ repository, turnContext });
 
   const result = await tool.execute('call_1', { generationId: 'generation_1', candidateId: 'candidate_1' });
@@ -262,7 +257,7 @@ test('select_candidate selects the candidate and terminates the turn', async () 
 
 test('select_candidate lets a bad candidate remain recoverable', async () => {
   const repository = createRepository();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
   const tool = createSelectCandidateTool({ repository, turnContext });
 
   const result = await tool.execute('call_1', { generationId: 'generation_1', candidateId: 'candidate_bad' });
@@ -273,39 +268,39 @@ test('select_candidate lets a bad candidate remain recoverable', async () => {
 
 test('generate_image returns terminate with a fatal code when the base asset is missing', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_gone', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_gone', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   const result = await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
   assert.equal(result.terminate, true);
   assert.equal(result.details.fatalCode, 'ASSET_NOT_FOUND');
   assert.equal(turnContext.fatal.code, 'ASSET_NOT_FOUND');
-  assert.equal(imagesModels.calls.length, 0);
+  assert.equal(imageProvider.calls.length, 0);
   assert.equal(repository.generations.length, 0);
 });
 
 test('generate_image returns terminate with a fatal code when storage is unavailable', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
+  const imageProvider = createModels();
   const assetStorage = createStorage({ getError: new Error('connect ECONNREFUSED') });
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage, turnContext, config });
 
   const result = await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
   assert.equal(result.terminate, true);
   assert.equal(result.details.fatalCode, 'ASSET_STORAGE_UNAVAILABLE');
-  assert.equal(imagesModels.calls.length, 0);
+  assert.equal(imageProvider.calls.length, 0);
 });
 
 test('asset ids are unique across turns with the same per-turn index', async () => {
   const assetIds = [];
   for (const turnId of ['turn_1', 'turn_2']) {
     const repository = createRepository();
-    const imagesModels = createModels();
-    const turnContext = createTurnContext({ projectId: 'project_1', turnId, initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-    const tool = createGenerateImageTool({ repository, imagesModels, assetStorage: createStorage(), turnContext, config });
+    const imageProvider = createModels();
+    const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId, initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+    const tool = createGenerateImageTool({ repository, imageProvider, assetStorage: createStorage(), turnContext, config });
     await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
     assetIds.push(repository.generations[0].outcome.candidate.assetId);
   }
@@ -315,8 +310,8 @@ test('asset ids are unique across turns with the same per-turn index', async () 
 
 test('generate_image records the turn id on the generation', async () => {
   const repository = createRepository();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_9', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels: createModels(), assetStorage: createStorage(), turnContext, config });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_9', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider: createModels(), assetStorage: createStorage(), turnContext, config });
 
   await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
   assert.equal(repository.generations[0].turnId, 'turn_9');
@@ -332,8 +327,8 @@ test('generate_image emits a turn-attributed provider span', async () => {
     },
   };
   const repository = createRepository();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_span', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const tool = createGenerateImageTool({ repository, imagesModels: createModels(), assetStorage: createStorage(), turnContext, config, telemetry });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_span', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const tool = createGenerateImageTool({ repository, imageProvider: createModels(), assetStorage: createStorage(), turnContext, config, telemetry });
 
   await tool.execute('call_1', { patch, renderPrompt: 'ivory coat' });
 
@@ -341,15 +336,15 @@ test('generate_image emits a turn-attributed provider span', async () => {
   assert.ok(providerSpan, 'provider span emitted');
   assert.equal(providerSpan.attrs['pi.turn.id'], 'turn_span');
   assert.equal(providerSpan.attrs['pi.project.id'], 'project_1');
-  assert.equal(providerSpan.attrs['pi.model.id'], 'gpt-image-2');
+  assert.equal(providerSpan.attrs['pi.model.id'], 'image-model');
 });
 
 test('transient provider failures consume attempts and the attempt cap stops the loop', async () => {
   const repository = createRepository();
-  const imagesModels = createModels({ fail: 'transient' });
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const attemptConfig = { guards: { maxImagesPerTurn: 5, maxImageAttemptsPerTurn: 2 }, image: { modelId: 'gpt-image-2' } };
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage: createStorage(), turnContext, config: attemptConfig });
+  const imageProvider = createModels({ fail: 'transient' });
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const attemptConfig = { guards: { maxImagesPerTurn: 5, maxImageAttemptsPerTurn: 2 }, image: { modelId: 'image-model' } };
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage: createStorage(), turnContext, config: attemptConfig });
 
   await assert.rejects(tool.execute('call_1', { patch, renderPrompt: 'x' }), /503/);
   await assert.rejects(tool.execute('call_2', { patch, renderPrompt: 'x' }), /503/);
@@ -357,16 +352,16 @@ test('transient provider failures consume attempts and the attempt cap stops the
     tool.execute('call_3', { patch, renderPrompt: 'x' }),
     (error) => error.code === 'MAX_IMAGE_ATTEMPTS_REACHED',
   );
-  assert.equal(imagesModels.calls.length, 2, '第三次在触达 provider 前就被闸住');
+  assert.equal(imageProvider.calls.length, 2, '第三次在触达 provider 前就被闸住');
   assert.equal(turnContext.imageCount, 0, '成功配额未被失败消耗');
 });
 
 test('invalid patches do not consume image attempts', async () => {
   const repository = createRepository();
-  const imagesModels = createModels();
-  const turnContext = createTurnContext({ projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
-  const attemptConfig = { guards: { maxImagesPerTurn: 2, maxImageAttemptsPerTurn: 1 }, image: { modelId: 'gpt-image-2' } };
-  const tool = createGenerateImageTool({ repository, imagesModels, assetStorage: createStorage(), turnContext, config: attemptConfig });
+  const imageProvider = createModels();
+  const turnContext = createTurnContext({ ownerId: 'dev', projectId: 'project_1', turnId: 'turn_1', initialBaseAssetId: 'asset_base', activeRevisionId: 'revision_1' });
+  const attemptConfig = { guards: { maxImagesPerTurn: 2, maxImageAttemptsPerTurn: 1 }, image: { modelId: 'image-model' } };
+  const tool = createGenerateImageTool({ repository, imageProvider, assetStorage: createStorage(), turnContext, config: attemptConfig });
 
   const badPatch = { modify: [{ path: 'not.allowed', operation: 'replace', value: 1 }] };
   await assert.rejects(tool.execute('call_1', { patch: badPatch, renderPrompt: 'x' }), { code: 'UNSAFE_STATE_PATH' });

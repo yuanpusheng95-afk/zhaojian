@@ -2,21 +2,18 @@ import pg from "pg";
 import Redis from "ioredis";
 
 import { runAgentTurn } from "../agent/agent-runner.js";
-import { createReadPhotoStateTool } from "../agent/tools/read-photo-state.js";
-import { createGenerateImageTool } from "../agent/tools/generate-image.js";
-import { createSelectCandidateTool } from "../agent/tools/select-candidate.js";
-import { createTurnContext } from "../agent/tools/turn-context.js";
+import { createAgentTools, createTurnContext } from "../agent/tools/index.js";
 import { loadWorkerConfig } from "../config.js";
 import { createAgentTurnQueue } from "../infrastructure/postgres/agent-turn-queue.js";
 import { PostgresPhotoProjectRepository } from "../infrastructure/postgres/photo-project-repository.js";
 import { createLlmModels } from "../infrastructure/models/llm-provider.js";
-import { createRelayImagesModels } from "../infrastructure/models/relay-images-provider.js";
+import { createRelayImageProvider } from "../infrastructure/models/relay-images-provider.js";
 import { createS3AssetStorage } from "../infrastructure/storage/s3-asset-storage.js";
 import { createPostgresSessionRepo } from "../infrastructure/postgres/session/repo.js";
 import { createStdoutTelemetry, createNoopTelemetry } from "../infrastructure/telemetry/stdout-telemetry.js";
 import { createPgTelemetry, createTeeTelemetry } from "../infrastructure/telemetry/pg-telemetry.js";
 import { instrumentStreamFn } from "../infrastructure/telemetry/stream-fn.js";
-import { AgentTurnWorker } from "./agent-turn-worker.js";
+import { AgentTurnWorker, type ClaimedTurn } from "./agent-turn-worker.js";
 import { createTurnEventPublisher } from "../infrastructure/redis/turn-events.js";
 
 const config = loadWorkerConfig(process.env);
@@ -33,25 +30,32 @@ const queue = createAgentTurnQueue({
   leaseMs: config.turnLeaseMs,
   eventPublisher: createTurnEventPublisher(redis),
 });
+function requireLlmModel(models: ReturnType<typeof createLlmModels>, modelId: string) {
+  const model = models.getModel("deepseek", modelId);
+  if (!model) throw new Error(`LLM model is not registered: ${modelId}`);
+  return model;
+}
+
 const llmModels = createLlmModels(config.llm);
-const imagesModels = createRelayImagesModels({
+const llmModel = requireLlmModel(llmModels, config.llm.modelId);
+const imageProvider = createRelayImageProvider({
   baseUrl: config.image.baseUrl,
   modelId: config.image.modelId,
+  apiKey: config.image.apiKey,
+  size: config.image.size,
+  editRoute: config.image.editRoute,
 });
-const imageModel = imagesModels.getModel("relay", config.image.modelId);
-Object.assign(imagesModels, { model: imageModel });
-const llmModel = llmModels.getModel("deepseek", config.llm.modelId);
-if (!llmModel) throw new Error(`LLM model is not registered: ${config.llm.modelId}`);
 const assetStorage = createS3AssetStorage(config.s3);
 const rawStreamFn = llmModels.streamSimple.bind(llmModels);
 
-async function executeTurn(turn: any) {
+async function executeTurn(turn: ClaimedTurn) {
   const project = await repository.getProject(turn.projectId);
-  const revision = await repository.getRevision(project.activeRevisionId as string);
+  const revision = await repository.getRevision(project.activeRevisionId);
   const turnContext = createTurnContext({
     projectId: turn.projectId,
+    ownerId: project.ownerId,
     turnId: turn.turnId,
-    initialBaseAssetId: (revision.anchorAssetId ?? null) as string | null,
+    initialBaseAssetId: revision.anchorAssetId ?? null,
     activeRevisionId: revision.id,
   });
   const streamFn = instrumentStreamFn({
@@ -59,11 +63,7 @@ async function executeTurn(turn: any) {
     streamFn: rawStreamFn as unknown as (...args: any[]) => Promise<any>,
     attributes: { "pi.turn.id": turn.turnId, "pi.project.id": turn.projectId },
   });
-  const tools = [
-    createReadPhotoStateTool({ repository, turnContext }),
-    createGenerateImageTool({ repository, imagesModels, assetStorage, turnContext, config, telemetry }),
-    createSelectCandidateTool({ repository, turnContext }),
-  ];
+  const tools = createAgentTools({ repository, imageProvider, assetStorage, turnContext, config, telemetry });
   const result = await runAgentTurn({ sessionRepo, config, model: llmModel, turn, tools, streamFn, telemetry });
   const generations = await repository.listGenerationsByTurn({ projectId: turn.projectId, turnId: turn.turnId });
   return {
@@ -72,7 +72,7 @@ async function executeTurn(turn: any) {
       toolCalls: result.stats?.toolCalls ?? 0,
       toolErrors: result.stats?.toolErrors ?? 0,
       generations: generations.length,
-      selected: generations.some((generation: any) => generation.selectedRevisionId != null),
+      selected: generations.some((generation) => generation.selectedRevisionId != null),
     },
   };
 }

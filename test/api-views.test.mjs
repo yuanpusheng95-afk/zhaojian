@@ -3,33 +3,67 @@ import { describe, expect, test } from 'bun:test';
 
 import { createTurnViews } from '../src/api/turn-views.js';
 
+let connect;
+
 function createDependencies({
   turn = null,
   generations = [],
   assets = new Map(),
   signError,
 } = {}) {
+  connect = async () => ({
+        async query(queryOrText, values = []) {
+          const text = typeof queryOrText === 'string' ? queryOrText : queryOrText.text;
+          const rowMode = typeof queryOrText === 'object' ? queryOrText.rowMode : undefined;
+          const boundValues = typeof queryOrText === 'object' && Array.isArray(queryOrText.values)
+            ? queryOrText.values
+            : values;
+          if (text.includes('max("agent_turns"."updated_at")')) {
+            return {
+              rows: turn && turn.id === boundValues[0] && turn.projectId === boundValues[1]
+                ? [[
+                    turn.updatedAt.toISOString(),
+                    generations.at(-1)?.updatedAt?.toISOString() ?? null,
+                    generations.length,
+                    generations.filter((generation) => generation.selectedCandidateId).length,
+                  ]]
+                : [],
+            };
+          }
+          const matched = turn && turn.id === boundValues[0] && turn.projectId === boundValues[1];
+          const objectRow = matched ? {
+            id: turn.id,
+            projectId: turn.projectId,
+            status: turn.status,
+            userMessage: turn.userMessage,
+            error_json: turn.errorJson,
+            outcome_json: turn.outcomeJson,
+            created_at: turn.createdAt,
+            updated_at: turn.updatedAt,
+          } : null;
+          if (objectRow && rowMode === 'array') {
+            return { rows: [[
+              turn.id,
+              turn.projectId,
+              turn.userMessage,
+              null,
+              turn.status,
+              null,
+              null,
+              turn.errorJson,
+              turn.outcomeJson,
+              turn.createdAt,
+              turn.updatedAt,
+            ]] };
+          }
+          return { rows: objectRow ? [objectRow] : [] };
+        },
+        release() {},
+      });
+
   const pool = {
-    async query(text, values) {
-      if (text.includes('FROM agent_turns t')) {
-        if (!turn || turn.id !== values[0] || turn.project_id !== values[1]) {
-          return { rows: [] };
-        }
-        const selected = generations.filter((generation) => generation.selectedCandidateId).length;
-        return { rows: [{
-          turn_updated_at: turn.updated_at,
-          generation_count: String(generations.length),
-          selected_count: String(selected),
-          generations_updated_at: generations.at(-1)?.updatedAt ?? null,
-        }] };
-      }
-      if (text.includes('FROM agent_turns')) {
-        if (!turn || turn.id !== values[0] || turn.project_id !== values[1]) {
-          return { rows: [] };
-        }
-        return { rows: [turn] };
-      }
-      return { rows: [] };
+    async query(text, values = []) {
+      return await (await connect()).query(text, values);
     },
   };
   const repository = {
@@ -70,13 +104,13 @@ const completedGeneration = {
 function baseTurn() {
   return {
     id: 'turn_1',
-    project_id: 'project_1',
-    user_message: 'edit',
+    projectId: 'project_1',
+    userMessage: 'edit',
     status: 'running',
-    outcome_json: null,
-    error_json: null,
-    created_at: new Date('2026-08-23T00:00:00Z'),
-    updated_at: new Date('2026-08-23T00:00:01Z'),
+    outcomeJson: null,
+    errorJson: null,
+    createdAt: new Date('2026-08-23T00:00:00Z'),
+    updatedAt: new Date('2026-08-23T00:00:01Z'),
   };
 }
 

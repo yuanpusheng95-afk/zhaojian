@@ -1,11 +1,15 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+
+import type { PhotoProjectRepository } from "../../domain/photo-project.js";
 import type { TurnContext } from "./turn-context.js";
 
 export function createReadPhotoStateTool({ repository, turnContext }: {
-  repository: { getRevision: (id: string) => Promise<any> };
+  repository: Pick<PhotoProjectRepository, "getRevision">;
   turnContext: TurnContext;
-}) {
+}): AgentTool<any> {
   return {
     name: "read_photo_state",
+    description: "Read the current photo editing state for the active turn",
     label: "Read photo state",
     parameters: { type: "object", properties: {}, required: [] },
     async execute() {

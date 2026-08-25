@@ -1,5 +1,10 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+
 import { AssetNotFoundError } from "../../domain/photo-project-service.js";
+import { ErrorCode } from "../../domain/errors.js";
+import type { PhotoProjectRepository } from "../../domain/photo-project.js";
 import { applyPhotoStatePatch } from "../../domain/photo-state.js";
+import type { ImageGenerationProvider } from "../../infrastructure/models/image-provider.js";
 import { createNoopTelemetry } from "../../infrastructure/telemetry/stdout-telemetry.js";
 import type { TelemetryContext } from "../../infrastructure/telemetry/stdout-telemetry.js";
 import {
@@ -11,40 +16,46 @@ import {
 import { MaxImageAttemptsReachedError, MaxImagesReachedError } from "./turn-context.js";
 import type { TurnContext } from "./turn-context.js";
 
+/** 工具层致命错误：终止整个 agent turn，code 走 ErrorCode 常量。 */
+export class ToolFatalError extends Error {
+  readonly fatalCode: string;
+  constructor(fatalCode: string, message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "ToolFatalError";
+    this.fatalCode = fatalCode;
+    if (options?.cause !== undefined) this.cause = options.cause;
+  }
+}
+
 const EXTENSION_BY_MIME = new Map([
   ["image/png", "png"],
   ["image/jpeg", "jpg"],
   ["image/webp", "webp"],
 ]);
 
-function isFatalProviderError(error: { message?: string }): boolean {
-  const message = String(error?.message ?? error).toLowerCase();
-  return message.includes("http 401")
-    || message.includes("unauthorized")
-    || message.includes("quota")
-    || message.includes("insufficient");
+type GenerateImageRepository = Pick<PhotoProjectRepository, "getRevision" | "recordGeneration" | "getAsset">;
+
+interface GenerateImageConfig {
+  guards: { maxImagesPerTurn: number; maxImageAttemptsPerTurn: number };
 }
 
 export function createGenerateImageTool({
-  repository, imagesModels, assetStorage, turnContext, config, telemetry = createNoopTelemetry(),
+  repository, imageProvider, assetStorage, turnContext, config, telemetry = createNoopTelemetry(),
 }: {
-  repository: any;
-  imagesModels: any;
-  assetStorage: any;
+  repository: GenerateImageRepository;
+  imageProvider: ImageGenerationProvider;
+  assetStorage: { put(key: string, bytes: Buffer | Uint8Array, contentType: string): Promise<void>; get(key: string): Promise<{ bytes: Buffer; contentType?: string }>; bucket: string };
   turnContext: TurnContext;
-  config: any;
+  config: GenerateImageConfig;
   telemetry?: TelemetryContext;
-}) {
+}): AgentTool<any> {
   async function readBaseImage() {
-    let asset: any;
+    let asset;
     try {
       asset = await repository.getAsset(turnContext.currentBaseAssetId!);
     } catch (error) {
       if (!(error instanceof AssetNotFoundError)) {
-        throw Object.assign(new Error(`Base asset repository unavailable: ${(error as Error).message}`), {
-          fatalCode: "ASSET_REPOSITORY_UNAVAILABLE",
-          cause: error,
-        });
+        throw new ToolFatalError(ErrorCode.ASSET_REPOSITORY_UNAVAILABLE, `Base asset repository unavailable: ${(error as Error).message}`, { cause: error });
       }
       throw Object.assign(new Error(`Base asset cannot be read: ${(error as Error).message}`), {
         fatalCode: "ASSET_NOT_FOUND",
@@ -61,7 +72,7 @@ export function createGenerateImageTool({
       return { ...asset, storageKey: key };
     } catch (error) {
       if (error instanceof InvalidAssetUriError) {
-        throw Object.assign(new Error(error.message), { fatalCode: "INVALID_ASSET_URI", cause: error });
+        throw new ToolFatalError(ErrorCode.INVALID_ASSET_URI, error.message, { cause: error });
       }
       throw error;
     }
@@ -72,7 +83,7 @@ export function createGenerateImageTool({
       return await assetStorage.get(base.storageKey);
     } catch (error) {
       throw Object.assign(new Error(`Base image bytes cannot be fetched: ${(error as Error).message}`), {
-        fatalCode: "ASSET_STORAGE_UNAVAILABLE",
+        fatalCode: ErrorCode.ASSET_STORAGE_UNAVAILABLE,
         cause: error,
       });
     }
@@ -83,7 +94,7 @@ export function createGenerateImageTool({
       await assetStorage.put(key, bytes, contentType);
     } catch (error) {
       throw Object.assign(new Error(`Generated image cannot be stored: ${(error as Error).message}`), {
-        fatalCode: "ASSET_STORAGE_UNAVAILABLE",
+        fatalCode: ErrorCode.ASSET_STORAGE_UNAVAILABLE,
         cause: error,
       });
     }
@@ -91,6 +102,7 @@ export function createGenerateImageTool({
 
   return {
     name: "generate_image",
+    description: "Generate image candidates from the current state and a state patch",
     label: "Generate image candidate",
     parameters: {
       type: "object" as const,
@@ -156,7 +168,7 @@ export function createGenerateImageTool({
       }
 
       const revision = await repository.getRevision(turnContext.activeRevisionId);
-      const proposedState = applyPhotoStatePatch(revision.state as any, params.patch);
+      const proposedState = applyPhotoStatePatch(revision.state, params.patch);
       turnContext.noteAttempt();
 
       try {
@@ -168,42 +180,31 @@ export function createGenerateImageTool({
             attributes: {
               "pi.turn.id": turnContext.turnId,
               "pi.project.id": turnContext.projectId,
-              "pi.model.id": config.image.modelId,
+              "pi.model.id": imageProvider.modelId,
             },
           },
-          () => imagesModels.generateImages(
-            imagesModels.model,
-            {
-              input: [
-                { type: "text", text: params.renderPrompt },
-                ...(stored ? [{
-                  type: "image",
-                  data: stored.bytes.toString("base64"),
-                  mimeType: stored.contentType ?? "image/png",
-                }] : []),
-              ],
-            },
-            {
-              apiKey: config.image.apiKey,
-              size: config.image.size,
-              editRoute: config.image.editRoute,
-              signal,
-            },
-          ),
+          () => imageProvider.generate({
+            prompt: params.renderPrompt,
+            baseImage: stored
+              ? { data: stored.bytes.toString("base64"), mimeType: stored.contentType ?? "image/png" }
+              : null,
+            signal,
+          }),
         );
-        if (generated.stopReason === "error" || !generated.output?.length) {
-          const message = generated.errorMessage ?? "Image provider returned no image";
-          if (isFatalProviderError({ message })) {
-            throw Object.assign(new Error(message), {
-              fatalCode: message.includes("401") || message.toLowerCase().includes("unauthorized")
-                ? "IMAGE_PROVIDER_UNAUTHORIZED"
-                : "IMAGE_PROVIDER_UNAVAILABLE",
-            });
+        if (!generated.ok) {
+          const { failure } = generated;
+          if (failure.fatal) {
+            turnContext.setFatal(failure.code, new Error(failure.message));
+            return {
+              content: [{ type: "text" as const, text: `Fatal image generation failure: ${failure.message}` }],
+              details: { fatalCode: failure.code },
+              terminate: true,
+            };
           }
-          throw new Error(message);
+          throw new Error(failure.message);
         }
 
-        const image = generated.output[0];
+        const image = generated.image;
         const contentType: string = image.mimeType ?? "image/png";
         const extension = EXTENSION_BY_MIME.get(contentType);
         if (!extension) throw new Error(`Unsupported generated image content type: ${contentType}`);
@@ -211,7 +212,7 @@ export function createGenerateImageTool({
         const bytes = Buffer.from(image.data, "base64");
         const assetId = `candidate_${turnContext.turnId}_${imageCount}`;
         const key = buildAssetKey({
-          ownerId: "dev",
+          ownerId: turnContext.ownerId,
           projectId: turnContext.projectId,
           assetId,
           contentType,
@@ -230,14 +231,14 @@ export function createGenerateImageTool({
               candidateId: assetId,
               assetId,
               uri: buildAssetUri(assetStorage.bucket, key),
-              metadata: { contentType, model: config.image.modelId },
+              metadata: { contentType, model: imageProvider.modelId },
               verification: {},
             },
           },
         });
-        const candidate = generation.candidates?.[0] ?? { id: generation.candidateId };
-        turnContext.advanceBase(candidate.id ?? generation.candidateId);
-        const candidateId = candidate.id ?? generation.candidateId;
+        const candidate = generation.candidates?.[0] ?? { id: generation.selectedCandidateId };
+        const candidateId = candidate.id ?? generation.selectedCandidateId;
+        turnContext.advanceBase(candidateId ?? assetId);
         return {
           content: [
             {

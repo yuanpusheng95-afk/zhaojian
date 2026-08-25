@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { Pool, PoolClient } from "pg";
+import type { Pool } from "pg";
 
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, type SQL } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
@@ -11,10 +11,24 @@ import {
   InvalidGenerationRequestError,
   ProjectNotFoundError,
   RevisionConflictError,
+  RevisionNotFoundError,
   TurnNotFoundError,
 } from "../../domain/photo-project-service.js";
 import { SELECTABLE_GENERATION_STATUSES } from "../../domain/generation-lifecycle.js";
-import { applyPhotoStatePatch } from "../../domain/photo-state.js";
+import { applyPhotoStatePatch, type PhotoState as ValidatedPhotoState, type StatePatch } from "../../domain/photo-state.js";
+import type {
+  Asset,
+  Candidate,
+  CreateProjectInput,
+  Generation,
+  PhotoState,
+  PhotoProjectRepository,
+  Project,
+  RecordAssetInput,
+  RecordGenerationInput,
+  Revision,
+  SelectCandidateInput,
+} from "../../domain/photo-project.js";
 import * as schema from "../../db/schema.js";
 import {
   agentTurns,
@@ -33,41 +47,36 @@ function toIso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
 }
 
-function notFound(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && "code" in error &&
-    (error as { code?: string }).code === "REVISION_NOT_FOUND");
-}
-
-function mapProject(row: typeof projects.$inferSelect) {
+function mapProject(row: typeof projects.$inferSelect): Project {
   return {
     id: row.id,
     name: row.name,
-    activeRevisionId: row.activeRevisionId,
-    runningTurnId: row.runningTurnId,
+    activeRevisionId: row.activeRevisionId as string,
+    runningTurnId: row.runningTurnId as string | null,
     ownerId: row.ownerId,
     createdAt: toIso(row.createdAt),
     updatedAt: toIso(row.updatedAt),
   };
 }
 
-function mapRevision(row: typeof photoRevisions.$inferSelect) {
+function mapRevision(row: typeof photoRevisions.$inferSelect): Revision {
   return {
     id: row.id,
     projectId: row.projectId,
     parentRevisionId: row.parentRevisionId,
-    state: row.stateJson,
+    state: row.stateJson as PhotoState,
     anchorAssetId: row.anchorAssetId,
     sourceGenerationId: row.sourceGenerationId,
     createdAt: toIso(row.createdAt),
   };
 }
 
-function mapAsset(row: typeof assets.$inferSelect) {
+function mapAsset(row: typeof assets.$inferSelect): Asset {
   return {
     id: row.id,
     kind: row.kind,
     uri: row.uri,
-    metadata: row.metadataJson,
+    metadata: row.metadataJson as Record<string, unknown>,
   };
 }
 
@@ -83,27 +92,27 @@ function mapCandidate(row: typeof generationOutputs.$inferSelect) {
 function mapGeneration(
   row: typeof generations.$inferSelect,
   candidateRows: Array<typeof generationOutputs.$inferSelect> = [],
-) {
+): Generation {
   return {
     id: row.id,
     projectId: row.projectId,
     turnId: row.turnId,
     inputRevisionId: row.inputRevisionId,
     inputAssetId: row.inputAssetId,
-    patch: row.patchJson,
-    proposedState: row.proposedStateJson,
-    status: row.status,
-    candidates: candidateRows.map(mapCandidate),
+    patch: row.patchJson as Record<string, unknown>,
+    proposedState: row.proposedStateJson as PhotoState,
+    status: row.status as "completed" | "failed",
+    candidates: candidateRows.map(mapCandidate) as Candidate[],
     selectedCandidateId: row.selectedCandidateId,
     selectedRevisionId: row.selectedRevisionId,
-    error: row.lastErrorJson,
+    error: row.lastErrorJson as Record<string, unknown> | null,
     renderPrompt: (row.metadataJson as { renderPrompt?: string | null }).renderPrompt ?? null,
     createdAt: toIso(row.createdAt),
     updatedAt: toIso(row.updatedAt),
   };
 }
 
-export class PostgresPhotoProjectRepository {
+export class PostgresPhotoProjectRepository implements PhotoProjectRepository {
   readonly #pool: Pool;
   readonly #db: Database;
   readonly #idFactory: (prefix: string) => string;
@@ -119,7 +128,7 @@ export class PostgresPhotoProjectRepository {
     now?: () => Date;
   }) {
     this.#pool = pool;
-    this.#db = drizzle(pool, { schema });
+    this.#db = drizzle(pool, { schema, casing: "snake_case" });
     this.#idFactory = idFactory;
     this.#now = now;
   }
@@ -129,18 +138,12 @@ export class PostgresPhotoProjectRepository {
     name,
     initialState,
     anchorAsset = null,
-    ownerId = "dev",
-  }: {
-    projectId?: string;
-    name: string;
-    initialState: Record<string, unknown>;
-    anchorAsset?: { assetId: string; uri?: string; metadata?: Record<string, unknown> } | null;
-    ownerId?: string;
-  }) {
+    ownerId,
+  }: CreateProjectInput): Promise<Project> {
     const id = projectId ?? this.#idFactory("project");
     const revisionId = this.#idFactory("revision");
     const now = this.#now();
-    const state = applyPhotoStatePatch(initialState as any, { modify: [], preserve: [] });
+    const state = applyPhotoStatePatch(initialState as ValidatedPhotoState, { modify: [], preserve: [] });
 
     return this.#transaction(async (db) => {
       if (anchorAsset) {
@@ -189,15 +192,7 @@ export class PostgresPhotoProjectRepository {
     patch,
     renderPrompt = null,
     outcome,
-  }: {
-    projectId: string;
-    turnId: string;
-    baseRevisionId: string;
-    inputAssetId: string | null;
-    patch: Record<string, unknown>;
-    renderPrompt?: string | null;
-    outcome?: Record<string, any>;
-  }) {
+  }: RecordGenerationInput): Promise<Generation> {
     if (typeof turnId !== "string" || turnId.trim() === "") {
       throw new InvalidGenerationRequestError("Generation requires a non-empty turn id");
     }
@@ -234,13 +229,9 @@ export class PostgresPhotoProjectRepository {
       const revisionRows = await db.select().from(photoRevisions)
         .where(eq(photoRevisions.id, baseRevisionId));
       const revisionRow = revisionRows[0];
-      if (!revisionRow) {
-        const error: Error & { code?: string } = new Error(`Revision not found: ${baseRevisionId}`);
-        error.code = "REVISION_NOT_FOUND";
-        throw error;
-      }
+      if (!revisionRow) throw new RevisionNotFoundError(baseRevisionId);
 
-      const proposedState = applyPhotoStatePatch(revisionRow.stateJson as any, patch as any);
+      const proposedState = applyPhotoStatePatch(revisionRow.stateJson as ValidatedPhotoState, patch as unknown as StatePatch);
       const generationId = this.#idFactory("generation");
       const now = this.#now();
 
@@ -296,11 +287,7 @@ export class PostgresPhotoProjectRepository {
     projectId,
     generationId,
     candidateId,
-  }: {
-    projectId: string;
-    generationId: string;
-    candidateId: string;
-  }) {
+  }: SelectCandidateInput): Promise<Revision> {
     return this.#transaction(async (db) => {
       const generationRows = await db.select().from(generations)
         .where(eq(generations.id, generationId)).for("update");
@@ -366,19 +353,19 @@ export class PostgresPhotoProjectRepository {
     });
   }
 
-  getProject(projectId: string) {
+  async getProject(projectId: string): Promise<Project> {
     return this.#requireProject(this.#db, projectId);
   }
 
-  getGeneration(generationId: string) {
+  async getGeneration(generationId: string): Promise<Generation> {
     return this.#requireGeneration(this.#db, generationId);
   }
 
-  getRevision(revisionId: string) {
+  async getRevision(revisionId: string): Promise<Revision> {
     return this.#requireRevision(this.#db, revisionId);
   }
 
-  getAsset(assetId: string) {
+  async getAsset(assetId: string): Promise<Asset> {
     return this.#requireAsset(this.#db, assetId);
   }
 
@@ -387,12 +374,7 @@ export class PostgresPhotoProjectRepository {
     kind = "source",
     uri = null,
     metadata = {},
-  }: {
-    assetId: string;
-    kind?: string;
-    uri?: string | null;
-    metadata?: Record<string, unknown>;
-  }) {
+  }: RecordAssetInput): Promise<Asset> {
     return this.#transaction(async (db) => {
       await db.insert(assets).values({
         id: assetId,
@@ -416,26 +398,26 @@ export class PostgresPhotoProjectRepository {
     return rows.map(mapRevision);
   }
 
-  async listGenerations(projectId: string) {
+  async listGenerations(projectId: string): Promise<Generation[]> {
     await this.#requireProject(this.#db, projectId);
-    const rows = await this.#db.select({ id: generations.id }).from(generations)
-      .where(eq(generations.projectId, projectId))
-      .orderBy(asc(generations.createdAt), asc(generations.id));
-    return Promise.all(rows.map(({ id }) => this.getGeneration(id)));
+    return this.#listGenerationsWhere(eq(generations.projectId, projectId));
   }
 
-  async listGenerationsByTurn({ projectId, turnId }: { projectId: string; turnId: string }) {
+  async listGenerationsByTurn({ projectId, turnId }: { projectId: string; turnId: string }): Promise<Generation[]> {
     await this.#requireProject(this.#db, projectId);
+    return this.#listGenerationsWhere(and(eq(generations.projectId, projectId), eq(generations.turnId, turnId)));
+  }
+
+  async #listGenerationsWhere(where: SQL | undefined): Promise<Generation[]> {
     const rows = await this.#db.select().from(generations)
-      .where(and(eq(generations.projectId, projectId), eq(generations.turnId, turnId)))
+      .where(where)
       .orderBy(asc(generations.createdAt), asc(generations.id));
     if (rows.length === 0) return [];
 
-    const candidateRows = await this.#db.select({
-      output: generationOutputs,
-    }).from(generationOutputs)
+    const candidateRows = await this.#db.select({ output: generationOutputs })
+      .from(generationOutputs)
       .innerJoin(generations, eq(generations.id, generationOutputs.generationId))
-      .where(and(eq(generations.projectId, projectId), eq(generations.turnId, turnId)))
+      .where(where)
       .orderBy(asc(generationOutputs.generationId), asc(generationOutputs.createdAt), asc(generationOutputs.id));
 
     const byGeneration = new Map<string, Array<typeof generationOutputs.$inferSelect>>();
@@ -462,13 +444,9 @@ export class PostgresPhotoProjectRepository {
     return mapGeneration(rows[0], candidateRows);
   }
 
-  async #requireRevision(database: Queryable, revisionId: string) {
+  async #requireRevision(database: Queryable, revisionId: string): Promise<Revision> {
     const rows = await database.select().from(photoRevisions).where(eq(photoRevisions.id, revisionId));
-    if (!rows[0]) {
-      const error: Error & { code?: string } = new Error(`Revision not found: ${revisionId}`);
-      error.code = "REVISION_NOT_FOUND";
-      throw error;
-    }
+    if (!rows[0]) throw new RevisionNotFoundError(revisionId);
     return mapRevision(rows[0]);
   }
 

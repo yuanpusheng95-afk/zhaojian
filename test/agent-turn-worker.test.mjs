@@ -94,6 +94,25 @@ test('worker marks fatal outcomes as failed', async () => {
   assert.equal(turn.error.code, 'IMAGE_PROVIDER_UNAUTHORIZED');
 });
 
+test('worker marks non-fatal agent failures as failed', async () => {
+  const queue = createQueue();
+  queue.request({ turnId: 'turn_no_image' });
+  const worker = createAgentTurnWorker({
+    queue,
+    config,
+    runTurn: async () => ({
+      kind: 'failed',
+      fatal: null,
+      error: { code: 'NO_IMAGE_GENERATED', message: 'Agent completed without generating a new image' },
+    }),
+  });
+
+  await worker.runOnce();
+  const turn = queue.turns.get('turn_no_image');
+  assert.equal(turn.status, 'failed');
+  assert.equal(turn.error.code, 'NO_IMAGE_GENERATED');
+});
+
 test('worker does not finish a turn after its lease is lost', async () => {
   const queue = createQueue();
   queue.request({ turnId: 'turn_lost' });

@@ -27,22 +27,23 @@ test('runAgentTurn persists the user prompt and assistant turns for later visibi
   const streamFn = createFakeStreamFn([
     {
       stopReason: 'toolUse',
-      content: [toolCall('call_1', 'read_photo_state', {})],
+      content: [toolCall('call_1', 'generate_image', {})],
     },
     {
       stopReason: 'stop',
       content: [{ type: 'text', text: 'done' }],
     },
   ]);
-  const tools = [{
-    name: 'read_photo_state',
-    description: 'read state',
+  const generateImageTool = {
+    name: 'generate_image',
+    description: 'generate an image',
     parameters: { type: 'object', properties: {}, required: [] },
     execute: async () => ({
       content: [{ type: 'text', text: '{}' }],
       details: {},
     }),
-  }];
+  };
+  const tools = [generateImageTool];
 
   const first = await runAgentTurn({
     sessionRepo, config, model, turn: { projectId: 'p1', userMessage: 'make it warmer' }, tools, streamFn,
@@ -52,22 +53,28 @@ test('runAgentTurn persists the user prompt and assistant turns for later visibi
 
   const second = await runAgentTurn({
     sessionRepo, config, model, turn: { projectId: 'p1', userMessage: 'select it' }, tools,
-    streamFn: createFakeStreamFn([{ stopReason: 'stop', content: [{ type: 'text', text: 'ok' }] }]),
+    streamFn: createFakeStreamFn([
+      { stopReason: 'toolUse', content: [toolCall('call_2', 'generate_image', {})] },
+      { stopReason: 'stop', content: [{ type: 'text', text: 'ok' }] },
+    ]),
   });
 
   const entries = (await (await sessionRepo.open({ id: 'project:p1' })).findEntriesOnBranch())
     .slice()
     .sort((left, right) => left.seq - right.seq);
   const messages = entries.filter((entry) => entry.type === 'message').map((entry) => entry.message);
-  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'assistant', 'user', 'assistant']);
+  assert.deepEqual(messages.map((message) => message.role), ['user', 'assistant', 'assistant', 'user', 'assistant', 'assistant']);
   const persistedToolResults = entries.filter((entry) => entry.type === 'custom' && entry.customType === 'tool_results');
-  assert.equal(persistedToolResults.length, 1);
+  assert.equal(persistedToolResults.length, 2);
   assert.equal(persistedToolResults[0].data[0].role, 'toolResult');
   assert.equal(second.kind, 'completed');
 
   const third = await runAgentTurn({
     sessionRepo, config, model, turn: { projectId: 'p1', userMessage: 'again' }, tools,
-    streamFn: createFakeStreamFn([{ stopReason: 'stop', content: [{ type: 'text', text: 'seen' }] }]),
+    streamFn: createFakeStreamFn([
+      { stopReason: 'toolUse', content: [toolCall('call_3', 'generate_image', {})] },
+      { stopReason: 'stop', content: [{ type: 'text', text: 'seen' }] },
+    ]),
   });
   assert.equal(third.kind, 'completed');
 });
@@ -100,8 +107,16 @@ test('runAgentTurn recovers from a first-session create race', async () => {
     config,
     model,
     turn: { projectId: 'p1', userMessage: 'hello' },
-    tools: [],
-    streamFn: createFakeStreamFn([{ stopReason: 'stop', content: [{ type: 'text', text: 'hi' }] }]),
+    tools: [{
+      name: 'generate_image',
+      description: 'generate an image',
+      parameters: { type: 'object', properties: {}, required: [] },
+      execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
+    }],
+    streamFn: createFakeStreamFn([
+      { stopReason: 'toolUse', content: [toolCall('call_1', 'generate_image', {})] },
+      { stopReason: 'stop', content: [{ type: 'text', text: 'hi' }] },
+    ]),
   });
   assert.equal(result.kind, 'completed');
   const entries = await (await created.open({ id: 'project:p1' })).findEntriesOnBranch();
@@ -112,12 +127,12 @@ test('runAgentTurn recovers from a first-session create race', async () => {
 test('runAgentTurn sends the user message to the model exactly once', async () => {
   const sessionRepo = new InMemorySessionRepo();
   const streamFn = createFakeStreamFn([
-    { stopReason: 'toolUse', content: [toolCall('call_1', 'read_photo_state', {})] },
+    { stopReason: 'toolUse', content: [toolCall('call_1', 'generate_image', {})] },
     { stopReason: 'stop', content: [{ type: 'text', text: 'done' }] },
   ]);
   const tools = [{
-    name: 'read_photo_state',
-    description: 'read state',
+    name: 'generate_image',
+    description: 'generate an image',
     parameters: { type: 'object', properties: {}, required: [] },
     execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
   }];
@@ -163,6 +178,28 @@ test('runAgentTurn reports aborted when the turn timeout fires', async () => {
   });
 
   assert.equal(result.kind, 'aborted');
+});
+
+test('runAgentTurn fails a completed turn that generated no image', async () => {
+  const sessionRepo = new InMemorySessionRepo();
+  const generateImageTool = {
+    name: 'generate_image',
+    description: 'generate an image',
+    parameters: { type: 'object', properties: {}, required: [] },
+    execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
+  };
+  const result = await runAgentTurn({
+    sessionRepo,
+    config,
+    model,
+    turn: { projectId: 'p_no_image', turnId: 'turn_no_image', userMessage: 'generate' },
+    tools: [generateImageTool],
+    streamFn: createFakeStreamFn([{ stopReason: 'stop', content: [{ type: 'text', text: 'already done' }] }]),
+  });
+
+  assert.equal(result.kind, 'failed');
+  assert.equal(result.fatal, null);
+  assert.equal(result.error.code, 'NO_IMAGE_GENERATED');
 });
 
 test('runAgentTurn surfaces stream errors without polluting the trajectory', async () => {
@@ -211,8 +248,8 @@ test('tool execution spans carry turn attribution', async () => {
     },
   };
   const tools = [{
-    name: 'read_photo_state',
-    description: 'read state',
+    name: 'generate_image',
+    description: 'generate an image',
     parameters: { type: 'object', properties: {}, required: [] },
     execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
   }];
@@ -225,7 +262,7 @@ test('tool execution spans carry turn attribution', async () => {
     tools,
     telemetry,
     streamFn: createFakeStreamFn([
-      { stopReason: 'toolUse', content: [toolCall('call_1', 'read_photo_state', {})] },
+      { stopReason: 'toolUse', content: [toolCall('call_1', 'generate_image', {})] },
       { stopReason: 'stop', content: [{ type: 'text', text: 'done' }] },
     ]),
   });
@@ -235,14 +272,14 @@ test('tool execution spans carry turn attribution', async () => {
   assert.ok(toolSpan, 'tool span emitted');
   assert.equal(toolSpan.attrs['pi.turn.id'], 'turn_tool_span');
   assert.equal(toolSpan.attrs['pi.project.id'], 'p9');
-  assert.equal(toolSpan.attrs['pi.tool.name'], 'read_photo_state');
+  assert.equal(toolSpan.attrs['pi.tool.name'], 'generate_image');
 });
 
 test('historical image bytes are stripped from persistence and from later contexts', async () => {
   const sessionRepo = new InMemorySessionRepo();
   const imageTool = [{
-    name: 'make_image',
-    description: 'make',
+    name: 'generate_image',
+    description: 'generate an image',
     parameters: { type: 'object', properties: {}, required: [] },
     execute: async () => ({
       content: [
@@ -258,7 +295,7 @@ test('historical image bytes are stripped from persistence and from later contex
     turn: { projectId: 'p1', userMessage: 'make one' },
     tools: imageTool,
     streamFn: createFakeStreamFn([
-      { stopReason: 'toolUse', content: [toolCall('call_1', 'make_image', {})] },
+      { stopReason: 'toolUse', content: [toolCall('call_1', 'generate_image', {})] },
       { stopReason: 'stop', content: [{ type: 'text', text: 'made' }] },
     ]),
   });
@@ -283,8 +320,9 @@ test('historical image bytes are stripped from persistence and from later contex
   const second = await runAgentTurn({
     sessionRepo, config, model,
     turn: { projectId: 'p1', userMessage: 'again' },
-    tools: [], streamFn: wrapped,
+    tools: imageTool, streamFn: wrapped,
   });
-  assert.equal(second.kind, 'completed');
+  assert.equal(second.kind, 'failed');
+  assert.equal(second.error.code, 'NO_IMAGE_GENERATED');
   assert.deepEqual(seenRoles, [0], 'no image blocks reach the model on the next turn');
 });

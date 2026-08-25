@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import { describe, expect, test } from 'bun:test';
 
-import http from 'node:http';
 
 import { IdempotencyConflictError, ProjectBusyError } from '../src/infrastructure/postgres/agent-turn-queue.js';
-import { handleTurnEvents, parsePollMs } from '../src/api/sse.js';
+import { createTurnEventStream, parsePollMs, toErrorPayload } from '../src/api/sse.js';
 import { createApiServer } from '../src/api/server.js';
 import { createApp } from '../src/api/app.js';
 
@@ -71,6 +70,9 @@ function recordingViews(detail) {
 
 function fakeRepository({ selectionError } = {}) {
   return {
+    async getProject(projectId) {
+      return { id: projectId, ownerId: 'dev' };
+    },
     async selectCandidate({ projectId, generationId, candidateId }) {
       if (selectionError === 'cross') {
         const error = new Error(`Generation ${generationId} does not belong to project ${projectId}`);
@@ -203,130 +205,23 @@ test('pollMs is clamped to the documented floor', () => {
 });
 
 test('SSE sends the current terminal turn and closes immediately', async () => {
-  const chunks = [];
-  const response = {
-    writeHead() {},
-    write(chunk) {
-      chunks.push(chunk);
-      return true;
-    },
-    end() {},
-  };
-  const request = { on() {} };
-
-  await handleTurnEvents({
-    request,
-    response,
+  const controller = new AbortController();
+  const events = [];
+  for await (const event of createTurnEventStream({
     turnViews: fakeViews({ status: 'completed', generations: [] }),
     projectId: 'project_1',
     turnId: 'turn_1',
-    pollMs: '250',
-  });
-
-  const events = chunks.join('').split('\n\n').filter(Boolean);
-  assert.equal(events[0], ': ping');
-  assert.match(events[1], /^event: turn\ndata: /);
-  assert.equal(events[2], 'event: done\ndata: {}');
-});
-
-test('SSE polls until the turn becomes terminal and cleans timers on close', async () => {
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const originalSetTimeout = globalThis.setTimeout;
-  const originalClearTimeout = globalThis.clearTimeout;
-  const intervals = [];
-  const timeouts = [];
-  let intervalCleared = false;
-  let timeoutCleared = false;
-  let closed = false;
-
-  globalThis.setInterval = (callback, delay) => {
-    intervals.push({ callback, delay });
-    return 101;
-  };
-  globalThis.clearInterval = () => {
-    intervalCleared = true;
-  };
-  globalThis.setTimeout = (callback, delay) => {
-    timeouts.push({ callback, delay });
-    return 202;
-  };
-  globalThis.clearTimeout = () => {
-    timeoutCleared = true;
-  };
-
-  try {
-    const chunks = [];
-    const listeners = new Map();
-    const response = {
-      writeHead() {},
-      write(chunk) {
-        chunks.push(chunk);
-        return true;
-      },
-      end() {
-        closed = true;
-      },
-      destroy() {
-        closed = true;
-      },
-    };
-    const request = {
-      on(event, callback) {
-        listeners.set(event, callback);
-      },
-    };
-    let calls = 0;
-    const views = {
-      async loadTurnDetail() {
-        calls += 1;
-        return { status: calls === 1 ? 'running' : 'completed', generations: [] };
-      },
-      async turnChangedSince() {
-        return { changed: true, fingerprint: `f${calls}` };
-      },
-    };
-
-    await handleTurnEvents({
-      request,
-      response,
-      turnViews: views,
-      projectId: 'project_1',
-      turnId: 'turn_1',
-      pollMs: '250',
-    });
-    assert.equal(timeouts.length, 1);
-    assert.equal(timeouts[0].delay, 250);
-    await Promise.resolve().then(timeouts[0].callback).catch(() => {});
-
-    assert.match(chunks.join(''), /"status":"running"/);
-    assert.match(chunks.join(''), /event: done\ndata: \{\}/);
-    assert.equal(closed, true);
-    assert.equal(intervalCleared, true);
-    assert.equal(timeoutCleared, true);
-
-    listeners.get('close')();
-    assert.equal(intervalCleared, true);
-    assert.equal(timeoutCleared, true);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-    globalThis.setTimeout = originalSetTimeout;
-    globalThis.clearTimeout = originalClearTimeout;
+    pollMs: 250,
+    signal: controller.signal,
+  })) {
+    events.push(event);
   }
+  assert.equal(events.length, 2);
+  assert.equal(events[0].type, 'snapshot');
+  assert.equal(events[1].type, 'done');
 });
 
 test('SSE emits an error event when views reject', async () => {
-  const chunks = [];
-  const response = {
-    writeHead() {},
-    write(chunk) {
-      chunks.push(chunk);
-      return true;
-    },
-    end() {},
-  };
-  const request = { on() {} };
   const views = {
     async turnChangedSince() {
       const error = new Error('turn exploded');
@@ -337,102 +232,65 @@ test('SSE emits an error event when views reject', async () => {
       throw new Error('detail should not be loaded');
     },
   };
-
-  await handleTurnEvents({
-    request,
-    response,
+  const controller = new AbortController();
+  const events = [];
+  for await (const event of createTurnEventStream({
     turnViews: views,
     projectId: 'project_1',
     turnId: 'turn_1',
-  });
-
-  assert.match(
-    chunks.join(''),
-    /event: error\ndata: \{"code":"TURN_NOT_FOUND","message":"turn exploded"\}/,
-  );
+    pollMs: 250,
+    signal: controller.signal,
+  })) {
+    events.push(event);
+  }
+  assert.deepEqual(events, [{ type: 'error', payload: { code: 'TURN_NOT_FOUND', message: 'turn exploded' } }]);
 });
 
 test('SSE hides unknown errors behind a stable internal code', async () => {
-  const chunks = [];
-  const response = {
-    writeHead() {},
-    write(chunk) {
-      chunks.push(chunk);
-      return true;
-    },
-    end() {},
-  };
-  const request = { on() {} };
   const views = {
     async turnChangedSince() {
       throw new Error('database password is wrong');
     },
   };
-
-  await handleTurnEvents({
-    request,
-    response,
+  const controller = new AbortController();
+  const events = [];
+  for await (const event of createTurnEventStream({
     turnViews: views,
     projectId: 'project_1',
     turnId: 'turn_1',
-  });
-
-  assert.match(
-    chunks.join(''),
-    /event: error\ndata: \{"code":"INTERNAL_ERROR","message":"Turn event stream failed"\}/,
-  );
-  assert.ok(!chunks.join('').includes('database password'));
+    pollMs: 250,
+    signal: controller.signal,
+  })) {
+    events.push(event);
+  }
+  assert.deepEqual(events, [{ type: 'error', payload: { code: 'INTERNAL_ERROR', message: 'Turn event stream failed' } }]);
 });
 
 test('SSE emits an error event when polling rejects mid-stream', async () => {
-  const chunks = [];
-  const response = {
-    writeHead() {},
-    write(chunk) {
-      chunks.push(chunk);
-      return true;
-    },
-    end() {},
-  };
-  const request = { on() {} };
   let calls = 0;
-  const server = http.createServer((req, res) =>
-    handleTurnEvents({
-      request: req,
-      response: res,
-      turnViews: {
-        async turnChangedSince() {
-          calls += 1;
-          if (calls === 1) return { changed: true, fingerprint: 'f1' };
-          throw new Error('database went away');
-        },
-        async loadTurnDetail() {
-          return { status: 'running', generations: [] };
-        },
+  const controller = new AbortController();
+  const events = [];
+  for await (const event of createTurnEventStream({
+    turnViews: {
+      async turnChangedSince() {
+        calls += 1;
+        if (calls === 1) return { changed: true, fingerprint: 'f1' };
+        throw new Error('database went away');
       },
-      projectId: 'project_1',
-      turnId: 'turn_1',
-      pollMs: '40',
-    }));
-  await new Promise((resolve) => server.listen(0, resolve));
-
-  try {
-    const streamResponse = await fetch(`http://127.0.0.1:${server.address().port}/projects/p1/turns/t1/events`);
-    const reader = streamResponse.body.getReader();
-    let text = '';
-    while (!text.includes('event: error')) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      text += Buffer.from(value).toString();
-    }
-    assert.match(text, /event: turn\ndata:/);
-    assert.match(
-      text,
-      /event: error\ndata: \{"code":"INTERNAL_ERROR","message":"Turn event stream failed"\}/,
-    );
-  } finally {
-    server.close();
+      async loadTurnDetail() {
+        return { status: 'running', generations: [] };
+      },
+    },
+    projectId: 'project_1',
+    turnId: 'turn_1',
+    pollMs: 40,
+    signal: controller.signal,
+  })) {
+    events.push(event);
+    if (event.type === 'error') break;
   }
+  assert.equal(events[0].type, 'snapshot');
+  assert.deepEqual(events[1], { type: 'error', payload: { code: 'INTERNAL_ERROR', message: 'Turn event stream failed' } });
 });
 
 test('SSE pushes only the initial snapshot while the fingerprint is unchanged', async () => {
@@ -544,9 +402,8 @@ test('uploads stores bytes and returns the anchor descriptor', async () => {
 });
 
 test('SSE falls back to polling after a Redis stream error', async () => {
-  const detail = { turnId: 't1', status: 'completed', generations: [] };
-  let readCalls = 0;
   let loadCalls = 0;
+  let readCalls = 0;
   const app = createApp({
     pool: {},
     queue: {},
@@ -561,7 +418,7 @@ test('SSE falls back to polling after a Redis stream error', async () => {
     turnViews: {
       loadTurnDetail: async () => {
         loadCalls += 1;
-        return detail;
+        return { turnId: 't1', status: loadCalls === 1 ? 'running' : 'completed', generations: [] };
       },
       turnChangedSince: async () => ({ changed: true, fingerprint: `f${loadCalls}` }),
     },
@@ -572,4 +429,115 @@ test('SSE falls back to polling after a Redis stream error', async () => {
   assert.equal(readCalls, 1);
   assert.match(events, /event: turn\ndata:/);
   assert.match(events, /event: done\ndata: \{\}/);
+});
+
+test('uploads and project creation honor the x-user-id header', async () => {
+  const puts = [];
+  const createdProjects = [];
+  const { server, url } = await startServer({
+    repository: {
+      async recordAsset({ assetId, uri, metadata }) {
+        return { id: assetId, uri, metadata };
+      },
+      async createProject(body) {
+        createdProjects.push(body);
+        return { id: 'project_1', ...body };
+      },
+    },
+    queue: fakeQueue(),
+    turnViews: fakeViews({}),
+    assetStorage: {
+      bucket: 'photo-agent',
+      async put(key, bytes, contentType) {
+        puts.push({ key, bytes, contentType });
+      },
+    },
+  });
+
+  try {
+    const png = Buffer.from('89504e470d0a1a0a', 'hex');
+    const upload = await fetch(`${url}/uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'image/png', 'x-user-id': 'alice' },
+      body: png,
+    });
+    assert.equal(upload.status, 201);
+    const uploadBody = await upload.json();
+    assert.match(uploadBody.uri, /^s3:\/\/photo-agent\/users\/alice\/projects\/uploads\/upload_[^.]+\.png$/);
+    assert.match(puts[0].key, /^users\/alice\/projects\/uploads\//);
+
+    const project = await fetch(`${url}/projects`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-user-id': 'alice' },
+      body: JSON.stringify({ name: 'Portrait' }),
+    });
+    assert.equal(project.status, 201);
+    assert.equal(createdProjects.at(-1).ownerId, 'alice');
+    assert.deepEqual(createdProjects.at(-1).initialState, {});
+
+    const rejected = await fetch(`${url}/uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'image/png', 'x-user-id': '../evil' },
+      body: png,
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal((await rejected.json()).error.code, 'INVALID_USER_ID');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('access policy can deny reads and writes with 404', async () => {
+  const { HttpError } = await import('../src/api/http-error.js');
+  const app = createApp({
+    repository: fakeRepository(),
+    queue: fakeQueue(),
+    turnViews: fakeViews({ status: 'completed' }),
+    assetStorage: { bucket: 'photo-agent', async put() {} },
+    accessPolicy: {
+      assertAccess({ userId, resource, action }) {
+        if (resource.ownerId !== userId) {
+          throw new HttpError(404, 'PROJECT_NOT_FOUND', `Project not accessible to ${userId}`);
+        }
+      },
+    },
+  });
+  const server = createApiServer({
+    repository: fakeRepository(),
+    queue: fakeQueue(),
+    turnViews: fakeViews({ status: 'completed' }),
+    assetStorage: { bucket: 'photo-agent', async put() {} },
+    accessPolicy: {
+      assertAccess({ userId, resource }) {
+        if (resource.ownerId !== userId) {
+          throw new HttpError(404, 'PROJECT_NOT_FOUND', `Project not accessible to ${userId}`);
+        }
+      },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    // owner can read
+    const own = await fetch(`${url}/projects/p1`, { headers: { 'x-user-id': 'dev' } });
+    assert.equal(own.status, 200);
+
+    // non-owner gets 404 on read
+    const foreign = await fetch(`${url}/projects/p1`, { headers: { 'x-user-id': 'mallory' } });
+    assert.equal(foreign.status, 404);
+    assert.equal((await foreign.json()).error.code, 'PROJECT_NOT_FOUND');
+
+    // non-owner gets 404 on write
+    const write = await fetch(`${url}/projects/p1/messages`, {
+      method: 'POST',
+      headers: { 'x-user-id': 'mallory', 'idempotency-key': 'k1' },
+      body: JSON.stringify({ message: 'hi' }),
+    });
+    assert.equal(write.status, 404);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

@@ -171,6 +171,36 @@ test('finishTurn writes outcome, releases the lock, and is idempotent for the sa
   assert.equal(project.running_turn_id, null);
 });
 
+test('finishTurn publishes only the first terminal transition', async () => {
+  const events = [];
+  const eventQueue = createAgentTurnQueue({
+    pool,
+    leaseMs: 30_000,
+    eventPublisher: {
+      publishTurnEvent: async (event) => {
+        events.push(event);
+      },
+    },
+  });
+
+  await createProject('project_events');
+  const requested = await eventQueue.requestTurn({
+    projectId: 'project_events',
+    userMessage: 'events',
+    idempotencyKey: 'key_events',
+  });
+  const claimed = await eventQueue.claimNextTurn();
+  await eventQueue.finishTurn({ ...claimed, status: 'completed' });
+  await eventQueue.finishTurn({ ...claimed, status: 'completed' });
+
+  assert.deepEqual(events, [{
+    turnId: requested.turnId,
+    projectId: 'project_events',
+    status: 'completed',
+    transitioned: true,
+  }]);
+});
+
 test('finishTurn rejects a wrong token without changing state', async () => {
   await createProject();
   await queue.requestTurn({ projectId: 'project_1', userMessage: 'lost', idempotencyKey: 'key_1' });
@@ -205,7 +235,12 @@ test('finishTurn commits when the terminal event publisher fails', async () => {
     status: 'completed',
   });
 
-  assert.deepEqual(result, { turnId: claimed.turnId, status: 'completed' });
+  assert.deepEqual(result, {
+    projectId: 'project_1',
+    status: 'completed',
+    transitioned: true,
+    turnId: claimed.turnId,
+  });
   const turn = (await pool.query('SELECT status FROM agent_turns WHERE id = $1', [claimed.turnId])).rows[0];
   const project = (await pool.query('SELECT running_turn_id FROM projects WHERE id = $1', ['project_1'])).rows[0];
   assert.equal(turn.status, 'completed');

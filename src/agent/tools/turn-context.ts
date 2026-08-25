@@ -1,5 +1,5 @@
 export class MaxImagesReachedError extends Error {
-  code = "MAX_IMAGES_REACHED";
+  code = "MAX_IMAGES_REACHED" as const;
   constructor(limit: number) {
     super(`Maximum images per turn reached: ${limit}`);
     this.name = this.constructor.name;
@@ -7,7 +7,7 @@ export class MaxImagesReachedError extends Error {
 }
 
 export class MaxImageAttemptsReachedError extends Error {
-  code = "MAX_IMAGE_ATTEMPTS_REACHED";
+  code = "MAX_IMAGE_ATTEMPTS_REACHED" as const;
   constructor(limit: number) {
     super(`Maximum image generation attempts per turn reached: ${limit}`);
     this.name = this.constructor.name;
@@ -16,6 +16,7 @@ export class MaxImageAttemptsReachedError extends Error {
 
 export interface TurnContext {
   projectId: string;
+  ownerId: string;
   turnId: string;
   currentBaseAssetId: string | null;
   activeRevisionId: string;
@@ -29,15 +30,17 @@ export interface TurnContext {
   setFatal(code: string, error?: unknown): NonNullable<TurnContext["fatal"]>;
 }
 
-export function createTurnContext({ projectId, turnId, initialBaseAssetId, activeRevisionId }: {
-  projectId: string; turnId: string; initialBaseAssetId: string | null; activeRevisionId: string;
+export function createTurnContext({ projectId, ownerId, turnId, initialBaseAssetId, activeRevisionId }: {
+  projectId: string; ownerId: string; turnId: string; initialBaseAssetId: string | null; activeRevisionId: string;
 }): TurnContext {
   if (!projectId) throw new TypeError("createTurnContext requires projectId");
+  if (!ownerId) throw new TypeError("createTurnContext requires ownerId");
   if (!turnId) throw new TypeError("createTurnContext requires turnId");
   if (!activeRevisionId) throw new TypeError("createTurnContext requires activeRevisionId");
 
   return {
     projectId,
+    ownerId,
     turnId,
     currentBaseAssetId: initialBaseAssetId,
     activeRevisionId,

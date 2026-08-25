@@ -1,13 +1,51 @@
 import { Agent, buildSessionContext } from "@earendil-works/pi-agent-core";
+import type { AgentState, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import { createNoopTelemetry } from "../infrastructure/telemetry/stdout-telemetry.js";
 import type { TelemetryContext } from "../infrastructure/telemetry/stdout-telemetry.js";
 import { SYSTEM_PROMPT } from "./system-prompt.js";
+
+type AgentModel = AgentState["model"];
+
+export interface AgentSessionEntry {
+  type: string;
+  seq: number;
+  customType?: string;
+  data?: unknown;
+}
+
+export interface AgentSession {
+  findEntriesOnBranch(): Promise<AgentSessionEntry[]>;
+  appendMessage(message: unknown): Promise<unknown>;
+  appendCustomEntry(customType: string, data: unknown): Promise<unknown>;
+}
+
+export interface AgentSessionRepo {
+  open(args: { id: string }): Promise<AgentSession>;
+  create(args: { id: string }): Promise<AgentSession>;
+}
+
+export interface AgentTurnConfig {
+  guards: { turnTimeoutMs: number };
+}
+
+export interface AgentTurnRequest {
+  turnId: string;
+  projectId: string;
+  userMessage?: string;
+}
+
+export interface AgentTurnResult {
+  kind: "completed" | "failed" | "aborted";
+  fatal: { code: string; message: string } | null;
+  error: { code: string; message: string } | null;
+  stats: { toolCalls: number; toolErrors: number };
+}
 
 export function projectSessionId(projectId: string): string {
   return `project:${projectId}`;
 }
 
-async function openOrCreateSession(sessionRepo: any, sessionId: string) {
+async function openOrCreateSession(sessionRepo: AgentSessionRepo, sessionId: string): Promise<AgentSession> {
   try {
     return await sessionRepo.open({ id: sessionId });
   } catch (error: any) {
@@ -40,7 +78,7 @@ function durableClone(value: unknown) {
 
 const KEEP_RECENT_TOOL_RESULTS = 1;
 
-function toolResultsProjector(entry: any, index: number, allEntries: any[]) {
+function toolResultsProjector(entry: AgentSessionEntry, index: number, allEntries: AgentSessionEntry[]) {
   if (!Array.isArray(entry.data)) return [];
   let lastKeptIndex = -1;
   for (let i = allEntries.length - 1; i >= 0; i -= 1) {
@@ -50,23 +88,23 @@ function toolResultsProjector(entry: any, index: number, allEntries: any[]) {
     }
   }
   const isMostRecent = index >= lastKeptIndex - (KEEP_RECENT_TOOL_RESULTS - 1);
-  return isMostRecent ? entry.data : stripHistoricalImages(entry.data);
+  return isMostRecent ? entry.data : stripHistoricalImages(entry.data as any[]);
 }
 
 export async function runAgentTurn({
   sessionRepo, config, model, turn, tools, streamFn, telemetry = createNoopTelemetry(),
 }: {
-  sessionRepo: any;
-  config: any;
-  model: any;
-  turn: { turnId: string; projectId: string; userMessage?: string };
-  tools: any[];
-  streamFn: any;
+  sessionRepo: AgentSessionRepo;
+  config: AgentTurnConfig;
+  model: AgentModel;
+  turn: AgentTurnRequest;
+  tools: AgentTool<any>[];
+  streamFn: StreamFn;
   telemetry?: TelemetryContext;
-}) {
+}): Promise<AgentTurnResult> {
   return telemetry.startSpan(
     { name: "pi.agent.turn", attributes: { "pi.turn.id": turn.turnId, "pi.project.id": turn.projectId } },
-    async (span: any) => {
+    async (span) => {
       if (!model) throw new TypeError("runAgentTurn requires model");
       const result = await runTurn({ sessionRepo, config, model, turn, tools, streamFn, telemetry });
       span.setAttributes({
@@ -83,22 +121,27 @@ export async function runAgentTurn({
 }
 
 async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, telemetry }: {
-  sessionRepo: any; config: any; model: any;
-  turn: { turnId: string; projectId: string; userMessage?: string };
-  tools: any[]; streamFn: any; telemetry: TelemetryContext;
-}) {
+  sessionRepo: AgentSessionRepo;
+  config: AgentTurnConfig;
+  model: AgentModel;
+  turn: AgentTurnRequest;
+  tools: AgentTool<any>[];
+  streamFn: StreamFn;
+  telemetry: TelemetryContext;
+}): Promise<AgentTurnResult> {
   const sessionId = projectSessionId(turn.projectId);
-  let fatal: any;
+  let fatal: { code: string; message: string } | null = null;
   let shouldStop = false;
   let timedOut = false;
   const stats = { toolCalls: 0, toolErrors: 0 };
-  let streamError: any = null;
+  let generatedImageCount = 0;
+  let streamError: { code: string; message: string } | null = null;
 
   try {
     const session = await openOrCreateSession(sessionRepo, sessionId);
     const entries = (await session.findEntriesOnBranch())
       .slice()
-      .sort((left: any, right: any) => left.seq - right.seq);
+      .sort((left, right) => left.seq - right.seq);
     const context: any = buildSessionContext(entries as any, {
       entryProjectors: { tool_results: toolResultsProjector } as any,
     });
@@ -126,17 +169,20 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
             attributes: {
               "pi.turn.id": turn.turnId,
               "pi.project.id": turn.projectId,
-            "pi.tool.name": event.toolName,
-            "pi.tool.call_id": event.toolCallId,
-            "pi.tool.is_error": event.isError,
+              "pi.tool.name": event.toolName,
+              "pi.tool.call_id": event.toolCallId,
+              "pi.tool.is_error": event.isError,
+            },
           },
-        },
           () => undefined,
         );
       }
       if (event.type === "tool_execution_end" && event.result?.details?.fatalCode) {
         fatal = { code: event.result.details.fatalCode, message: event.result.content[0]?.text };
         shouldStop = true;
+      }
+      if (event.type === "tool_execution_end" && event.toolName === "generate_image" && !event.isError) {
+        generatedImageCount += 1;
       }
       if (event.type !== "turn_end") return;
       const message = event.message;
@@ -173,6 +219,14 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
           stats,
         };
       }
+      if (generatedImageCount === 0) {
+        return {
+          kind: "failed" as const,
+          fatal: null,
+          error: { code: "NO_IMAGE_GENERATED", message: "Agent completed without generating a new image" },
+          stats,
+        };
+      }
       return {
         kind: "completed" as const,
         fatal,
@@ -183,7 +237,7 @@ async function runTurn({ sessionRepo, config, model, turn, tools, streamFn, tele
       clearTimeout(timeout);
     }
   } catch (error: any) {
-    if (fatal === undefined && error) {
+    if (!fatal && error) {
       fatal = { code: "AGENT_RUN_FAILED", message: error.message };
     }
     return { kind: "failed" as const, fatal, error: fatal, stats };

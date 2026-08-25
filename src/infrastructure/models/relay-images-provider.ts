@@ -4,6 +4,12 @@ import {
   envApiKeyAuth,
 } from "@earendil-works/pi-ai";
 
+import type {
+  ImageGenerationFailure,
+  ImageGenerationProvider,
+  ImageGenerationResult,
+} from "./image-provider.js";
+
 const API_ID = "relay-openai-images";
 const DEFAULT_MIME = "image/png";
 const DEFAULT_SIZE = "1024x1024";
@@ -180,4 +186,79 @@ export function createRelayImagesModels({ baseUrl, modelId }: { baseUrl: string;
     }) as any,
   );
   return models;
+}
+
+function classifyRelayFailure(message: string): ImageGenerationFailure {
+  const text = String(message).toLowerCase();
+  if (text.includes("http 401") || text.includes("unauthorized")) {
+    return { code: "IMAGE_PROVIDER_UNAUTHORIZED", message, fatal: true };
+  }
+  if (text.includes("quota") || text.includes("insufficient")) {
+    return { code: "IMAGE_PROVIDER_UNAVAILABLE", message, fatal: true };
+  }
+  return { code: "IMAGE_PROVIDER_UNAVAILABLE", message, fatal: false };
+}
+
+export interface RelayImageProviderOptions {
+  baseUrl: string;
+  modelId: string;
+  apiKey: string;
+  size?: string;
+  editRoute?: "chat" | "edits";
+  fetch?: typeof fetch;
+}
+
+/** ImageGenerationProvider 端口的 relay 实现：封装请求路由、重试和错误分类。 */
+export function createRelayImageProvider({
+  baseUrl,
+  modelId,
+  apiKey,
+  size = DEFAULT_SIZE,
+  editRoute = "chat",
+  fetch: fetchImpl,
+}: RelayImageProviderOptions): ImageGenerationProvider {
+  if (!apiKey) throw new TypeError("createRelayImageProvider requires an apiKey");
+
+  const models = createRelayImagesModels({ baseUrl, modelId });
+  const model = models.getModel("relay", modelId) as any;
+  if (!model) throw new Error(`Relay image model is not registered: ${modelId}`);
+
+  return {
+    modelId,
+    async generate(request) {
+      const generated = await relayGenerateImages(model, {
+        input: [
+          { type: "text", text: request.prompt },
+          ...(request.baseImage
+            ? [{ type: "image", data: request.baseImage.data, mimeType: request.baseImage.mimeType }]
+            : []),
+        ],
+      }, {
+        apiKey,
+        size: request.size ?? size,
+        editRoute,
+        signal: request.signal,
+        ...(fetchImpl ? { fetch: fetchImpl } : {}),
+      });
+
+      if (generated.stopReason === "aborted") {
+        return {
+          ok: false as const,
+          failure: {
+            code: "IMAGE_PROVIDER_ABORTED" as const,
+            message: generated.errorMessage ?? "Image generation aborted",
+            fatal: false,
+          },
+        };
+      }
+      if (generated.stopReason === "error" || !generated.output?.length) {
+        return {
+          ok: false as const,
+          failure: classifyRelayFailure(generated.errorMessage ?? "Image provider returned no image"),
+        };
+      }
+      const image = generated.output[0];
+      return { ok: true as const, image: { data: image.data, mimeType: image.mimeType ?? DEFAULT_MIME } };
+    },
+  };
 }

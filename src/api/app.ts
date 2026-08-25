@@ -2,46 +2,55 @@ import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { streamSSE } from "hono/streaming";
 import { cors } from "hono/cors";
-import { parsePollMs } from "./sse.js";
 import { z } from "zod";
-import type { Pool } from "pg";
+
+import { ERROR_STATUS } from "../domain/errors.js";
+import { AllowAllAccessPolicy, type AccessPolicy, type AccessAction } from "./access-policy.js";
+import { HttpError } from "./http-error.js";
+
+import { createTurnEventStream, parsePollMs } from "./sse.js";
+import type { TurnViews } from "./turn-views.js";
+import type { PhotoProjectRepository } from "../domain/photo-project.js";
+import type { AgentTurnQueue } from "../infrastructure/postgres/agent-turn-queue.js";
+import type { TurnEventConsumer } from "../infrastructure/redis/turn-events.js";
+import type { AssetStorageLike } from "../infrastructure/storage/asset-storage.js";
 
 export interface AppDeps {
-  pool: Pool | any;
-  repository: any;
-  queue: any;
-  turnViews: any;
-  assetStorage: any;
-  eventConsumer?: any;
+  repository: Pick<PhotoProjectRepository, "createProject" | "getProject" | "getGeneration" | "recordAsset" | "selectCandidate">;
+  queue: Pick<AgentTurnQueue, "requestTurn">;
+  turnViews: TurnViews;
+  assetStorage: Pick<AssetStorageLike, "put" | "bucket">;
+  eventConsumer?: Pick<TurnEventConsumer, "readTurnEvent"> | null;
+  accessPolicy?: AccessPolicy;
   logger?: Console;
 }
 
 const MessageSchema = z.object({ message: z.string().min(1) });
 
-class HttpError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string) {
-    super(message);
+/** 用户标识会进入 S3 key 路径，必须限制字符集和长度。 */
+const USER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+
+/**
+ * V1 没有登录体系：请求头携带用户标识，缺省回落 dev。
+ * 这是身份提示而非鉴权——真正的访问控制要等认证落地后再加。
+ */
+function resolveUserId(headerValue: string | undefined): string {
+  const userId = (headerValue ?? "").trim();
+  if (!userId) return "dev";
+  if (!USER_ID_PATTERN.test(userId)) {
+    throw new HttpError(
+      400,
+      "INVALID_USER_ID",
+      "x-user-id must start with a letter or digit, contain only [A-Za-z0-9._:-], and be at most 64 characters",
+    );
   }
+  return userId;
 }
 
-const ERROR_STATUS: Record<string, number> = {
-  PROJECT_NOT_FOUND: 404,
-  GENERATION_NOT_FOUND: 404,
-  TURN_NOT_FOUND: 404,
-  REVISION_NOT_FOUND: 404,
-  ASSET_NOT_FOUND: 404,
-  UNSUPPORTED_MEDIA_TYPE: 415,
-  "23505": 409,
-  REVISION_CONFLICT: 409,
-  CANDIDATE_SELECTION_ERROR: 409,
-  PROJECT_EXISTS: 409,
-  IDEMPOTENCY_CONFLICT: 409,
-  PROJECT_BUSY: 409,
-  INVALID_GENERATION_REQUEST: 400,
-  INVALID_STATE_PATCH: 400,
-  UNSAFE_STATE_PATH: 400,
-  PATCH_CONFLICT: 400,
-};
+/** 统一访问检查入口：拒绝抛 404，隐藏资源存在性。 */
+function assertProjectAccess(policy: AccessPolicy, userId: string, resource: { ownerId: string }, action: AccessAction) {
+  policy.assertAccess({ userId, resource, action });
+}
 
 function errorResponse(error: unknown) {
   const code = (error as any)?.code ?? (error as any)?.cause?.code;
@@ -59,7 +68,7 @@ function errorResponse(error: unknown) {
   return { status: 500, body: { error: { code: "INTERNAL_ERROR", message: "Internal server error" } } };
 }
 
-export function createApp({ pool, repository, queue, turnViews, assetStorage, eventConsumer, logger = console }: AppDeps) {
+export function createApp({ repository, queue, turnViews, assetStorage, eventConsumer = null, accessPolicy = new AllowAllAccessPolicy(), logger = console }: AppDeps) {
   const app = new Hono();
 
   app.use("*", cors());
@@ -85,9 +94,10 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
       return c.json({ error: { code: "REQUEST_TOO_LARGE", message: "Upload exceeds 20971520 bytes" } }, 413);
     }
     const buffer = Buffer.from(bytes);
+    const userId = resolveUserId(c.req.header("x-user-id"));
     const assetId = `upload_${crypto.randomUUID()}`;
     const extension = mediaType.split("/")[1] ?? "png";
-    const key = `users/dev/projects/uploads/${assetId}.${extension}`;
+    const key = `users/${userId}/projects/uploads/${assetId}.${extension}`;
     await assetStorage.put(key, buffer, mediaType);
     const uri = `s3://${assetStorage.bucket}/${key}`;
     const metadata = { contentType };
@@ -96,25 +106,26 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
   });
 
   app.post("/projects", async (c) => {
-    const body = await c.req.json();
+    const body = await c.req.json().catch(() => ({}));
     if (typeof body?.name !== "string" || !body.name.trim()) throw new HttpError(400, "INVALID_PROJECT", "name is required");
-    const project = await repository.createProject(body);
+    const ownerId = resolveUserId(c.req.header("x-user-id"));
+    const project = await repository.createProject({
+      ...body,
+      initialState: body.initialState ?? {},
+      ownerId,
+    });
     return c.json(project, 201);
   });
 
   app.get("/projects/:projectId", async (c) => {
     const project = await repository.getProject(c.req.param("projectId"));
+    assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "read");
     return c.json(project);
   });
 
   app.get("/generations/:generationId", async (c) => {
     const generation = await repository.getGeneration(c.req.param("generationId"));
     return c.json(generation);
-  });
-
-  app.get("/assets/:assetId/url", async (c) => {
-    const view = await turnViews.assetUrl(c.req.param("assetId"));
-    return c.json(view);
   });
 
   app.post("/projects/:projectId/messages", async (c) => {
@@ -127,6 +138,8 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
     const message = parsedMessage.data.message;
     const idempotencyKey = c.req.header("idempotency-key");
     if (!idempotencyKey?.trim()) throw new HttpError(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required");
+    const project = await repository.getProject(projectId);
+    assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "write");
     const result = await queue.requestTurn({ projectId, userMessage: message, idempotencyKey });
     return c.json(result, (result.replayed ? 200 : 202) as any);
   });
@@ -145,6 +158,8 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
       throw new HttpError(400, "INVALID_SELECTION", "generationId and candidateId are required");
     }
     await turnViews.assertTurnExists({ projectId, turnId });
+    const project = await repository.getProject(projectId);
+    assertProjectAccess(accessPolicy, resolveUserId(c.req.header("x-user-id")), project, "write");
     const revision = await repository.selectCandidate({
       projectId,
       generationId: body.generationId,
@@ -159,53 +174,28 @@ export function createApp({ pool, repository, queue, turnViews, assetStorage, ev
     const pollMs = parsePollMs(c.req.query("pollMs"));
     const abortSignal = c.req.raw.signal;
 
-    let streamClosed = false;
-    abortSignal.addEventListener("abort", () => { streamClosed = true; });
-
     return streamSSE(c, async (stream) => {
-      let lastFingerprint: string | null | undefined;
-      let useRedis = eventConsumer != null;
-      if (eventConsumer) {
-        let lastEventId = "0";
-        while (!streamClosed && !abortSignal.aborted) {
-          try {
-            const next = await eventConsumer.readTurnEvent(turnId, lastEventId, 250);
-            if (next) {
-              lastEventId = next.id;
-              const view = await turnViews.loadTurnDetail({ projectId, turnId });
-              await stream.writeSSE({ event: "turn", data: JSON.stringify(view) });
-              if (["completed", "failed", "aborted"].includes(view.status)) {
-                await stream.writeSSE({ event: "done", data: "{}" });
-                return;
-              }
-            }
-          } catch {
-            useRedis = false;
-            break;
-          }
-        }
-      }
+      const events = createTurnEventStream({
+        turnViews,
+        eventConsumer,
+        projectId,
+        turnId,
+        pollMs,
+        signal: abortSignal,
+        onFallback: (error) => {
+          logger.warn("Turn event Redis consumer failed; falling back to database polling", { error });
+        },
+      });
 
-      while (!useRedis && !streamClosed && !abortSignal.aborted) {
-        try {
-          const changed = await turnViews.turnChangedSince({ projectId, turnId, lastFingerprint });
-          lastFingerprint = changed.fingerprint;
-          if (!changed.changed) {
-            await stream.sleep(pollMs);
-            continue;
-          }
-          const view = await turnViews.loadTurnDetail({ projectId, turnId });
-          await stream.writeSSE({ event: "turn", data: JSON.stringify(view) });
-          if (["completed", "failed", "aborted"].includes(view.status)) {
-            await stream.writeSSE({ event: "done", data: "{}" });
-            break;
-          }
-        } catch (error: any) {
-          const payload = ["TURN_NOT_FOUND", "REVISION_NOT_FOUND", "ASSET_NOT_FOUND", "INVALID_ASSET_URI"].includes(error?.code)
-            ? { code: error.code, message: error.message }
-            : { code: "INTERNAL_ERROR", message: "Turn event stream failed" };
-          await stream.writeSSE({ event: "error", data: JSON.stringify(payload) });
-          break;
+      for await (const event of events) {
+        if (event.type === "snapshot") {
+          await stream.writeSSE({ event: "turn", data: JSON.stringify(event.view) });
+        } else if (event.type === "done") {
+          await stream.writeSSE({ event: "done", data: "{}" });
+          return;
+        } else {
+          await stream.writeSSE({ event: "error", data: JSON.stringify(event.payload) });
+          return;
         }
       }
     });

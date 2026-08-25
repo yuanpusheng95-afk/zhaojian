@@ -24,7 +24,6 @@ const turnViews = createTurnViews({
 });
 const redis = new Redis(config.redisUrl);
 const app = createApp({
-  pool,
   repository,
   queue,
   turnViews,

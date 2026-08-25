@@ -1,101 +1,68 @@
-import { appendEntry, readEntry } from './entries.js';
+import type { SessionMetadata, SessionStorage as CoreSessionStorage } from '@earendil-works/pi-agent-core';
+import type { PostgresSessionRepo } from './repo.js';
+import type {
+  NewSessionRecord,
+  ProvisionedSessionEntry,
+  SessionBranchQuery,
+  SessionEntryQuery,
+  SessionRecordQuery,
+} from './types.js';
 import { isUniqueViolation, sessionError } from './errors.js';
-import { computeStats, getFact, setFact } from './facts.js';
-import { createLane, moveLane, readLanes, validateTarget } from './lanes.js';
-import { findEntries, findEntriesOnBranch, getLog } from './queries.js';
-import { appendRecord, findOpenOperations, findRecords } from './records.js';
-import { readSession } from './sessions.js';
-import type { Pool, PoolClient } from 'pg';
 
 function translate(error: unknown) {
-  if ((error as any)?.name === 'SessionError') return error;
-  if (isUniqueViolation(error)) {
-    return sessionError('already_exists', (error as Error).message, error);
-  }
-  if (error instanceof TypeError) {
-    return sessionError('invalid_payload', error.message, error);
-  }
+  if ((error as { name?: unknown })?.name === 'SessionError') return error;
+  if (isUniqueViolation(error)) return sessionError('already_exists', (error as Error).message, error);
+  if (error instanceof TypeError) return sessionError('invalid_payload', error.message, error);
   return sessionError('storage', (error as Error)?.message ?? String(error), error);
 }
 
-export function createPostgresSessionStorage({ pool, sessionId }: { pool: Pool; sessionId: string }) {
-  if (!pool) throw new TypeError('createPostgresSessionStorage requires a pg pool');
-  if (!sessionId) {
-    throw new TypeError('createPostgresSessionStorage requires a sessionId');
-  }
+export function createPostgresSessionStorage(
+  repo: PostgresSessionRepo,
+  sessionId: string,
+): CoreSessionStorage<SessionMetadata> {
+  if (!repo) throw new TypeError('createPostgresSessionStorage requires a session repository');
+  if (!sessionId) throw new TypeError('createPostgresSessionStorage requires a sessionId');
 
-  /** 每个 mutation 一个事务：seq 分配与写入必须原子，否则并发下会重号。 */
-  async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await pool.connect();
+  const run = async <T>(operation: () => Promise<T>): Promise<T> => {
     try {
-      await client.query('BEGIN');
-      const result = await fn(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw translate(error);
-    } finally {
-      client.release();
-    }
-  }
-
-  async function withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await pool.connect();
-    try {
-      return await fn(client);
+      return await operation();
     } catch (error) {
       throw translate(error);
-    } finally {
-      client.release();
     }
-  }
-
-  return {
-    async getMetadata() {
-      const row = await withClient((client) => readSession(client, sessionId));
-      if (!row) throw sessionError('not_found', `Session ${sessionId} not found`);
-      return {
-        id: row.id,
-        createdAt: row.createdAt,
-        parentSessionId: row.parentSessionId ?? undefined,
-        ...row.metadata,
-      };
-    },
-
-    getLanes: () => withClient((client) => readLanes(client, sessionId)),
-    createLane: (lane: string, at?: string | null) =>
-      inTransaction((client) => createLane(client, sessionId, lane, at)),
-    moveLane: (lane: string, to?: string | null) =>
-      inTransaction((client) => moveLane(client, sessionId, lane, to)),
-
-    appendEntry: (entry: any, lane: string) =>
-      inTransaction((client) => appendEntry(client, sessionId, entry, lane)),
-    appendRecord: (record: any) =>
-      inTransaction((client) => appendRecord(client, sessionId, record)),
-
-    getEntry: (id: string) => withClient((client) => readEntry(client, sessionId, id)),
-    findEntries: (query?: any) =>
-      withClient((client) => findEntries(client, sessionId, query)),
-    findEntriesOnBranch: (query?: any) =>
-      withClient((client) => findEntriesOnBranch(client, sessionId, query)),
-    findRecords: (query?: any) =>
-      withClient((client) => findRecords(client, sessionId, query)),
-    findOpenOperations: (lane: string, options?: any) =>
-      withClient((client) => findOpenOperations(client, sessionId, lane, options)),
-    getLog: (options?: { afterSeq?: number; limit?: number }) => withClient((client) => getLog(client, sessionId, options)),
-
-    getName: () => withClient((client) => getFact(client, sessionId, 'name', null)),
-    setName: (name: unknown) =>
-      inTransaction((client) => setFact(client, sessionId, 'name', null, name)),
-    getLabel: (id: string) => withClient((client) => getFact(client, sessionId, 'label', id)),
-    setLabel: (id: string, label: unknown) =>
-      inTransaction(async (client) => {
-        // label 的目标必须是已存在的 entry
-        await validateTarget(client, sessionId, id);
-        await setFact(client, sessionId, 'label', id, label);
-      }),
-
-    getStats: () => withClient((client) => computeStats(client, sessionId)),
   };
+
+  const storage = {
+    getMetadata: () =>
+      run(async () => {
+        const metadata = await repo.getSessionMetadata(sessionId);
+        if (!metadata) throw sessionError('not_found', `Session ${sessionId} not found`);
+        return {
+          id: metadata.id,
+          createdAt: metadata.createdAt,
+          parentSessionId: metadata.parentSessionId ?? undefined,
+          ...metadata.metadata,
+        };
+      }),
+    getLanes: () => run(() => repo.getLanes(sessionId)),
+    createLane: (lane: string, at?: string | null) => run(() => repo.createLane(sessionId, lane, at)),
+    moveLane: (lane: string, to?: string | null) => run(() => repo.moveLane(sessionId, lane, to)),
+    appendEntry: (entry: ProvisionedSessionEntry, lane: string) => run(() => repo.appendEntry(sessionId, entry, lane)),
+    appendRecord: (record: NewSessionRecord) => run(() => repo.appendRecord(sessionId, record)),
+    getEntry: (id: string) => run(() => repo.getEntry(sessionId, id)),
+    findEntries: (query?: SessionEntryQuery) => run(() => repo.findEntries(sessionId, query)),
+    findEntriesOnBranch: (query?: SessionBranchQuery) => run(() => repo.findEntriesOnBranch(sessionId, query)),
+    findRecords: (query?: SessionRecordQuery) => run(() => repo.findRecords(sessionId, query)),
+    findOpenOperations: (
+      lane: string,
+      options?: { limit?: number },
+    ) => run(() => repo.findOpenOperations(sessionId, lane, options)),
+    getLog: (options?: { afterSeq?: number; limit?: number }) => run(() => repo.getLog(sessionId, options)),
+    getName: () => run(() => repo.getName(sessionId)),
+    setName: (name: unknown) => run(() => repo.setName(sessionId, name)),
+    getLabel: (id: string) => run(() => repo.getLabel(sessionId, id)),
+    setLabel: (id: string, label: unknown) => run(() => repo.setLabel(sessionId, id, label)),
+    getStats: () => run(() => repo.getStats(sessionId)),
+  };
+
+  return storage as unknown as CoreSessionStorage<SessionMetadata>;
 }

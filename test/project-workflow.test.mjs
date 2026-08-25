@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   CandidateSelectionError,
-  PhotoProjectService,
+  InMemoryPhotoProjectService,
   RevisionConflictError,
   RevisionNotFoundError,
 } from '../src/domain/photo-project-service.js';
@@ -31,13 +31,13 @@ function initialState() {
 }
 
 function createService() {
-  return new PhotoProjectService({
+  return new InMemoryPhotoProjectService({
     idFactory: createIdFactory(),
     now: () => '2026-08-19T14:40:00+08:00',
   });
 }
 
-function createProject(service, projectId = 'project_1') {
+async function createProject(service, projectId = 'project_1') {
   return service.createProject({
     projectId,
     name: 'Autumn portrait',
@@ -58,9 +58,9 @@ function editPatch(value = 'ivory coat') {
   };
 }
 
-function recordGeneration(service, project, patch = editPatch(), options = {}) {
-  const baseRevisionId =
-    options.baseRevisionId ?? service.getProject(project.id).activeRevisionId;
+async function recordGeneration(service, project, patch = editPatch(), options = {}) {
+  const current = await service.getProject(project.id);
+  const baseRevisionId = options.baseRevisionId ?? current.activeRevisionId;
   return service.recordGeneration({
     projectId: project.id,
     turnId: options.turnId ?? 'turn_1',
@@ -74,17 +74,17 @@ function recordGeneration(service, project, patch = editPatch(), options = {}) {
   });
 }
 
-test('creates a revision only after the user selects a generated candidate', () => {
+test('creates a revision only after the user selects a generated candidate', async () => {
   const service = createService();
-  const project = createProject(service);
+  const project = await createProject(service);
 
-  const generation = recordGeneration(service, project);
+  const generation = await recordGeneration(service, project);
 
   assert.equal(generation.status, 'completed');
   assert.equal(generation.inputRevisionId, project.activeRevisionId);
   assert.equal(generation.proposedState.appearance.outfit, 'ivory coat');
-  assert.equal(service.getProject(project.id).activeRevisionId, 'revision_1');
-  assert.equal(service.listRevisions(project.id).length, 1);
+  assert.equal((await service.getProject(project.id)).activeRevisionId, 'revision_1');
+  assert.equal((await service.listRevisions(project.id)).length, 1);
   assert.deepEqual(generation.candidates, [{
     id: 'candidate_1',
     assetId: 'asset_generated_1',
@@ -92,7 +92,7 @@ test('creates a revision only after the user selects a generated candidate', () 
     createdAt: generation.createdAt,
   }]);
 
-  const revision = service.selectCandidate({
+  const revision = await service.selectCandidate({
     projectId: project.id,
     generationId: generation.id,
     candidateId: 'candidate_1',
@@ -101,30 +101,30 @@ test('creates a revision only after the user selects a generated candidate', () 
   assert.equal(revision.parentRevisionId, 'revision_1');
   assert.equal(revision.anchorAssetId, 'asset_generated_1');
   assert.equal(revision.state.appearance.outfit, 'ivory coat');
-  assert.equal(service.getProject(project.id).activeRevisionId, revision.id);
-  assert.equal(service.listRevisions(project.id).length, 2);
+  assert.equal((await service.getProject(project.id)).activeRevisionId, revision.id);
+  assert.equal((await service.listRevisions(project.id)).length, 2);
 });
 
-test('allows a second generation with an identical patch in the same turn', () => {
+test('allows a second generation with an identical patch in the same turn', async () => {
   const service = createService();
-  const project = createProject(service);
+  const project = await createProject(service);
   const request = { patch: editPatch() };
 
-  const first = recordGeneration(service, project, request.patch);
-  const second = recordGeneration(service, project, request.patch);
+  const first = await recordGeneration(service, project, request.patch);
+  const second = await recordGeneration(service, project, request.patch);
 
   assert.notEqual(second.id, first.id);
   assert.deepEqual(
-    service.listGenerations(project.id).map(({ id }) => id),
+    (await service.listGenerations(project.id)).map(({ id }) => id),
     [first.id, second.id],
   );
 });
 
-test('rejects an edit based on a missing revision', () => {
+test('rejects an edit based on a missing revision', async () => {
   const service = createService();
-  const project = createProject(service);
+  const project = await createProject(service);
 
-  assert.throws(
+  await assert.rejects(
     () =>
       service.recordGeneration({
         projectId: project.id,
@@ -141,14 +141,14 @@ test('rejects an edit based on a missing revision', () => {
   );
 });
 
-test('records a failed generation without candidates', () => {
+test('records a failed generation without candidates', async () => {
   const service = createService();
-  const project = createProject(service);
+  const project = await createProject(service);
 
-  const generation = service.recordGeneration({
+  const generation = await service.recordGeneration({
     projectId: project.id,
     turnId: 'turn_1',
-    baseRevisionId: service.getProject(project.id).activeRevisionId,
+    baseRevisionId: (await service.getProject(project.id)).activeRevisionId,
     inputAssetId: 'asset_source',
     patch: editPatch(),
     outcome: { kind: 'failed', error: { message: 'provider unavailable' } },
@@ -159,24 +159,24 @@ test('records a failed generation without candidates', () => {
   assert.deepEqual(generation.error, { message: 'provider unavailable' });
 });
 
-test('selecting the same candidate is idempotent but another is rejected', () => {
+test('selecting the same candidate is idempotent but another is rejected', async () => {
   const service = createService();
-  const project = createProject(service);
-  const generation = recordGeneration(service, project);
+  const project = await createProject(service);
+  const generation = await recordGeneration(service, project);
 
-  const first = service.selectCandidate({
+  const first = await service.selectCandidate({
     projectId: project.id,
     generationId: generation.id,
     candidateId: 'candidate_1',
   });
-  const repeated = service.selectCandidate({
+  const repeated = await service.selectCandidate({
     projectId: project.id,
     generationId: generation.id,
     candidateId: 'candidate_1',
   });
 
   assert.equal(repeated.id, first.id);
-  assert.throws(
+  await assert.rejects(
     () =>
       service.selectCandidate({
         projectId: project.id,
@@ -187,24 +187,23 @@ test('selecting the same candidate is idempotent but another is rejected', () =>
   );
 });
 
-test('rejects selecting a completed generation after the active revision advanced', () => {
+test('rejects selecting a completed generation after the active revision advanced', async () => {
   const service = createService();
-  const project = createProject(service);
-
-  const first = recordGeneration(service, project, editPatch('ivory coat'), {
+  const project = await createProject(service);
+  const first = await recordGeneration(service, project, editPatch('ivory coat'), {
     turnId: 'turn_1',
   });
-  const second = recordGeneration(service, project, editPatch('wool coat'), {
+  const second = await recordGeneration(service, project, editPatch('wool coat'), {
     turnId: 'turn_2',
   });
 
-  service.selectCandidate({
+  await service.selectCandidate({
     projectId: project.id,
     generationId: first.id,
     candidateId: 'candidate_1',
   });
 
-  assert.throws(
+  await assert.rejects(
     () =>
       service.selectCandidate({
         projectId: project.id,
@@ -215,11 +214,11 @@ test('rejects selecting a completed generation after the active revision advance
   );
 });
 
-test('rejects invalid patches before recording a generation', () => {
+test('rejects invalid patches before recording a generation', async () => {
   const service = createService();
-  const project = createProject(service);
+  const project = await createProject(service);
 
-  assert.throws(
+  await assert.rejects(
     () =>
       service.recordGeneration({
         projectId: project.id,
@@ -239,21 +238,21 @@ test('rejects invalid patches before recording a generation', () => {
   );
 });
 
-test('reports a missing revision as not found', () => {
+test('reports a missing revision as not found', async () => {
   const service = createService();
 
-  const project = createProject(service);
-  service.selectCandidate({
+  const project = await createProject(service);
+  await service.selectCandidate({
     projectId: project.id,
-    generationId: recordGeneration(service, project).id,
+    generationId: (await recordGeneration(service, project)).id,
     candidateId: 'candidate_1',
   });
 
-  assert.throws(
+  await assert.rejects(
     () => service.getRevision('revision_missing'),
     (error) => error.code === 'REVISION_NOT_FOUND',
   );
-  assert.throws(
+  await assert.rejects(
     () =>
       service.recordGeneration({
         projectId: project.id,
@@ -267,10 +266,10 @@ test('reports a missing revision as not found', () => {
   );
 });
 
-test('rejects a project whose initial photo state is invalid', () => {
+test('rejects a project whose initial photo state is invalid', async () => {
   const service = createService();
 
-  assert.throws(
+  await assert.rejects(
     () =>
       service.createProject({
         projectId: 'project_invalid',
@@ -279,4 +278,37 @@ test('rejects a project whose initial photo state is invalid', () => {
       }),
     { code: 'INVALID_STATE_PATCH' },
   );
+});
+
+test('records and reads assets through the same port', async () => {
+  const service = createService();
+
+  const asset = await service.recordAsset({
+    assetId: 'upload_1',
+    uri: 's3://photo-agent/users/dev/uploads/upload_1.png',
+    metadata: { contentType: 'image/png' },
+  });
+
+  assert.deepEqual(asset, {
+    id: 'upload_1',
+    kind: 'source',
+    uri: 's3://photo-agent/users/dev/uploads/upload_1.png',
+    metadata: { contentType: 'image/png' },
+  });
+  assert.deepEqual(await service.getAsset('upload_1'), asset);
+  await assert.rejects(
+    () => service.getAsset('missing'),
+    (error) => error.code === 'ASSET_NOT_FOUND',
+  );
+});
+
+test('lists generations scoped by turn', async () => {
+  const service = createService();
+  const project = await createProject(service);
+  await recordGeneration(service, project, editPatch(), { turnId: 'turn_1' });
+  await recordGeneration(service, project, editPatch(), { turnId: 'turn_2' });
+
+  const scoped = await service.listGenerationsByTurn({ projectId: project.id, turnId: 'turn_1' });
+  assert.equal(scoped.length, 1);
+  assert.equal(scoped[0].turnId, 'turn_1');
 });

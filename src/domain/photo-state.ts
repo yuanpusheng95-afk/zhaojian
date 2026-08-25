@@ -12,12 +12,12 @@ interface PreserveConstraint {
   source: "user";
 }
 
-interface StatePatch {
+export interface StatePatch {
   modify: ModifyInstruction[];
   preserve: PreserveConstraint[];
 }
 
-type PhotoState = Record<string, unknown> & { constraints?: unknown[] };
+export type PhotoState = Record<string, unknown> & { constraints?: unknown[] };
 
 const ALLOWED_MODIFY_PATHS = new Set([
   "subject.identity.preserve",
