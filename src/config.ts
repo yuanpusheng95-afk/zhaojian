@@ -140,6 +140,7 @@ export function loadApiConfig(env: Record<string, string | undefined> = process.
     ...s3Fields,
     SIGNED_URL_TTL_SECONDS: positiveInt("SIGNED_URL_TTL_SECONDS", 900),
     REDIS_URL: z.string().default("redis://127.0.0.1:6379"),
+    JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
     CORS_ORIGIN: z.string().default("*"),
   });
   const parsed = schema.parse(env);
@@ -149,6 +150,7 @@ export function loadApiConfig(env: Record<string, string | undefined> = process.
     s3: s3Output(parsed),
     signedUrlTtlSeconds: parsed.SIGNED_URL_TTL_SECONDS,
     redisUrl: parsed.REDIS_URL,
+    jwtSecret: parsed.JWT_SECRET,
     corsOrigin: parsed.CORS_ORIGIN,
   };
 }

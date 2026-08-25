@@ -541,3 +541,61 @@ test('access policy can deny reads and writes with 404', async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('auth mode: unauthenticated requests get 401 and authenticated ones pass ownership checks', async () => {
+  const { createJwtSessionStore } = await import('../src/infrastructure/auth/jwt-session.js');
+  const { HttpError } = await import('../src/api/http-error.js');
+
+  // 最小 Redis 替身
+  const store = new Map();
+  const redis = {
+    async set(key, value) { store.set(key, value); },
+    async get(key) { return store.get(key) ?? null; },
+    async del(key) { store.delete(key); },
+  };
+  const sessionStore = createJwtSessionStore({
+    jwtSecret: 'api-test-secret-0123456789abcdef',
+    redis,
+    ttlSeconds: 3600,
+  });
+
+  const server = createApiServer({
+    repository: fakeRepository(),
+    queue: fakeQueue(),
+    turnViews: fakeViews({}),
+    assetStorage: { bucket: 'photo-agent', async put() {} },
+    sessionStore,
+    authPool: {}, // auth routes not exercised in this test
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    // 未登录 → 401（不再是回落 dev）
+    const anon = await fetch(`${url}/projects/p1`);
+    assert.equal(anon.status, 401);
+
+    // 登录 user_dev（fakeRepository 里 p1 的 ownerId 是 dev）→ 200
+    const session = await sessionStore.issue('dev');
+    const authed = await fetch(`${url}/projects/p1`, {
+      headers: { cookie: `auth_token=${session.token}` },
+    });
+    assert.equal(authed.status, 200);
+
+    // 登录了别人 → 404 掩盖存在性
+    const otherSession = await sessionStore.issue('mallory');
+    const foreign = await fetch(`${url}/projects/p1`, {
+      headers: { cookie: `auth_token=${otherSession.token}` },
+    });
+    assert.equal(foreign.status, 404);
+
+    // 无效 token → 401
+    const bad = await fetch(`${url}/projects/p1`, {
+      headers: { cookie: 'auth_token=garbage.token.value' },
+    });
+    assert.equal(bad.status, 401);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

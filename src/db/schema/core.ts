@@ -90,3 +90,11 @@ export const agentTelemetrySpans = pgTable("agent_telemetry_spans", {
   index("agent_telemetry_spans_name_created_idx").on(table.name, table.createdAt),
   index("agent_telemetry_spans_turn_idx").on(table.turnId),
 ]);
+
+export const users = pgTable("users", {
+  id: text().primaryKey(),
+  email: text().notNull().unique(),
+  passwordHash: text().notNull(),
+  displayName: text().notNull().default(""),
+  createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+});

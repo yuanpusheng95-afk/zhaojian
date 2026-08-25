@@ -9,6 +9,7 @@ import { createS3AssetStorage } from "../infrastructure/storage/s3-asset-storage
 import { createTurnViews } from "./turn-views.js";
 import { createApp } from "./app.js";
 import { createTurnEventConsumer } from "../infrastructure/redis/turn-events.js";
+import { createJwtSessionStore } from "../infrastructure/auth/jwt-session.js";
 
 const config = loadApiConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });
@@ -23,12 +24,15 @@ const turnViews = createTurnViews({
   signedUrlTtlSeconds: config.signedUrlTtlSeconds,
 });
 const redis = new Redis(config.redisUrl);
+const sessionStore = createJwtSessionStore({ jwtSecret: config.jwtSecret, redis });
 const app = createApp({
   repository,
   queue,
   turnViews,
   assetStorage,
   eventConsumer: createTurnEventConsumer(redis),
+  sessionStore,
+  authPool: pool,
 });
 
 serve({ fetch: app.fetch, port: config.port }, (info) => {

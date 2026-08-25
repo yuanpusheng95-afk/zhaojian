@@ -21,9 +21,11 @@
     "@earendil-works/pi-ai": "0.84.2",
     "@hono/node-server": "^2.1.1",
     "@types/node": "^26.2.0",
+    "bcryptjs": "^3.0.3",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.13.3",
     "ioredis": "^6.0.0",
+    "jose": "^6.2.10",
     "pg": "^8.23.0",
     "zod": "^4.4.3"
   },

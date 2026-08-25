@@ -39,7 +39,7 @@ test('worker config fails fast on every missing credential', () => {
 });
 
 test('api config does not require model credentials', () => {
-  const config = loadApiConfig({ S3_ACCESS_KEY: 'ak', S3_SECRET_KEY: 'sk' });
+  const config = loadApiConfig({ JWT_SECRET: 'x'.repeat(32), S3_ACCESS_KEY: 'ak', S3_SECRET_KEY: 'sk' });
   assert.equal(config.port, 3000);
   assert.equal(config.s3.accessKey, 'ak');
   assert.equal(config.signedUrlTtlSeconds, 900);
@@ -108,10 +108,11 @@ test('image attempt cap defaults to twice the image quota and can be overridden'
 });
 
 test('public signing endpoint defaults to the ops endpoint and can be split for containers', () => {
-  const merged = loadApiConfig({ S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k' });
+  const merged = loadApiConfig({ JWT_SECRET: 'x'.repeat(32), S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k' });
   assert.equal(merged.s3.publicEndpoint, merged.s3.endpoint);
 
   const split = loadApiConfig({
+    JWT_SECRET: 'x'.repeat(32),
     S3_ACCESS_KEY: 'k', S3_SECRET_KEY: 'k',
     S3_ENDPOINT: 'http://minio:9000',
     S3_PUBLIC_ENDPOINT: 'http://127.0.0.1:9000',
