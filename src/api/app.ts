@@ -21,8 +21,8 @@ import type { TurnEventConsumer } from "@/infrastructure/redis/turn-events";
 import type { AssetStorageLike } from "@/infrastructure/storage/asset-storage";
 
 export interface AppDeps {
-  repository: Pick<PhotoProjectRepository, "createProject" | "getProject" | "getGeneration" | "recordAsset" | "selectCandidate">;
-  queue: Pick<AgentTurnQueue, "requestTurn">;
+  repository: Pick<PhotoProjectRepository, "createProject" | "listProjects" | "getProject" | "getGeneration" | "listGenerations" | "recordAsset" | "selectCandidate">;
+  queue: Pick<AgentTurnQueue, "requestTurn" | "listTurns">;
   turnViews: TurnViews;
   assetStorage: Pick<AssetStorageLike, "put" | "bucket">;
   eventConsumer?: Pick<TurnEventConsumer, "readTurnEvent"> | null;
@@ -197,6 +197,10 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
     return c.json(project, 201);
   });
 
+  app.get("/projects", async (c) => {
+    return c.json(await repository.listProjects(currentUserId(c, sessionStore)));
+  });
+
   app.get("/projects/:projectId", async (c) => {
     const project = await repository.getProject(c.req.param("projectId"));
     assertProjectAccess(policy, currentUserId(c, sessionStore), project, "read");
@@ -224,6 +228,13 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
     assertProjectAccess(policy, currentUserId(c, sessionStore), project, "write");
     const result = await queue.requestTurn({ projectId, userMessage: message, idempotencyKey });
     return c.json(result, (result.replayed ? 200 : 202) as never);
+  });
+
+  app.get("/projects/:projectId/turns", async (c) => {
+    const projectId = c.req.param("projectId");
+    const project = await repository.getProject(projectId);
+    assertProjectAccess(policy, currentUserId(c, sessionStore), project, "read");
+    return c.json(await queue.listTurns({ projectId }));
   });
 
   app.get("/projects/:projectId/turns/:turnId", async (c) => {

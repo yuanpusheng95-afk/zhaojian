@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 
-import { and, asc, eq, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, type SQL } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
@@ -351,6 +351,13 @@ export class PostgresPhotoProjectRepository implements PhotoProjectRepository {
       }).where(eq(projects.id, projectId));
       return mapRevision(revision);
     });
+  }
+
+  async listProjects(ownerId: string): Promise<Project[]> {
+    const rows = await this.#db.select().from(projects)
+      .where(eq(projects.ownerId, ownerId))
+      .orderBy(desc(projects.updatedAt), desc(projects.id));
+    return rows.map(mapProject);
   }
 
   async getProject(projectId: string): Promise<Project> {

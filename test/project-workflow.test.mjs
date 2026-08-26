@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   CandidateSelectionError,
-  InMemoryPhotoProjectService,
+  InMemoryPhotoProjectRepository,
   RevisionConflictError,
   RevisionNotFoundError,
 } from '../src/domain/photo-project-service.js';
@@ -31,7 +31,7 @@ function initialState() {
 }
 
 function createService() {
-  return new InMemoryPhotoProjectService({
+  return new InMemoryPhotoProjectRepository({
     idFactory: createIdFactory(),
     now: () => '2026-08-19T14:40:00+08:00',
   });

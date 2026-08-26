@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { and, eq, lte, sql } from "drizzle-orm";
+import { and, desc, eq, lte, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { ErrorCode, ProjectNotFoundError } from "@/domain/errors";
@@ -116,6 +116,19 @@ export function createAgentTurnQueue({ pool, leaseMs = 30_000, eventPublisher }:
         if (!winner || winner.userMessage !== userMessage) throw new IdempotencyConflictError(projectId, idempotencyKey);
         return { turnId: winner.turnId as string, replayed: true };
       });
+    },
+
+    listTurns({ projectId }: { projectId: string }) {
+      return db.select({
+        turnId: agentTurns.id,
+        status: agentTurns.status,
+        userMessage: agentTurns.userMessage,
+        createdAt: agentTurns.createdAt,
+        updatedAt: agentTurns.updatedAt,
+      }).from(agentTurns)
+        .where(eq(agentTurns.projectId, projectId))
+        .orderBy(desc(agentTurns.createdAt), desc(agentTurns.id))
+        .limit(50);
     },
 
     claimNextTurn() {

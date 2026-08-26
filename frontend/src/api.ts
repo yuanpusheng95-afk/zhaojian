@@ -1,4 +1,16 @@
 export type User = { id: string; email: string; displayName: string };
+export type Project = {
+  id: string;
+  name: string;
+  runningTurnId: string | null;
+  updatedAt: string;
+};
+export type TurnSummary = {
+  turnId: string;
+  status: "queued" | "running" | "completed" | "failed" | "aborted";
+  userMessage: string;
+  updatedAt: string;
+};
 
 export type Candidate = { id: string; assetId: string; url: string | null; contentType: string | null };
 export type TurnGeneration = {
@@ -49,14 +61,17 @@ export const api = {
   login: (input: { email: string; password: string }) =>
     request<User>("/auth/login", { method: "POST", body: JSON.stringify(input) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
+
+  projects: () => request<Project[]>("/projects"),
   createProject: (input: { name: string; anchorAsset?: { assetId: string; uri: string; metadata?: unknown } }) =>
-    request<{ id: string; name: string }>("/projects", {
+    request<Project>("/projects", {
       method: "POST",
       body: JSON.stringify({
         initialState: { subject: { identity: { preserve: true } }, constraints: [] },
         ...input,
       }),
     }),
+
   upload: async (file: File) => {
     const response = await fetch("/uploads", {
       method: "POST",
@@ -70,14 +85,15 @@ export const api = {
     }
     return payload as { assetId: string; uri: string; metadata: Record<string, unknown> };
   },
+
   sendMessage: (projectId: string, message: string) =>
     request<{ turnId: string; replayed: boolean }>(`/projects/${projectId}/messages`, {
       method: "POST",
       headers: { "idempotency-key": crypto.randomUUID() },
       body: JSON.stringify({ message }),
     }),
-  turn: (projectId: string, turnId: string) =>
-    request<TurnDetail>(`/projects/${projectId}/turns/${turnId}`),
+  turns: (projectId: string) => request<TurnSummary[]>(`/projects/${projectId}/turns`),
+  turn: (projectId: string, turnId: string) => request<TurnDetail>(`/projects/${projectId}/turns/${turnId}`),
   select: (projectId: string, turnId: string, generationId: string, candidateId: string) =>
     request<{ revisionId: string }>(`/projects/${projectId}/turns/${turnId}/selections`, {
       method: "POST",

@@ -2,7 +2,7 @@
  * Photo project 领域端口：应用层与工具只依赖此接口，不依赖具体存储实现。
  *
  * 两个实现必须保持同一套业务不变量（revision 冲突、候选选择状态机、幂等重选）：
- * - InMemoryPhotoProjectService（domain/photo-project-service.ts）：单测/工具测试替身。
+ * - InMemoryPhotoProjectRepository（domain/photo-project-service.ts）：单测/工具测试替身。
  * - PostgresPhotoProjectRepository（infrastructure/postgres/）：生产实现。
  *
  * SQL 实现允许附加跨表完整性校验（例如 recordGeneration 校验 turn 存在），
@@ -117,6 +117,7 @@ export interface RecordAssetInput {
 
 export interface PhotoProjectRepository {
   createProject(input: CreateProjectInput): Promise<Project>;
+  listProjects(ownerId: string): Promise<Project[]>;
   recordGeneration(input: RecordGenerationInput): Promise<Generation>;
   selectCandidate(input: SelectCandidateInput): Promise<Revision>;
   recordAsset(input: RecordAssetInput): Promise<Asset>;

@@ -7,4 +7,4 @@ export {
   type StatePatch,
 } from "@/domain/photo-state";
 export * from "@/domain/photo-project";
-export * from "@/domain/photo-project-service";
+export { InMemoryPhotoProjectRepository } from "@/domain/photo-project-service";

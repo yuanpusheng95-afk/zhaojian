@@ -55,7 +55,7 @@ interface StoredAsset {
  * PhotoProjectRepository 的内存实现，作为单元测试的替身；
  * 生产实现是 PostgresPhotoProjectRepository，两者共享 photo-project.ts 里的端口契约。
  */
-export class InMemoryPhotoProjectService implements PhotoProjectRepository {
+export class InMemoryPhotoProjectRepository implements PhotoProjectRepository {
   readonly #projects = new Map<string, Project>();
   readonly #revisions = new Map<string, Revision>();
   readonly #generations = new Map<string, Generation>();
@@ -102,6 +102,13 @@ export class InMemoryPhotoProjectService implements PhotoProjectRepository {
     this.#projects.set(id, project);
     this.#revisions.set(revision.id, revision);
     return clone(project);
+  }
+
+  async listProjects(ownerId: string): Promise<Project[]> {
+    return [...this.#projects.values()]
+      .filter((project) => project.ownerId === ownerId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id))
+      .map(clone);
   }
 
   async recordGeneration({ projectId, turnId, baseRevisionId, inputAssetId, patch, renderPrompt = null, outcome }: RecordGenerationInput): Promise<Generation> {

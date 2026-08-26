@@ -1,13 +1,31 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError, type TurnDetail, type User } from "./api";
+import { api, ApiError, type Project, type TurnDetail, type TurnSummary, type User } from "./api";
 
-type Screen = "auth" | "studio";
+type ChatMessage = { id: string; side: "left" | "right"; content: string; time: string };
+
+function timeLabel(iso: string) {
+  return new Date(iso).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+function relativeLabel(iso: string) {
+  const delta = Date.now() - new Date(iso).getTime();
+  if (delta < 60 * 1000) return "刚刚";
+  if (delta < 60 * 60 * 1000) return `${Math.floor(delta / 60000)}分钟前`;
+  if (delta < 24 * 60 * 60 * 1000) return `${Math.floor(delta / 3600000)}小时前`;
+  return `${Math.floor(delta / 86400000)}天前`;
+}
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [project, setProject] = useState<{ id: string; name: string } | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [project, setProject] = useState<Project | null>(null);
+  const [turns, setTurns] = useState<TurnSummary[]>([]);
   const [turn, setTurn] = useState<TurnDetail | null>(null);
+  const [chat, setChat] = useState<ChatMessage[]>([{
+    id: "welcome", side: "left",
+    content: "你好！我是你的 AI 摄影师 📸\n上传一张照片，告诉我想要的风格、场景和氛围，我来帮你生成。",
+    time: timeLabel(new Date().toISOString()),
+  }]);
   const [message, setMessage] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -18,18 +36,54 @@ export default function App() {
     api.me().then(setUser).catch(() => setUser(null)).finally(() => setLoading(false));
   }, []);
 
+  useEffect(() => {
+    if (!user) return;
+    api.projects().then((items) => {
+      setProjects(items);
+      setProject(items[0] ?? null);
+    }).catch(() => setProjects([]));
+  }, [user]);
+
+  useEffect(() => {
+    if (!project) { setTurns([]); setTurn(null); return; }
+    let cancelled = false;
+    api.turns(project.id).then((items) => {
+      if (cancelled) return;
+      setTurns(items);
+      const active = project.runningTurnId ?? items[0]?.turnId;
+      if (active) api.turn(project.id, active).then((detail) => !cancelled && setTurn(detail)).catch(() => undefined);
+    }).catch(() => setTurns([]));
+    return () => { cancelled = true; };
+  }, [project]);
+
   const candidates = useMemo(
-    () => turn?.generations.flatMap((generation) => generation.candidate ? [{ ...generation, candidate: generation.candidate }] : []),
+    () => turn?.generations.flatMap((generation) => generation.candidate ? [{ ...generation, candidate: generation.candidate }] : []) ?? [],
     [turn],
   );
-  const selected = candidates?.find((generation) => generation.selectedCandidateId);
-  const latest = selected ?? candidates?.at(-1);
+  const selected = candidates.find((generation) => generation.selectedCandidateId);
+  const latest = selected ?? candidates.at(-1);
   const isGenerating = turn?.status === "queued" || turn?.status === "running";
+
+  const refreshTurns = useCallback(async (target: Project) => {
+    const [items, activeId] = await Promise.all([
+      api.turns(target.id),
+      Promise.resolve(target.runningTurnId),
+    ]);
+    setTurns(items);
+    const active = activeId ?? items[0]?.turnId;
+    if (active) setTurn(await api.turn(target.id, active));
+  }, []);
 
   const submit = useCallback(async () => {
     if (!message.trim() || busy) return;
     setBusy(true);
     setError("");
+    const now = timeLabel(new Date().toISOString());
+    const sent: ChatMessage = { id: crypto.randomUUID(), side: "right", content: message, time: now };
+    setChat((current) => [...current, sent, {
+      id: `${sent.id}-ack`, side: "left",
+      content: file ? "收到，我会基于这张照片开始拍摄。" : "收到，我马上开始生成。", time: now,
+    }]);
     try {
       let currentProject = project;
       if (!currentProject) {
@@ -43,10 +97,14 @@ export default function App() {
           ...(anchor ? { anchorAsset: anchor } : {}),
         });
         setProject(currentProject);
+        setProjects((current) => [currentProject!, ...current]);
       }
       const created = await api.sendMessage(currentProject.id, message);
       setTurn(await api.turn(currentProject.id, created.turnId));
       setMessage("");
+      setFile(null);
+      setPreviewUrl(null);
+      setProjects(await api.projects());
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "操作失败，请重试");
     } finally {
@@ -60,7 +118,13 @@ export default function App() {
     source.addEventListener("turn", (event) => {
       setTurn(JSON.parse((event as MessageEvent).data));
     });
-    source.addEventListener("done", () => source.close());
+    source.addEventListener("done", () => {
+      setChat((current) => [...current, {
+        id: crypto.randomUUID(), side: "left",
+        content: "照片已经生成好了，你可以继续告诉我要怎么调整。", time: timeLabel(new Date().toISOString()),
+      }]);
+      source.close();
+    });
     source.addEventListener("error", () => source.close());
     return () => source.close();
   }, [isGenerating, project, turn]);
@@ -74,10 +138,7 @@ export default function App() {
   if (loading) {
     return <div className="grid min-h-screen place-items-center text-sm text-slate-500">加载中…</div>;
   }
-
-  if (!user) {
-    return <AuthScreen onAuthenticated={setUser} />;
-  }
+  if (!user) return <AuthScreen onAuthenticated={setUser} />;
 
   return (
     <div className="min-h-screen">
@@ -97,9 +158,7 @@ export default function App() {
               <Avatar name={user.displayName || user.email} />
               <span className="max-w-32 truncate text-sm">{user.displayName || user.email}</span>
             </div>
-            <button className="text-sm text-slate-500 hover:text-slate-800" onClick={async () => { await api.logout(); setUser(null); }}>
-              退出
-            </button>
+            <button className="text-sm text-slate-500 hover:text-slate-800" onClick={async () => { await api.logout(); setUser(null); }}>退出</button>
           </div>
         </div>
       </header>
@@ -108,14 +167,55 @@ export default function App() {
         <aside className="space-y-4">
           <button
             className="w-full rounded-2xl bg-gradient-to-r from-violet-500 to-indigo-500 py-3 font-medium text-white shadow-lg shadow-violet-500/20"
-            onClick={() => { setProject(null); setTurn(null); setMessage(""); setFile(null); setPreviewUrl(null); }}
-          >
-            ＋ 新建项目
-          </button>
-          <div className="rounded-2xl border border-slate-200 bg-white p-4">
-            <div className="text-sm font-semibold">当前项目</div>
-            <div className="mt-2 text-sm text-slate-600">{project?.name ?? "尚未创建"}</div>
+            onClick={() => { setProject(null); setTurn(null); setTurns([]); setMessage(""); setFile(null); setPreviewUrl(null); setChat([{
+              id: "welcome", side: "left",
+              content: "开始一个新项目吧！上传照片并告诉我你想要的风格。", time: timeLabel(new Date().toISOString()),
+            }]); }}
+          >＋ 新建项目</button>
+
+          <div className="rounded-2xl border border-slate-200 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+              <span className="text-sm font-semibold">对话历史</span>
+              <span className="text-xs text-slate-400">{project ? `${turns.length} 条` : ""}</span>
+            </div>
+            <div className="max-h-72 space-y-1 overflow-y-auto p-2">
+              {turns.map((item) => (
+                <button
+                  key={item.turnId}
+                  className={`w-full rounded-xl px-3 py-2 text-left ${turn?.turnId === item.turnId ? "bg-violet-50 text-violet-700" : "hover:bg-slate-50"}`}
+                  onClick={async () => setTurn(await api.turn(project!.id, item.turnId))}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm">{item.userMessage}</span>
+                    {item.status !== "completed" && <StatusDot status={item.status} />}
+                  </div>
+                  <div className="text-xs text-slate-400">{relativeLabel(item.updatedAt)}</div>
+                </button>
+              ))}
+              {turns.length === 0 && <div className="px-3 py-6 text-center text-xs text-slate-400">暂无对话</div>}
+            </div>
           </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold">我的项目</span>
+              <span className="text-xs text-slate-400">{projects.length}</span>
+            </div>
+            <div className="mt-3 space-y-1">
+              {projects.map((item) => (
+                <button
+                  key={item.id}
+                  className={`w-full rounded-xl px-3 py-2 text-left ${project?.id === item.id ? "bg-violet-50 text-violet-700" : "hover:bg-slate-50"}`}
+                  onClick={() => setProject(item)}
+                >
+                  <div className="truncate text-sm">{item.name}</div>
+                  <div className="text-xs text-slate-400">{relativeLabel(item.updatedAt)}{item.runningTurnId ? " · 生成中" : ""}</div>
+                </button>
+              ))}
+              {projects.length === 0 && <div className="py-6 text-center text-xs text-slate-400">还没有项目</div>}
+            </div>
+          </div>
+
           <label className="block rounded-2xl border border-dashed border-slate-300 bg-white p-4 text-center text-sm text-slate-600">
             上传基准照片
             <input
@@ -137,7 +237,7 @@ export default function App() {
             <h1 className="flex items-center gap-2 text-lg font-semibold">
               {isGenerating ? <>正在生成 <Spinner /></> : turn?.status === "failed" ? "生成失败" : "生成结果"}
             </h1>
-            <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">版本 1/1</span>
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">{project?.name ?? "未命名项目"}</span>
           </div>
           <p className="mt-1 text-sm text-slate-500">{turn?.userMessage ?? "描述你想要的照片风格和场景"}</p>
 
@@ -147,7 +247,7 @@ export default function App() {
               : <div className="grid aspect-[4/3] place-items-center rounded-2xl bg-slate-100 text-sm text-slate-500">{isGenerating ? "AI 正在拍摄…" : "暂无照片"}</div>}
           </div>
 
-          {candidates && candidates.length > 1 && (
+          {candidates.length > 1 && (
             <div className="mt-4 grid grid-cols-3 gap-3">
               {candidates.map(({ generationId, candidate, selectedCandidateId }) => (
                 <button key={generationId} onClick={() => select(generationId, candidate.id)}>
@@ -165,20 +265,12 @@ export default function App() {
             <div className="mt-5 grid grid-cols-3 gap-3">
               <ActionChip icon="👍" label={latest.selectedCandidateId ? "已选择" : "满意，继续下一步"} />
               <ActionChip icon="🎛" label="微调编辑" />
-              <ActionChip icon="↻" label="重新生成" onClick={() => { setMessage(turn?.userMessage ?? ""); }} />
+              <ActionChip icon="↻" label="重新生成" onClick={() => setMessage(turn?.userMessage ?? "")} />
             </div>
           )}
         </section>
 
-        <ChatPanel
-          message={message}
-          onMessage={setMessage}
-          onSubmit={submit}
-          busy={busy}
-          turn={turn}
-          error={error}
-          onQuickAction={(value) => setMessage(value)}
-        />
+        <ChatPanel chat={chat} message={message} onMessage={setMessage} onSubmit={submit} busy={busy} error={error} onQuickAction={(value) => setMessage(value)} />
       </main>
     </div>
   );
@@ -232,28 +324,19 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: User) => void
   );
 }
 
-function ChatPanel({ message, onMessage, onSubmit, busy, turn, error, onQuickAction }: {
-  message: string; onMessage: (value: string) => void; onSubmit: () => void; busy: boolean;
-  turn: TurnDetail | null; error: string; onQuickAction: (value: string) => void;
+function ChatPanel({ chat, message, onMessage, onSubmit, busy, error, onQuickAction }: {
+  chat: ChatMessage[]; message: string; onMessage: (value: string) => void; onSubmit: () => void; busy: boolean;
+  error: string; onQuickAction: (value: string) => void;
 }) {
   return (
     <aside className="flex max-h-[calc(100vh-108px)] flex-col rounded-3xl border border-slate-200 bg-white shadow-sm">
       <div className="flex items-center justify-between border-b border-slate-100 p-5">
-        <div className="flex items-center gap-2 font-semibold">AI 摄影师 <span className="rounded-md bg-violet-100 px-2 py-.5 text-xs text-violet-700">PRO</span></div>
+        <div className="flex items-center gap-2 font-semibold">AI 摄影师 <span className="rounded-md bg-violet-100 px-2 py-0.5 text-xs text-violet-700">PRO</span></div>
         <button className="text-sm text-slate-500">清空对话</button>
       </div>
       <div className="flex-1 space-y-4 overflow-y-auto p-5">
-        <Bubble side="left">
-          你好！我是你的 AI 摄影师 📸
-          <br />上传一张照片，告诉我想要的风格、场景和氛围，我来帮你生成。
-        </Bubble>
-        {turn && <>
-          <Bubble side="right">{turn.userMessage}</Bubble>
-          <Bubble side="left">
-            {turn.status === "queued" || turn.status === "running" ? "正在为你拍摄…" : turn.status === "failed" ? "这次拍摄失败了，请换个描述试试。" : "这是生成的照片，你可以继续告诉我要怎么调整。"}
-          </Bubble>
-        </>}
-        {error && <Bubble side="left">{error}</Bubble>}
+        {chat.map((item) => <Bubble key={item.id} side={item.side} time={item.time}>{item.content}</Bubble>)}
+        {error && <Bubble side="left" time={timeLabel(new Date().toISOString())}>{error}</Bubble>}
       </div>
       <div className="border-t border-slate-100 p-4">
         <div className="mb-3 flex flex-wrap gap-2">
@@ -275,10 +358,13 @@ function ChatPanel({ message, onMessage, onSubmit, busy, turn, error, onQuickAct
   );
 }
 
-function Bubble({ side, children }: { side: "left" | "right"; children: React.ReactNode }) {
+function Bubble({ side, time, children }: { side: "left" | "right"; time: string; children: React.ReactNode }) {
   return (
     <div className={side === "right" ? "flex justify-end" : "flex justify-start"}>
-      <div className={`max-w-[82%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm ${side === "right" ? "bg-gradient-to-r from-violet-500 to-indigo-500 text-white" : "bg-slate-100 text-slate-800"}`}>{children}</div>
+      <div className={`max-w-[82%] rounded-2xl px-4 py-3 text-sm ${side === "right" ? "bg-gradient-to-r from-violet-500 to-indigo-500 text-white" : "bg-slate-100 text-slate-800"}`}>
+        <div className="whitespace-pre-wrap">{children}</div>
+        <div className={`mt-1 text-[10px] ${side === "right" ? "text-white/70" : "text-slate-400"}`}>{time}</div>
+      </div>
     </div>
   );
 }
@@ -304,6 +390,11 @@ function ActionChip({ icon, label, onClick }: { icon: string; label: string; onC
       <span className="mr-1">{icon}</span>{label}
     </button>
   );
+}
+
+function StatusDot({ status }: { status: TurnSummary["status"] }) {
+  const color = status === "failed" || status === "aborted" ? "bg-rose-500" : "bg-amber-500";
+  return <span className={`size-2 shrink-0 rounded-full ${color}`} />;
 }
 
 function Spinner() {

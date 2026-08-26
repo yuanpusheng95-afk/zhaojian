@@ -694,3 +694,33 @@ test('api key auth: Bearer zj_ token grants the owner access without a cookie', 
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('project turn history is scoped and newest first', async () => {
+  const repository = {
+    ...fakeRepository(),
+    async listGenerations(projectId) {
+      assert.equal(projectId, 'p1');
+      return [{ id: 'g1', status: 'completed', candidates: [] }];
+    },
+  };
+  const queue = {
+    ...fakeQueue(),
+    async listTurns({ projectId }) {
+      assert.equal(projectId, 'p1');
+      return [
+        { turnId: 'turn_new', status: 'running', userMessage: 'newest', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:02:00Z' },
+        { turnId: 'turn_old', status: 'completed', userMessage: 'oldest', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:01:00Z' },
+      ];
+    },
+  };
+  const { server, url } = await startServer({ repository, queue, turnViews: fakeViews({}) });
+  const response = await fetch(`${url}/projects/p1/turns`, { headers: { 'x-user-id': 'dev' } });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.length, 2);
+  assert.equal(body[0].turnId, 'turn_new');
+  assert.equal(body[0].status, 'running');
+  assert.equal(body[0].userMessage, 'newest');
+  assert.equal(body[0].updatedAt, '2026-01-01T00:02:00Z');
+  server.close();
+});

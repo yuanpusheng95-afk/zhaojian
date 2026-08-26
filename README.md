@@ -101,6 +101,7 @@ GET  /health
 
 # Agent turns
 POST /projects/:projectId/messages                  # Idempotency-Key 必填；202 新建 / 200 重放 / 409 冲突或忙碌
+GET  /projects/:projectId/turns                     # 项目轮次历史（最新在前，最多 50 条）
 GET  /projects/:projectId/turns/:turnId             # 轮次详情，completed generation 带签名候选图
 POST /projects/:projectId/turns/:turnId/selections  # 手动选图，成功返回 { revisionId }
 GET  /projects/:projectId/turns/:turnId/events      # SSE：turn + done + error
