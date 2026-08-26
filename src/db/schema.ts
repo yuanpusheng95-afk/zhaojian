@@ -1,2 +1,2 @@
-export * from "./schema/core.js";
-export * from "./schema/session.js";
+export * from "@/db/schema/core";
+export * from "@/db/schema/session";

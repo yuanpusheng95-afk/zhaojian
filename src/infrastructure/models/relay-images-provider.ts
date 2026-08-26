@@ -8,7 +8,7 @@ import type {
   ImageGenerationFailure,
   ImageGenerationProvider,
   ImageGenerationResult,
-} from "./image-provider.js";
+} from "@/infrastructure/models/image-provider";
 
 const API_ID = "relay-openai-images";
 const DEFAULT_MIME = "image/png";

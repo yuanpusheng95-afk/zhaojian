@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import type { SpanOptions, TelemetryContext, TelemetrySpan } from "./stdout-telemetry.js";
+import type { SpanOptions, TelemetryContext, TelemetrySpan } from "@/infrastructure/telemetry/stdout-telemetry";
 
 export function createPgTelemetry({ pool, now = () => Date.now() }: {
   pool: Pool; now?: () => number;

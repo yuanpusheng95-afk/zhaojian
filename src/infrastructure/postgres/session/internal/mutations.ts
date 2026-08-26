@@ -9,19 +9,19 @@ import {
   agentSessionRecords,
   agentSessions,
   agentSessionSequences,
-} from '../../../../db/schema/session.js';
-import { assertJsonSerializable } from './mappers.js';
-import { sessionError } from '../errors.js';
+} from '@/db/schema/session.js';
+import { assertJsonSerializable } from '@/infrastructure/postgres/session/internal/mappers.js';
+import { sessionError } from '@/infrastructure/postgres/session/errors.js';
 import type { LaneRecord } from '@earendil-works/pi-agent-core';
-import type { SessionClient } from '../types.js';
-import type { NewSessionRecord, ProvisionedSessionEntry, SessionEntry, SessionRecord } from '../types.js';
+import type { SessionClient } from '@/infrastructure/postgres/session/types.js';
+import type { NewSessionRecord, ProvisionedSessionEntry, SessionEntry, SessionRecord } from '@/infrastructure/postgres/session/types.js';
 import {
   findOpenOperations,
   nextSequence,
   readLaneLeaf,
   requireLane,
   validateTarget,
-} from './queries.js';
+} from '@/infrastructure/postgres/session/internal/queries.js';
 
 export type ProvisionedEntry = ProvisionedSessionEntry;
 

@@ -2,10 +2,10 @@ import { Session, uuidv7 } from '@earendil-works/pi-agent-core';
 import { and, desc, eq } from 'drizzle-orm';
 import type { Pool } from 'pg';
 
-import { agentSessionEntries, agentSessions } from '../../../db/schema/session.js';
-import { isUniqueViolation, sessionError } from './errors.js';
-import { toEntry, toSessionRow } from './internal/mappers.js';
-import { createPostgresSessionStorage } from './storage.js';
+import { agentSessionEntries, agentSessions } from '@/db/schema/session.js';
+import { isUniqueViolation, sessionError } from '@/infrastructure/postgres/session/errors.js';
+import { toEntry, toSessionRow } from '@/infrastructure/postgres/session/internal/mappers.js';
+import { createPostgresSessionStorage } from '@/infrastructure/postgres/session/storage.js';
 import {
   createSessionDatabase,
   type SessionClient,
@@ -18,9 +18,9 @@ import {
   type SessionRecord,
   type SessionRecordQuery,
   type SessionRow,
-} from './types.js';
-import * as queries from './internal/queries.js';
-import * as mutations from './internal/mutations.js';
+} from '@/infrastructure/postgres/session/types.js';
+import * as queries from '@/infrastructure/postgres/session/internal/queries.js';
+import * as mutations from '@/infrastructure/postgres/session/internal/mutations.js';
 
 const DEFAULT_LANE = 'main';
 

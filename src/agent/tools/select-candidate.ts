@@ -1,8 +1,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { TSchema } from "typebox";
 
-import type { PhotoProjectRepository } from "../../domain/photo-project.js";
-import type { TurnContext } from "./turn-context.js";
+import type { PhotoProjectRepository } from "@/domain/photo-project";
+import type { TurnContext } from "@/agent/tools/turn-context";
 
 export interface SelectCandidateParams {
   generationId: string;

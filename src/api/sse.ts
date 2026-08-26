@@ -1,5 +1,5 @@
 import { ErrorCode } from "@/domain/errors";
-import type { TurnViews } from "./turn-views.js";
+import type { TurnViews } from "@/api/turn-views";
 
 export const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "aborted"]);
 

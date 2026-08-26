@@ -2,12 +2,12 @@ import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { Pool } from "pg";
 
-import { ErrorCode } from "../../domain/errors.js";
-import { HttpError } from "../../api/http-error.js";
-import { hashPassword, verifyPassword } from "./password.js";
-import { AuthError, type JwtSessionStore } from "./jwt-session.js";
-import { createUserRepository, type UserRepository } from "./user-repository.js";
-import { createApiKeyStore, type ApiKeyStore } from "./api-keys.js";
+import { ErrorCode } from "@/domain/errors";
+import { HttpError } from "@/api/http-error";
+import { hashPassword, verifyPassword } from "@/infrastructure/auth/password";
+import { AuthError, type JwtSessionStore } from "@/infrastructure/auth/jwt-session";
+import { createUserRepository, type UserRepository } from "@/infrastructure/auth/user-repository";
+import { createApiKeyStore, type ApiKeyStore } from "@/infrastructure/auth/api-keys";
 
 const RegisterSchema = z.object({
   email: z.string().email(),

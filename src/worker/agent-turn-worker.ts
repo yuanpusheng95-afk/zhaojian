@@ -1,6 +1,6 @@
-import { ErrorCode } from "../domain/errors.js";
-import type { AgentTurnQueue } from "../infrastructure/postgres/agent-turn-queue.js";
-import type { AgentTurnResult } from "../agent/agent-runner.js";
+import { ErrorCode } from "@/domain/errors";
+import type { AgentTurnQueue } from "@/infrastructure/postgres/agent-turn-queue";
+import type { AgentTurnResult } from "@/agent/agent-runner";
 
 export interface WorkerConfig {
   heartbeatMs: number;

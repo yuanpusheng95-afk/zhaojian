@@ -8,8 +8,8 @@ import type {
   SessionLanePointer,
   SessionRecord,
   SessionRecordRow,
-} from '../types.js';
-import { sessionError } from '../errors.js';
+} from '@/infrastructure/postgres/session/types.js';
+import { sessionError } from '@/infrastructure/postgres/session/errors.js';
 
 export async function queryRows(client: SessionClient, statement: SQL): Promise<Record<string, unknown>[]> {
   const result = await client.execute(statement);

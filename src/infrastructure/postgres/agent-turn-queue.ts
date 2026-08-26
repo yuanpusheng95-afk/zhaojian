@@ -3,10 +3,10 @@ import type { Pool } from "pg";
 import { and, eq, lte, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
-import { ErrorCode, ProjectNotFoundError } from "../../domain/errors.js";
-import type { TurnEventPublisher } from "../redis/turn-events.js";
-import * as schema from "../../db/schema.js";
-import { agentTurns, projects } from "../../db/schema.js";
+import { ErrorCode, ProjectNotFoundError } from "@/domain/errors";
+import type { TurnEventPublisher } from "@/infrastructure/redis/turn-events";
+import * as schema from "@/db/schema";
+import { agentTurns, projects } from "@/db/schema";
 
 export class IdempotencyConflictError extends Error {
   code = ErrorCode.IDEMPOTENCY_CONFLICT;

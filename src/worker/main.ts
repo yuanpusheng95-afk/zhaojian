@@ -1,20 +1,20 @@
 import pg from "pg";
 import Redis from "ioredis";
 
-import { runAgentTurn } from "../agent/agent-runner.js";
-import { createAgentTools, createTurnContext } from "../agent/tools/index.js";
-import { loadWorkerConfig } from "../config.js";
-import { createAgentTurnQueue } from "../infrastructure/postgres/agent-turn-queue.js";
-import { PostgresPhotoProjectRepository } from "../infrastructure/postgres/photo-project-repository.js";
-import { createLlmModels } from "../infrastructure/models/llm-provider.js";
-import { createRelayImageProvider } from "../infrastructure/models/relay-images-provider.js";
-import { createS3AssetStorage } from "../infrastructure/storage/s3-asset-storage.js";
-import { createPostgresSessionRepo } from "../infrastructure/postgres/session/repo.js";
-import { createStdoutTelemetry, createNoopTelemetry } from "../infrastructure/telemetry/stdout-telemetry.js";
-import { createPgTelemetry, createTeeTelemetry } from "../infrastructure/telemetry/pg-telemetry.js";
-import { instrumentStreamFn } from "../infrastructure/telemetry/stream-fn.js";
-import { AgentTurnWorker, type ClaimedTurn } from "./agent-turn-worker.js";
-import { createTurnEventPublisher } from "../infrastructure/redis/turn-events.js";
+import { runAgentTurn } from "@/agent/agent-runner";
+import { createAgentTools, createTurnContext } from "@/agent/tools/index";
+import { loadWorkerConfig } from "@/config";
+import { createAgentTurnQueue } from "@/infrastructure/postgres/agent-turn-queue";
+import { PostgresPhotoProjectRepository } from "@/infrastructure/postgres/photo-project-repository";
+import { createLlmModels } from "@/infrastructure/models/llm-provider";
+import { createRelayImageProvider } from "@/infrastructure/models/relay-images-provider";
+import { createS3AssetStorage } from "@/infrastructure/storage/s3-asset-storage";
+import { createPostgresSessionRepo } from "@/infrastructure/postgres/session/repo";
+import { createStdoutTelemetry, createNoopTelemetry } from "@/infrastructure/telemetry/stdout-telemetry";
+import { createPgTelemetry, createTeeTelemetry } from "@/infrastructure/telemetry/pg-telemetry";
+import { instrumentStreamFn } from "@/infrastructure/telemetry/stream-fn";
+import { AgentTurnWorker, type ClaimedTurn } from "@/worker/agent-turn-worker";
+import { createTurnEventPublisher } from "@/infrastructure/redis/turn-events";
 
 const config = loadWorkerConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });

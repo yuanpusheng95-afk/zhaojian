@@ -2,11 +2,11 @@ import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import type { Pool } from "pg";
 
-import * as schema from "../db/schema.js";
-import { agentTurns, generations } from "../db/schema.js";
-import { TurnNotFoundError } from "../domain/photo-project-service.js";
-import type { Candidate, PhotoProjectRepository } from "../domain/photo-project.js";
-import { resolveAssetStorageKey } from "../infrastructure/storage/asset-storage.js";
+import * as schema from "@/db/schema";
+import { agentTurns, generations } from "@/db/schema";
+import { TurnNotFoundError } from "@/domain/photo-project-service";
+import type { Candidate, PhotoProjectRepository } from "@/domain/photo-project";
+import { resolveAssetStorageKey } from "@/infrastructure/storage/asset-storage";
 
 type TurnViewsRepository = Pick<PhotoProjectRepository, "listGenerationsByTurn" | "getAsset">;
 type TurnViewsAssetStorage = {

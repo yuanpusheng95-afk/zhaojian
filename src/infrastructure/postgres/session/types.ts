@@ -1,7 +1,7 @@
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { Pool } from "pg";
 
-import * as schema from "../../../db/schema/session.js";
+import * as schema from "@/db/schema/session";
 import type {
   BranchBounds,
   Entry,

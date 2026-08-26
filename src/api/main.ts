@@ -2,14 +2,14 @@ import pg from "pg";
 import Redis from "ioredis";
 import { serve } from "@hono/node-server";
 
-import { loadApiConfig } from "../config.js";
-import { PostgresPhotoProjectRepository } from "../infrastructure/postgres/photo-project-repository.js";
-import { createAgentTurnQueue } from "../infrastructure/postgres/agent-turn-queue.js";
-import { createS3AssetStorage } from "../infrastructure/storage/s3-asset-storage.js";
-import { createTurnViews } from "./turn-views.js";
-import { createApp } from "./app.js";
-import { createTurnEventConsumer } from "../infrastructure/redis/turn-events.js";
-import { createJwtSessionStore } from "../infrastructure/auth/jwt-session.js";
+import { loadApiConfig } from "@/config";
+import { PostgresPhotoProjectRepository } from "@/infrastructure/postgres/photo-project-repository";
+import { createAgentTurnQueue } from "@/infrastructure/postgres/agent-turn-queue";
+import { createS3AssetStorage } from "@/infrastructure/storage/s3-asset-storage";
+import { createTurnViews } from "@/api/turn-views";
+import { createApp } from "@/api/app";
+import { createTurnEventConsumer } from "@/infrastructure/redis/turn-events";
+import { createJwtSessionStore } from "@/infrastructure/auth/jwt-session";
 
 const config = loadApiConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });

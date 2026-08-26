@@ -13,9 +13,9 @@ import {
   RevisionConflictError,
   RevisionNotFoundError,
   TurnNotFoundError,
-} from "../../domain/photo-project-service.js";
-import { SELECTABLE_GENERATION_STATUSES } from "../../domain/generation-lifecycle.js";
-import { applyPhotoStatePatch, type PhotoState as ValidatedPhotoState, type StatePatch } from "../../domain/photo-state.js";
+} from "@/domain/photo-project-service";
+import { SELECTABLE_GENERATION_STATUSES } from "@/domain/generation-lifecycle";
+import { applyPhotoStatePatch, type PhotoState as ValidatedPhotoState, type StatePatch } from "@/domain/photo-state";
 import type {
   Asset,
   Candidate,
@@ -28,8 +28,8 @@ import type {
   RecordGenerationInput,
   Revision,
   SelectCandidateInput,
-} from "../../domain/photo-project.js";
-import * as schema from "../../db/schema.js";
+} from "@/domain/photo-project";
+import * as schema from "@/db/schema";
 import {
   agentTurns,
   assets,
@@ -37,7 +37,7 @@ import {
   generations,
   photoRevisions,
   projects,
-} from "../../db/schema.js";
+} from "@/db/schema";
 
 type Database = NodePgDatabase<typeof schema>;
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];

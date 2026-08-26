@@ -2,9 +2,9 @@ import { Agent, buildSessionContext } from "@earendil-works/pi-agent-core";
 import type { AgentEvent, Entry, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { AgentState, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
-import { createNoopTelemetry } from "../infrastructure/telemetry/stdout-telemetry.js";
-import type { TelemetryContext } from "../infrastructure/telemetry/stdout-telemetry.js";
-import { SYSTEM_PROMPT } from "./system-prompt.js";
+import { createNoopTelemetry } from "@/infrastructure/telemetry/stdout-telemetry";
+import type { TelemetryContext } from "@/infrastructure/telemetry/stdout-telemetry";
+import { SYSTEM_PROMPT } from "@/agent/system-prompt";
 type ToolDetails = import("./tools/index.js").GenerateImageDetails | import("./tools/index.js").ReadPhotoStateDetails | import("./tools/index.js").SelectCandidateDetails;
 type ProjectAgentTool = import("@earendil-works/pi-agent-core").AgentTool<import("typebox").TSchema, ToolDetails>;
 

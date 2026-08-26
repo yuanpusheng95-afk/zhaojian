@@ -1,7 +1,7 @@
 import type { Server } from "node:http";
 import http from "node:http";
 
-import { createApp, type AppDeps } from "./app.js";
+import { createApp, type AppDeps } from "@/api/app";
 
 export function createApiServer(dependencies: AppDeps): Server {
   const app = createApp({ ...dependencies, logger: dependencies.logger ?? console });

@@ -1,7 +1,7 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 
-import type { TelemetryContext } from "./stdout-telemetry.js";
+import type { TelemetryContext } from "@/infrastructure/telemetry/stdout-telemetry";
 
 export const RETRYABLE_STREAM_ERROR = /429|rate.?limit|timeout|econn|reset|5\d{2}|temporar|overload/i;
 

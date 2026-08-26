@@ -8,7 +8,7 @@ import {
   agentSessionRecords,
   agentSessionSequences,
   agentSessions,
-} from '../../../../db/schema/session.js';
+} from '@/db/schema/session.js';
 import {
   assertValidCursor,
   assertValidLimit,
@@ -17,8 +17,8 @@ import {
   toEntry,
   toLanePointer,
   toRecord,
-} from './mappers.js';
-import { sessionError } from '../errors.js';
+} from '@/infrastructure/postgres/session/internal/mappers.js';
+import { sessionError } from '@/infrastructure/postgres/session/errors.js';
 import type {
   SessionClient,
   SessionEntry,
@@ -30,7 +30,7 @@ import type {
   SessionRecord,
   SessionRecordQuery,
   SessionRow,
-} from '../types.js';
+} from '@/infrastructure/postgres/session/types.js';
 
 export async function requireSession(client: SessionClient, id: string): Promise<SessionRow | undefined> {
   const rows = await client.select().from(agentSessions).where(eq(agentSessions.id, id));

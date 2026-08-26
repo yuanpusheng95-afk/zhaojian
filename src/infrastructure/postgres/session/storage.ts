@@ -1,13 +1,13 @@
 import type { SessionMetadata, SessionStorage as CoreSessionStorage } from '@earendil-works/pi-agent-core';
-import type { PostgresSessionRepo } from './repo.js';
+import type { PostgresSessionRepo } from '@/infrastructure/postgres/session/repo.js';
 import type {
   NewSessionRecord,
   ProvisionedSessionEntry,
   SessionBranchQuery,
   SessionEntryQuery,
   SessionRecordQuery,
-} from './types.js';
-import { isUniqueViolation, sessionError } from './errors.js';
+} from '@/infrastructure/postgres/session/types.js';
+import { isUniqueViolation, sessionError } from '@/infrastructure/postgres/session/errors.js';
 
 function translate(error: unknown) {
   if ((error as { name?: unknown })?.name === 'SessionError') return error;

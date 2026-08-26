@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
-import { SELECTABLE_GENERATION_STATUSES } from "./generation-lifecycle.js";
-import { applyPhotoStatePatch, type StatePatch } from "./photo-state.js";
+import { SELECTABLE_GENERATION_STATUSES } from "@/domain/generation-lifecycle";
+import { applyPhotoStatePatch, type StatePatch } from "@/domain/photo-state";
 import type {
   Asset,
   AssetDescriptor,
@@ -15,7 +15,7 @@ import type {
   RecordGenerationInput,
   Revision,
   SelectCandidateInput,
-} from "./photo-project.js";
+} from "@/domain/photo-project";
 
 import {
   AssetNotFoundError,
@@ -26,7 +26,7 @@ import {
   ProjectNotFoundError,
   RevisionConflictError,
   RevisionNotFoundError,
-} from "./errors.js";
+} from "@/domain/errors";
 
 export {
   AssetNotFoundError,
@@ -38,7 +38,7 @@ export {
   RevisionConflictError,
   RevisionNotFoundError,
   TurnNotFoundError,
-} from "./errors.js";
+} from "@/domain/errors";
 
 function clone<T>(value: T): T {
   return structuredClone(value);

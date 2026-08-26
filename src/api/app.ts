@@ -7,15 +7,14 @@ import type { Pool } from "pg";
 import { z } from "zod";
 
 import { ERROR_STATUS } from "@/domain/errors";
-import { AllowAllAccessPolicy, type AccessPolicy, type AccessAction } from "./access-policy.js";
-import { OwnerOnlyAccessPolicy } from "./owner-only-policy.js";
+import { AllowAllAccessPolicy, OwnerOnlyAccessPolicy, type AccessPolicy, type AccessAction } from "@/api/access-policy";
 import { AuthError, type JwtSessionStore } from "@/infrastructure/auth/jwt-session";
 import { createAuthRoutes } from "@/infrastructure/auth/routes";
 import { createApiKeyStore, API_KEY_PREFIX } from "@/infrastructure/auth/api-keys";
-import { HttpError } from "./http-error.js";
+import { HttpError } from "@/api/http-error";
 
-import { createTurnEventStream, parsePollMs } from "./sse.js";
-import type { TurnViews } from "./turn-views.js";
+import { createTurnEventStream, parsePollMs } from "@/api/sse";
+import type { TurnViews } from "@/api/turn-views";
 import type { PhotoProjectRepository } from "@/domain";
 import type { AgentTurnQueue } from "@/infrastructure/postgres/agent-turn-queue";
 import type { TurnEventConsumer } from "@/infrastructure/redis/turn-events";
@@ -43,8 +42,8 @@ const MessageSchema = z.object({ message: z.string().min(1) });
 const USER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
 /**
- * V1 没有登录体系：请求头携带用户标识，缺省回落 dev。
- * 这是身份提示而非鉴权——真正的访问控制要等认证落地后再加。
+ * 测试模式（无 sessionStore）：请求头携带用户标识，缺省回落 dev。
+ * 这是身份提示而非鉴权；生产组合根必须注入 sessionStore。
  */
 function legacyUserId(headerValue: string | undefined): string {
   const userId = (headerValue ?? "").trim();
@@ -60,8 +59,8 @@ function legacyUserId(headerValue: string | undefined): string {
 }
 
 /**
- * 认证模式：身份必须来自 JWT cookie，缺失即 401。
- * 匿名模式（无 sessionStore）：回落 x-user-id / dev，仅用于测试与本地调试。
+ * 认证模式：身份必须来自 JWT cookie / API key，缺失即 401。
+ * 测试模式（无 sessionStore）：回落 x-user-id / dev。
  */
 function currentUserId(c: { get(key: "userId"): string | undefined; req: { header(name: string): string | undefined } }, sessionStore?: JwtSessionStore): string {
   if (sessionStore) {
@@ -113,7 +112,7 @@ function errorResponse(error: unknown) {
 
 export function createApp({ repository, queue, turnViews, assetStorage, eventConsumer = null, accessPolicy, sessionStore, authPool, apiKeyStore, logger = console }: AppDeps) {
   const app = new Hono();
-  // 认证开启时强制归属校验；未开启（测试/本地）保持放行
+  // 认证开启时强制归属校验；未开启（测试替身）显式放行
   const policy = accessPolicy ?? (sessionStore ? new OwnerOnlyAccessPolicy() : new AllowAllAccessPolicy());
 
   app.use("*", cors());

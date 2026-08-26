@@ -1,21 +1,21 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { TSchema } from "typebox";
 
-import { AssetNotFoundError } from "../../domain/photo-project-service.js";
-import { ErrorCode } from "../../domain/errors.js";
-import type { PhotoProjectRepository } from "../../domain/photo-project.js";
-import { applyPhotoStatePatch, type StatePatch } from "../../domain/photo-state.js";
-import type { ImageGenerationProvider } from "../../infrastructure/models/image-provider.js";
-import { createNoopTelemetry } from "../../infrastructure/telemetry/stdout-telemetry.js";
-import type { TelemetryContext } from "../../infrastructure/telemetry/stdout-telemetry.js";
+import { AssetNotFoundError } from "@/domain/photo-project-service";
+import { ErrorCode } from "@/domain/errors";
+import type { PhotoProjectRepository } from "@/domain/photo-project";
+import { applyPhotoStatePatch, type StatePatch } from "@/domain/photo-state";
+import type { ImageGenerationProvider } from "@/infrastructure/models/image-provider";
+import { createNoopTelemetry } from "@/infrastructure/telemetry/stdout-telemetry";
+import type { TelemetryContext } from "@/infrastructure/telemetry/stdout-telemetry";
 import {
   InvalidAssetUriError,
   buildAssetKey,
   buildAssetUri,
   resolveAssetStorageKey,
-} from "../../infrastructure/storage/asset-storage.js";
-import { MaxImageAttemptsReachedError, MaxImagesReachedError } from "./turn-context.js";
-import type { TurnContext } from "./turn-context.js";
+} from "@/infrastructure/storage/asset-storage";
+import { MaxImageAttemptsReachedError, MaxImagesReachedError } from "@/agent/tools/turn-context";
+import type { TurnContext } from "@/agent/tools/turn-context";
 
 /** 工具层致命错误：终止整个 agent turn，code 走 ErrorCode 常量。 */
 export class ToolFatalError extends Error {
