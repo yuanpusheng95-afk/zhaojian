@@ -161,7 +161,7 @@ export function createApp({ repository, queue, turnViews, assetStorage, eventCon
     }));
   }
 
-  app.use("/", serveStatic({ root: "./public", index: "index.html" }));
+  app.use("/", serveStatic({ root: "./dist/public", index: "index.html" }));
 
   app.post("/uploads", async (c) => {
     const contentType = c.req.header("content-type") ?? "";

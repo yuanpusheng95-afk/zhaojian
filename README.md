@@ -51,7 +51,7 @@ src/
 - **错误码单一来源**：`src/domain/errors.ts` 的 `ErrorCode` 常量 + `ERROR_STATUS` 映射，业务错误类全部引用常量。
 - **SSE 策略化**：`PollingEventSource` 主干 + `RedisEventSource` 加速 + 失败一次性熔断降级装饰器。
 - **config zod 化**：三个 loader 共享 schema 片段，全量类型推导，fail-fast 校验。
-- **访问控制接缝**：`AccessPolicy` 端口默认放行；认证落地后在组合根注入真实实现即可，路由层零改动。
+- **访问控制接缝**：`AccessPolicy` 端口 + `OwnerOnlyAccessPolicy`；认证开启后自动强制资源归属。
 
 ## 快速开始
 
@@ -89,7 +89,7 @@ cp .env.example .env          # 填写凭证
 docker compose up -d --build  # 构建、迁移、启动 postgres/minio/redis/api/worker
 ```
 
-`migrate` 是一次性任务，由 Compose 在数据库健康后执行；API 和 worker 等它成功后启动。前端由 API 容器直接提供，访问 `http://127.0.0.1:3000/`。
+`migrate` 是一次性任务，由 Compose 在数据库健康后执行；API 和 worker 等它成功后启动。前端由 API 容器直接提供，访问 `http://127.0.0.1:3000/`。本地开发可运行 `bun run dev:frontend`，Vite 会代理 API 到 `127.0.0.1:3000`。
 
 ## 最小 API
 
