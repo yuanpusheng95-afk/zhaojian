@@ -2,6 +2,7 @@ FROM oven/bun:1.3.10
 WORKDIR /app
 
 COPY package.json bun.lock ./
+ENV BUN_CONFIG_REGISTRY=https://registry.npmjs.org
 RUN bun install --frozen-lockfile --production
 
 COPY src ./src
