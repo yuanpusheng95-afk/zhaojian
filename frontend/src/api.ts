@@ -27,6 +27,7 @@ export type TurnDetail = {
   projectId: string;
   status: "queued" | "running" | "completed" | "failed";
   userMessage: string;
+  error: { code?: string; message?: string } | null;
   generations: TurnGeneration[];
 };
 

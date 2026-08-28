@@ -79,6 +79,10 @@ export default function App() {
 
   const submit = useCallback(async () => {
     if (!message.trim() || busy) return;
+    if (!project && !file) {
+      setError("当前中转站只支持图生图：请先上传一张基准照片，再输入修改指令。");
+      return;
+    }
     setBusy(true);
     setError("");
     const now = timeLabel(new Date().toISOString());
@@ -124,11 +128,14 @@ export default function App() {
     source.addEventListener("done", () => {
       const finalTurn = turnRef.current;
       const succeeded = finalTurn && finalTurn.generations.some((generation) => generation.candidate);
+      const noImageOnly = !succeeded && finalTurn?.error?.code === "NO_IMAGE_GENERATED";
       setChat((current) => [...current, {
         id: crypto.randomUUID(), side: "left",
         content: succeeded
           ? "照片已经生成好了，你可以继续告诉我要怎么调整。"
-          : "这次没有生成出照片，请换个描述或重新试试。",
+          : noImageOnly
+            ? "生成失败：中转站当前不支持纯文字生图，请上传一张基准照片后重试。"
+            : "这次没有生成出照片，请换个描述或重新试试。",
         time: timeLabel(new Date().toISOString()),
       }]);
       source.close();
