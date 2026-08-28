@@ -32,6 +32,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const turnRef = useRef<TurnDetail | null>(null);
+  useEffect(() => { turnRef.current = turn; }, [turn]);
 
   useEffect(() => {
     api.me().then(setUser).catch(() => setUser(null)).finally(() => setLoading(false));
@@ -120,15 +122,20 @@ export default function App() {
       setTurn(JSON.parse((event as MessageEvent).data));
     });
     source.addEventListener("done", () => {
+      const finalTurn = turnRef.current;
+      const succeeded = finalTurn && finalTurn.generations.some((generation) => generation.candidate);
       setChat((current) => [...current, {
         id: crypto.randomUUID(), side: "left",
-        content: "照片已经生成好了，你可以继续告诉我要怎么调整。", time: timeLabel(new Date().toISOString()),
+        content: succeeded
+          ? "照片已经生成好了，你可以继续告诉我要怎么调整。"
+          : "这次没有生成出照片，请换个描述或重新试试。",
+        time: timeLabel(new Date().toISOString()),
       }]);
       source.close();
     });
     source.addEventListener("error", () => source.close());
     return () => source.close();
-  }, [isGenerating, project, turn]);
+  }, [isGenerating, project?.id, turn?.turnId]);
 
   const select = useCallback(async (generationId: string, candidateId: string) => {
     if (!project || !turn) return;
