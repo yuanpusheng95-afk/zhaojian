@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type Project, type TurnDetail, type TurnSummary, type User } from "./api";
 
 type ChatMessage = { id: string; side: "left" | "right"; content: string; time: string };
@@ -31,6 +31,7 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
 
   useEffect(() => {
     api.me().then(setUser).catch(() => setUser(null)).finally(() => setLoading(false));
@@ -242,9 +243,21 @@ export default function App() {
           <p className="mt-1 text-sm text-slate-500">{turn?.userMessage ?? "描述你想要的照片风格和场景"}</p>
 
           <div className="mt-5">
-            {latest?.candidate.url
-              ? <img className="aspect-[4/3] w-full rounded-2xl object-cover" src={latest.candidate.url} alt="主图" />
-              : <div className="grid aspect-[4/3] place-items-center rounded-2xl bg-slate-100 text-sm text-slate-500">{isGenerating ? "AI 正在拍摄…" : "暂无照片"}</div>}
+            {latest?.candidate.url ? (
+              <div className="relative">
+                <DragScrollContainer className="max-h-[560px] rounded-2xl border border-slate-200 bg-slate-50">
+                  <img className="w-full object-contain" src={latest.candidate.url} alt="主图" />
+                </DragScrollContainer>
+                <button
+                  className="absolute right-3 top-3 grid size-9 place-items-center rounded-xl bg-black/50 text-white backdrop-blur hover:bg-black/70"
+                  onClick={() => setLightboxUrl(latest.candidate.url)}
+                  title="放大查看"
+                >⤢</button>
+                {!isGenerating && <div className="mt-1 text-center text-xs text-slate-400">图片较大时可按住拖动 / 滚动查看，点击右上角放大</div>}
+              </div>
+            ) : (
+              <div className="grid aspect-[4/3] place-items-center rounded-2xl bg-slate-100 text-sm text-slate-500">{isGenerating ? "AI 正在拍摄…" : "暂无照片"}</div>
+            )}
           </div>
 
           {candidates.length > 1 && (
@@ -272,6 +285,7 @@ export default function App() {
 
         <ChatPanel chat={chat} message={message} onMessage={setMessage} onSubmit={submit} busy={busy} error={error} onQuickAction={(value) => setMessage(value)} />
       </main>
+      {lightboxUrl && <ZoomCanvas url={lightboxUrl} onClose={() => setLightboxUrl(null)} />}
     </div>
   );
 }
@@ -403,4 +417,172 @@ function Spinner() {
 
 function Avatar({ name }: { name: string }) {
   return <div className="grid size-8 place-items-center rounded-full bg-violet-100 text-sm text-violet-700">{name.slice(0, 1).toUpperCase()}</div>;
+}
+
+function useDragScroll<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const drag = useRef({ down: false, moved: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 });
+
+  const onPointerDown = (e: React.PointerEvent<T>) => {
+    const el = ref.current;
+    if (!el || e.button !== 0) return;
+    drag.current = { down: true, moved: false, startX: e.clientX, startY: e.clientY, scrollLeft: el.scrollLeft, scrollTop: el.scrollTop };
+  };
+  const onPointerMove = (e: React.PointerEvent<T>) => {
+    const el = ref.current;
+    if (!el || !drag.current.down) return;
+    const dx = e.clientX - drag.current.startX;
+    const dy = e.clientY - drag.current.startY;
+    if (Math.abs(dx) + Math.abs(dy) > 4) drag.current.moved = true;
+    el.scrollLeft = drag.current.scrollLeft - dx;
+    el.scrollTop = drag.current.scrollTop - dy;
+  };
+  const end = () => { drag.current.down = false; };
+
+  return {
+    ref,
+    didDrag: () => drag.current.moved,
+    handlers: { onPointerDown, onPointerMove, onPointerUp: end, onPointerLeave: end },
+  };
+}
+
+function DragScrollContainer({ className, children }: { className?: string; children: React.ReactNode }) {
+  const { ref, handlers } = useDragScroll<HTMLDivElement>();
+  return (
+    <div ref={ref} className={`select-none overflow-auto cursor-grab active:cursor-grabbing ${className ?? ""}`} {...handlers}>
+      {children}
+    </div>
+  );
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function ZoomCanvas({ url, onClose }: { url: string; onClose: () => void }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 });
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const drag = useRef<{ down: boolean; id: number; startX: number; startY: number; tx: number; ty: number } | null>(null);
+  const fitRef = useRef<() => void>(() => undefined);
+
+  const fitToScreen = useCallback(() => {
+    const el = containerRef.current;
+    const size = natural;
+    if (!el || !size) return;
+    const { width, height } = el.getBoundingClientRect();
+    const scale = Math.min(1, (width - 48) / size.w, (height - 48) / size.h);
+    setView({ scale, tx: (width - size.w * scale) / 2, ty: (height - size.h * scale) / 2 });
+  }, [natural]);
+  fitRef.current = fitToScreen;
+
+  const zoomAtCenter = useCallback((factor: number) => {
+    const el = containerRef.current;
+    if (!el) return;
+    const { width, height } = el.getBoundingClientRect();
+    setView(({ scale, tx, ty }) => {
+      const next = clamp(scale * factor, 0.05, 16);
+      const f = next / scale;
+      return { scale: next, tx: width / 2 - (width / 2 - tx) * f, ty: height / 2 - (height / 2 - ty) * f };
+    });
+  }, []);
+
+  // 图片加载完成后自适应一次
+  useEffect(() => {
+    if (natural) fitToScreen();
+  }, [natural, fitToScreen]);
+
+  // 滚轮缩放（非 passive，才能 preventDefault）+ 键盘快捷键 + 滚动锁
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      const factor = Math.exp(-e.deltaY * 0.0016);
+      setView(({ scale, tx, ty }) => {
+        const next = clamp(scale * factor, 0.05, 16);
+        const f = next / scale;
+        return { scale: next, tx: px - (px - tx) * f, ty: py - (py - ty) * f };
+      });
+    };
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      if (e.key === "+" || e.key === "=") zoomAtCenter(1.25);
+      if (e.key === "-") zoomAtCenter(0.8);
+      if (e.key === "0") fitRef.current();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = previous;
+      el.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [onClose, zoomAtCenter]);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/95">
+      <div
+        ref={containerRef}
+        className="absolute inset-0 touch-none select-none overflow-hidden cursor-grab active:cursor-grabbing"
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          drag.current = { down: true, id: e.pointerId, startX: e.clientX, startY: e.clientY, tx: view.tx, ty: view.ty };
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          const d = drag.current;
+          if (!d || !d.down || d.id !== e.pointerId) return;
+          setView(({ scale }) => ({ scale, tx: d.tx + (e.clientX - d.startX), ty: d.ty + (e.clientY - d.startY) }));
+        }}
+        onPointerUp={() => { if (drag.current) drag.current.down = false; }}
+        onDoubleClick={() => {
+          setView((current) => {
+            const el = containerRef.current;
+            if (!el) return current;
+            const { width, height } = el.getBoundingClientRect();
+            const fits = natural ? Math.min(1, (width - 48) / natural.w, (height - 48) / natural.h) : 1;
+            const isBestFit = Math.abs(current.scale - fits) < 1e-4;
+            if (!isBestFit) return current;
+            const next = 1;
+            return { scale: next, tx: (width - (natural?.w ?? 0) * next) / 2, ty: (height - (natural?.h ?? 0) * next) / 2 };
+          });
+        }}
+      >
+        <div className="pointer-events-none absolute inset-0 grid place-items-center">
+          {natural ? null : <div className="text-sm text-white/60">加载中…</div>}
+        </div>
+        <img
+          src={url}
+          alt="预览"
+          draggable={false}
+          className="absolute left-0 top-0 max-h-none max-w-none"
+          style={{
+            transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`,
+            transformOrigin: "0 0",
+          }}
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            setNatural((current) => current ?? { w: img.naturalWidth, h: img.naturalHeight });
+          }}
+        />
+      </div>
+
+      <div className="absolute right-4 top-4 z-10 flex items-center gap-2">
+        <span className="rounded-xl bg-white/10 px-3 py-2 text-sm text-white">{Math.round(view.scale * 100)}%</span>
+        <button className="grid size-10 place-items-center rounded-xl bg-white/15 text-lg text-white backdrop-blur hover:bg-white/25" title="放大 (+)" onClick={() => zoomAtCenter(1.25)}>＋</button>
+        <button className="grid size-10 place-items-center rounded-xl bg-white/15 text-lg text-white backdrop-blur hover:bg-white/25" title="缩小 (-)" onClick={() => zoomAtCenter(0.8)}>－</button>
+        <button className="rounded-xl bg-white/15 px-3 py-2 text-sm text-white backdrop-blur hover:bg-white/25" title="适应屏幕 (0)" onClick={fitToScreen}>适应</button>
+        <button className="grid size-10 place-items-center rounded-xl bg-white/15 text-white backdrop-blur hover:bg-white/25" title="关闭 (Esc)" onClick={onClose}>✕</button>
+      </div>
+      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-4 py-1.5 text-xs text-white/70">
+        滚轮缩放 · 拖拽平移 · 双击 100% · +/− 缩放 · 0 适应 · Esc 关闭
+      </div>
+    </div>
+  );
 }
